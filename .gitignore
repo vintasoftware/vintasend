@@ -1,0 +1,47 @@
+*.pyc
+db.sqlite3
+db.sqlite3-journal
+.DS_Store
+.env
+**/settings/local.py
+/staticfiles/*
+/mediafiles/*
+__pycache__/
+/.vscode/
+
+# coverage result
+.coverage
+/coverage/
+
+# pycharm
+.idea/
+
+# data
+*.dump
+
+# npm
+node_modules/
+npm-debug.log
+
+# Sass
+.sass-cache
+*.map
+
+# General
+/agemo_api-venv/
+/venv/
+/env/
+/output/
+/cache/
+boilerplate.zip
+
+# Spritesmith
+spritesmith-generated/
+spritesmith.scss
+
+# templated email
+tmp_email/
+
+.direnv
+.envrc
+.tool-versions
