@@ -1,10 +1,13 @@
 [run]
 branch = True
-source = django_ai_assistant
+source = vintasend
 
 [report]
 omit =
     */tests/*
+    vintasend/app_settings.py
+    vintasend/services/dataclasses.py
+
 exclude_lines =
     pragma: no cover
     if TYPE_CHECKING:

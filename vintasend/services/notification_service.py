@@ -107,7 +107,7 @@ class NotificationService:
 
     def create_notification(
         self,
-        user_id: uuid.UUID,
+        user_id: int | str | uuid.UUID,
         notification_type: str,
         title: str,
         body_template: str,
@@ -127,7 +127,7 @@ class NotificationService:
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            user_id: uuid.UUID - the user ID to send the notification to
+            user_id: int | str | uuid.UUID - the user ID to send the notification to
             notification_type: str - the type of notification to send
             title: str - the title of the notification
             body_template: str - the string that represents the body template
@@ -154,7 +154,7 @@ class NotificationService:
 
     def update_notification(
         self,
-        notification_id: uuid.UUID,
+        notification_id: int | str | uuid.UUID,
         **kwargs: UpdateNotificationKwargs,
     ) -> Notification:
         """
@@ -167,7 +167,7 @@ class NotificationService:
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            notification_id: uuid.UUID - the ID of the notification to update
+            notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
         notification = self.notification_backend.persist_notification_update(
@@ -177,6 +177,55 @@ class NotificationService:
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(tz=datetime.timezone.utc):
             self.send(notification)
         return notification
+    
+    def get_all_future_notifications(self) -> Iterable[Notification]:
+        """
+        Get future notifications from the backend.
+
+        Returns:
+            Iterable[Notification] - the future notifications
+        """
+        return self.notification_backend.get_all_future_notifications()
+    
+    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> Iterable[Notification]:
+        """
+        Get future notifications from the backend.
+
+        Parameters:
+            user_id: int | str | uuid.UUID - the user ID to get the notifications for
+
+        Returns:
+            Iterable[Notification] - the future notifications from the user
+        """
+        return self.notification_backend.get_all_future_notifications_from_user(user_id)
+    
+    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> Iterable[Notification]:
+        """
+        Get future notifications from the backend.
+
+        Parameters:
+            user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            page: int - the page number to get
+            page_size: int - the number of notifications per page
+
+        Returns:
+            Iterable[Notification] - the selected page of the future notifications from the user
+        """
+        return self.notification_backend.get_future_notifications_from_user(user_id, page, page_size)
+    
+    def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
+        """
+        Get future notifications from the backend.
+
+        Parameters:
+            user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            page: int - the page number to get
+            page_size: int - the number of notifications per page
+
+        Returns:
+            Iterable[Notification] - the future notifications
+        """
+        return self.notification_backend.get_future_notifications(page, page_size)
 
     def get_notification_context(self, notification: Notification) -> NotificationContextDict:
         """
@@ -240,19 +289,19 @@ class NotificationService:
         """
         return self.notification_backend.get_pending_notifications(page, page_size)
 
-    def get_notification(self, notification_id: uuid.UUID) -> Notification:
+    def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification:
         """
         Get a notification from the backend.
 
         Parameters:
-            notification_id: uuid.UUID - the ID of the notification to get
+            notification_id: int | str | uuid.UUID - the ID of the notification to get
 
         Returns:
             Notification - the notification
         """
         return self.notification_backend.get_notification(notification_id)
 
-    def mark_read(self, notification_id: uuid.UUID) -> Notification:
+    def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification:
         """
         Mark a notification as read.
 
@@ -269,7 +318,7 @@ class NotificationService:
 
     def get_in_app_unread(
         self,
-        user_id: uuid.UUID,
+        user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
     ) -> Iterable[Notification]:
@@ -280,7 +329,7 @@ class NotificationService:
             * NotificationError if no in-app notification adapter is found.
 
         Parameters:
-            user_id: uuid.UUID - the user ID to get the notifications for
+            user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
 
@@ -295,14 +344,14 @@ class NotificationService:
             user_id=user_id, page=page, page_size=page_size
         )
 
-    def cancel_notification(self, notification: Notification) -> None:
+    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
         Cancel a notification.
 
         Parameters:
-            notification: Notification - the notification to cancel
+            notifictaion_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
-        return self.notification_backend.cancel_notification(notification.id)
+        return self.notification_backend.cancel_notification(notification_id)
 
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
         """
@@ -320,7 +369,7 @@ class NotificationService:
             context_dict: dict - the context to generate the context for the notification
         """
         for adapter in self.notification_adapters:
-            if adapter.notification_type != notification_dict.get("notification_type"):
+            if adapter.notification_type.value != notification_dict.get("notification_type"):
                 continue
             # adapter might have a dynamic inheritance, so we need to check if it has the delayed_send method
             # instead of using isinstance

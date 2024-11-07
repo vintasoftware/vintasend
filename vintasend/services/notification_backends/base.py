@@ -25,9 +25,25 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_all_future_notifications(self) -> Iterable["Notification"]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> Iterable["Notification"]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> Iterable["Notification"]:
+        raise NotImplementedError
+
+    @abstractmethod
     def persist_notification(
         self,
-        user_id: uuid.UUID,
+        user_id: int | str | uuid.UUID,
         notification_type: str,
         title: str,
         body_template: str,

@@ -15,3 +15,12 @@ class FakeTemplateRenderer(BaseTemplatedEmailRenderer):
 class FakeTemplateRendererWithException(BaseTemplatedEmailRenderer):
     def render(self, notification, context):
         raise NotificationBodyTemplateRenderingError("Fake error")
+
+
+class InvalidTemplateRenderer():
+    pass
+
+
+class FakeTemplateRendererWithExceptionOnInit(FakeTemplateRendererWithException):
+    def __init__(self):
+        raise NotificationBodyTemplateRenderingError("Fake error")

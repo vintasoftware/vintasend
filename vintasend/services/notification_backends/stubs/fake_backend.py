@@ -6,6 +6,7 @@ import uuid
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.exceptions import NotificationNotFoundError
 
 
 class FakeFileBackend(BaseNotificationBackend):
@@ -33,6 +34,29 @@ class FakeFileBackend(BaseNotificationBackend):
             os.remove(self.database_file_name)
         except FileNotFoundError:
             pass
+
+    def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
+        return self.__paginate_notifications(self.get_all_future_notifications(), page, page_size)
+
+    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> list[Notification]:
+        return self.__paginate_notifications(self.get_all_future_notifications_from_user(user_id), page, page_size)
+
+    def get_all_future_notifications(self) -> list[Notification]:
+        return [
+            n
+            for n in self.notifications
+            if n.status == NotificationStatus.PENDING_SEND.value
+            and (n.send_after is not None and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc))
+        ]
+
+    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> list[Notification]:
+        return [
+            n
+            for n in self.notifications
+            if n.status == NotificationStatus.PENDING_SEND.value
+            and (n.send_after is not None and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc))
+            and str(n.user_id) == str(user_id)
+        ]
 
     def get_all_pending_notifications(self) -> list[Notification]:
         return [
@@ -122,10 +146,7 @@ class FakeFileBackend(BaseNotificationBackend):
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, **kwargs: UpdateNotificationKwargs
     ) -> Notification:
-        try:
-            notification = next(n for n in self.notifications if n.id == notification_id)
-        except IndexError as e:
-            raise ValueError("Notification not found") from e
+        notification = self.get_notification(notification_id)
 
         for key, value in kwargs.items():
             setattr(notification, key, value)
@@ -161,7 +182,7 @@ class FakeFileBackend(BaseNotificationBackend):
         try:
             return next(n for n in self.notifications if str(n.id) == str(notification_id))
         except StopIteration as e:
-            raise ValueError("Notification not found") from e
+            raise NotificationNotFoundError("Notification not found") from e
 
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
@@ -175,4 +196,13 @@ class FakeFileBackend(BaseNotificationBackend):
         ]
 
         # page is 1-indexed
+        return self.__paginate_notifications(notifications, page, page_size)
+
+    def __paginate_notifications(self, notifications: list[Notification], page: int, page_size: int):
+        # page is 1-indexed
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
+    
+
+class InvalidBackend():
+    def __init__(self, *_args, **_kwargs):
+        pass

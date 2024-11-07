@@ -29,7 +29,7 @@ def get_notification_adapters(
     for adapter_import_string, template_renderer_import_str in adapters_imports_strs_with_default:
         try:
             adapter_cls = _import_class(adapter_import_string)
-        except ImportError as e:
+        except (ImportError, ModuleNotFoundError) as e:
             raise ValueError(
                 f"Notifications Adapter Error: Could not import {adapter_import_string}"
             ) from e
@@ -65,7 +65,7 @@ def get_notification_backend(
 
     try:
         backend_cls = _import_class(backend_import_str_with_fallback)
-    except ImportError as e:
+    except (ImportError, ModuleNotFoundError) as e:
         raise ValueError(
             f"Notifications Backend Error: Could not import {backend_import_str_with_fallback}"
         ) from e
@@ -87,7 +87,7 @@ def get_notification_backend(
 def get_template_renderer(template_renderer_import_str: str) -> BaseTemplatedEmailRenderer:
     try:
         template_renderer_cls = _import_class(template_renderer_import_str)
-    except ImportError as e:
+    except (ImportError, ModuleNotFoundError) as e:
         raise ValueError(
             f"Notifications Template Renderer Error: Could not import {template_renderer_import_str}"
         ) from e
@@ -98,5 +98,10 @@ def get_template_renderer(template_renderer_import_str: str) -> BaseTemplatedEma
         raise ValueError(
             f"Notifications Template Renderer Error: Could not instantiate {template_renderer_import_str}"
         ) from e
+    
+    if not isinstance(template_renderer, BaseTemplatedEmailRenderer):
+        raise ValueError(
+            f"Notifications Template Renderer Error: {template_renderer_import_str} is not a valid template renderer"
+        )
 
     return cast(BaseTemplatedEmailRenderer, template_renderer)
