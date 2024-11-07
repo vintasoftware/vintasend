@@ -35,8 +35,8 @@ class NotificationContextDict(dict):
                 int
                 | float
                 | str
-                | list["NotificationContextDict"]
-                | dict[str, "NotificationContextDict"]
+                | list
+                | dict
             ),
         ):
             raise TypeError("Value must be an int, float, str, list, or dict")
