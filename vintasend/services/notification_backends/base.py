@@ -91,6 +91,12 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def filter_all_in_app_unread_notifications(
+        self, user_id: int | str | uuid.UUID
+    ) -> Iterable["Notification"]:
+        raise NotImplementedError
+
+    @abstractmethod
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> Iterable["Notification"]:

@@ -184,8 +184,8 @@ class FakeFileBackend(BaseNotificationBackend):
         except StopIteration as e:
             raise NotificationNotFoundError("Notification not found") from e
 
-    def filter_in_app_unread_notifications(
-        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    def filter_all_in_app_unread_notifications(
+        self, user_id: int | str | uuid.UUID
     ) -> list[Notification]:
         notifications = [
             n
@@ -194,9 +194,12 @@ class FakeFileBackend(BaseNotificationBackend):
             and n.status == NotificationStatus.SENT.value
             and n.notification_type == NotificationTypes.IN_APP.value
         ]
+        return notifications
 
-        # page is 1-indexed
-        return self.__paginate_notifications(notifications, page, page_size)
+    def filter_in_app_unread_notifications(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> list[Notification]:
+        return self.__paginate_notifications(self.filter_all_in_app_unread_notifications(user_id), page, page_size)
 
     def __paginate_notifications(self, notifications: list[Notification], page: int, page_size: int):
         # page is 1-indexed
