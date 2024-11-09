@@ -11,6 +11,9 @@ DEFAULT_SETTINGS = {
     ],
     "NOTIFICATION_BACKEND": "vintasend_django.services.notification_backends.django_db_notification_backend.DjangoDbNotificationBackend",
     "NOTIFICATION_MODEL": "vintasend_django.models.Notification",
+    "NOTIFICATION_DEFAULT_BCC_EMAILS": [],
+    "NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL": "http",
+    "NOTIFICATION_DEFAULT_BASE_URL_DOMAIN": "example.com",
 }
 
 
@@ -93,11 +96,17 @@ class NotificationSettings:
     NOTIFICATION_ADAPTERS: list[tuple[str, str]]
     NOTIFICATION_BACKEND: str
     NOTIFICATION_MODEL: str | None
+    NOTIFICATION_DEFAULT_BCC_EMAILS: list[str]
+    NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL: str
+    NOTIFICATION_DEFAULT_BASE_URL_DOMAIN: str
 
     def __init__(self):
         self.NOTIFICATION_ADAPTERS = get_config("NOTIFICATION_ADAPTERS")
         self.NOTIFICATION_BACKEND = get_config("NOTIFICATION_BACKEND")
         self.NOTIFICATION_MODEL = get_config("NOTIFICATION_MODEL")
+        self.NOTIFICATION_DEFAULT_BCC_EMAILS = get_config("NOTIFICATION_DEFAULT_BCC_EMAILS")
+        self.NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL = get_config("NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL")
+        self.NOTIFICATION_DEFAULT_BASE_URL_DOMAIN = get_config("NOTIFICATION_DEFAULT_BASE_URL_DOMAIN")
 
     def get_notification_model_cls(self):
         module_name, class_name = self.NOTIFICATION_MODEL.rsplit(".", 1)
