@@ -101,3 +101,7 @@ class BaseNotificationBackend(ABC):
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> Iterable["Notification"]:
         raise NotImplementedError
+
+    @abstractmethod
+    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
+        raise NotImplementedError
