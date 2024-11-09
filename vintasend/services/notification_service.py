@@ -102,6 +102,7 @@ class NotificationService:
                     raise e
             try:
                 self.notification_backend.mark_pending_as_sent(notification.id)
+                self.notification_backend.store_context_used(notification.id, context)
             except NotificationUpdateError as e:
                 raise NotificationMarkSentError("Failed to mark notification as sent") from e
 

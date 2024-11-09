@@ -105,3 +105,7 @@ class BaseNotificationBackend(ABC):
     @abstractmethod
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         raise NotImplementedError
+    
+    @abstractmethod
+    def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
+        raise NotImplementedError

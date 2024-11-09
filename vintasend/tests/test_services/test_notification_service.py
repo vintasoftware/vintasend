@@ -141,6 +141,10 @@ class TestNotificationService:
 
         assert len(notification_service.notification_adapters[0].sent_emails) == 1
 
+        sent_notification = notification_service.get_notification(notification.id)
+        assert sent_notification.status == NotificationStatus.SENT.value
+        assert sent_notification.context_used == {"test": "test"}
+
     def test_create_notification(self):
         assert len(self.notification_service.notification_backend.notifications) == 0
         notification = self.notification_service.create_notification(

@@ -73,9 +73,10 @@ class Notification:
     subject_template: str
     preheader_template: str
     status: str
+    context_used: dict | None = None
 
 
-class UpdateNotificationKwargs(TypedDict, total=False):
+class UpdateNotificationKwargs(TypedDict, total=False): 
     title: str
     body_template: str
     context_name: str

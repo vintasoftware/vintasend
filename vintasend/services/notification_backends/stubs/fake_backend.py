@@ -79,6 +79,7 @@ class FakeFileBackend(BaseNotificationBackend):
             "subject_template": notification.subject_template,
             "preheader_template": notification.preheader_template,
             "status": notification.status,
+            "context_used": notification.context_used,
         }
 
     def _convert_json_to_notification(self, notification: dict) -> Notification:
@@ -98,6 +99,7 @@ class FakeFileBackend(BaseNotificationBackend):
             subject_template=notification["subject_template"],
             preheader_template=notification["preheader_template"],
             status=notification["status"],
+            context_used=notification.get("context_used"),
         )
 
     def _store_notifications(self):
@@ -208,6 +210,11 @@ class FakeFileBackend(BaseNotificationBackend):
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         notification = self.get_notification(notification_id)
         return notification.context_kwargs.get("email", "testemail@example.com")
+    
+    def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
+        notification = self.get_notification(notification_id)
+        notification.context_used = context
+        self._store_notifications()
     
 
 class InvalidBackend():
