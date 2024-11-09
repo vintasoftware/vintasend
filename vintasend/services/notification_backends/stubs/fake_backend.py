@@ -205,7 +205,7 @@ class FakeFileBackend(BaseNotificationBackend):
         # page is 1-indexed
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
     
-    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str | None:
+    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         notification = self.get_notification(notification_id)
         return notification.context_kwargs.get("email", "testemail@example.com")
     
