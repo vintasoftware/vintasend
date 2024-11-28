@@ -59,7 +59,7 @@ class BaseNotificationBackend(ABC):
     def persist_notification_update(
         self,
         notification_id: int | str | uuid.UUID,
-        **kwargs: "UpdateNotificationKwargs",
+        update_data: "UpdateNotificationKwargs",
     ) -> "Notification":
         """
         Update a notification in the backend. This method should return the updated notification.

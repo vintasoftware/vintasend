@@ -118,7 +118,7 @@ class FakeFileBackend(BaseNotificationBackend):
 
     def persist_notification(
         self,
-        user_id: uuid.UUID,
+        user_id: uuid.UUID | str | int,
         notification_type: str,
         title: str,
         body_template: str,
@@ -146,11 +146,11 @@ class FakeFileBackend(BaseNotificationBackend):
         return notification
 
     def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, **kwargs: UpdateNotificationKwargs
+        self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
     ) -> Notification:
         notification = self.get_notification(notification_id)
 
-        for key, value in kwargs.items():
+        for key, value in updated_data.items():
             setattr(notification, key, value)
 
         return notification
@@ -209,7 +209,7 @@ class FakeFileBackend(BaseNotificationBackend):
     
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         notification = self.get_notification(notification_id)
-        return notification.context_kwargs.get("email", "testemail@example.com")
+        return str(notification.context_kwargs.get("email", "testemail@example.com"))
     
     def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
         notification = self.get_notification(notification_id)
