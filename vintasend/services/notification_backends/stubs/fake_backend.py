@@ -146,11 +146,11 @@ class FakeFileBackend(BaseNotificationBackend):
         return notification
 
     def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
+        self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs
     ) -> Notification:
         notification = self.get_notification(notification_id)
 
-        for key, value in updated_data.items():
+        for key, value in update_data.items():
             setattr(notification, key, value)
 
         return notification

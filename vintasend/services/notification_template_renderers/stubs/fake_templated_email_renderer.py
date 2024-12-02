@@ -1,18 +1,18 @@
 from vintasend.exceptions import NotificationBodyTemplateRenderingError
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
-    BaseTemplatedEmailRenderer,
+    BaseTemplateRenderer,
     TemplatedEmail,
 )
 
 
-class FakeTemplateRenderer(BaseTemplatedEmailRenderer):
+class FakeTemplateRenderer(BaseTemplateRenderer):
     def render(self, notification, context):
         return TemplatedEmail(
             subject=notification.subject_template, body=notification.body_template
         )
 
 
-class FakeTemplateRendererWithException(BaseTemplatedEmailRenderer):
+class FakeTemplateRendererWithException(BaseTemplateRenderer):
     def render(self, notification, context):
         raise NotificationBodyTemplateRenderingError("Fake error")
 

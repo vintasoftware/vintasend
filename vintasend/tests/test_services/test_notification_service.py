@@ -5,9 +5,11 @@ from unittest.mock import patch
 from freezegun import freeze_time
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import NotificationError, NotificationNotFoundError, NotificationSendError, NotificationMarkFailedError, NotificationMarkSentError, NotificationUpdateError
-from vintasend.services.dataclasses import Notification
+from vintasend.services.dataclasses import Notification, NotificationContextDict
+from vintasend.services.notification_adapters.stubs.fake_adapter import FakeEmailAdapter
 from vintasend.services.notification_backends.stubs.fake_backend import FakeFileBackend
 from vintasend.services.notification_service import NotificationService, register_context
+from vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer import FakeTemplateRenderer
 
 
 class TestNotificationService:
@@ -30,7 +32,7 @@ class TestNotificationService:
     def create_notification_context(self, test):
         if test != "test":
             raise ValueError()
-        return {"test": "test"}
+        return NotificationContextDict({"test": "test"})
 
     def test_sends_without_context(self):
         notification = Notification(
@@ -40,7 +42,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="non_registered_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -83,7 +85,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -115,7 +117,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -139,7 +141,7 @@ class TestNotificationService:
 
         notification_service.send(notification)
 
-        assert len(notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(notification_service.notification_adapters)[0].sent_emails) == 1
 
         sent_notification = notification_service.get_notification(notification.id)
         assert sent_notification.status == NotificationStatus.SENT.value
@@ -153,7 +155,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -161,7 +163,7 @@ class TestNotificationService:
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
 
     @patch("vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_sent")
     def test_create_notification_with_failing_mark_as_sent(self, mock_mark_pending_as_sent):
@@ -175,7 +177,7 @@ class TestNotificationService:
                 title="Test Notification",
                 body_template="vintasend_django/emails/test/test_templated_email_body.html",
                 context_name="test_context",
-                context_kwargs={"test": "test"},
+                context_kwargs=NotificationContextDict({"test": "test"}),
                 send_after=None,
                 subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
                 preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -204,7 +206,7 @@ class TestNotificationService:
                 title="Test Notification",
                 body_template="vintasend_django/emails/test/test_templated_email_body.html",
                 context_name="test_context",
-                context_kwargs={"test": "test"},
+                context_kwargs=NotificationContextDict({"test": "test"}),
                 send_after=None,
                 subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
                 preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -218,7 +220,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -226,7 +228,7 @@ class TestNotificationService:
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 0
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
 
     def test_create_notification_with_send_after_in_the_past(self):
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -236,7 +238,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=1),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -244,7 +246,7 @@ class TestNotificationService:
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
 
     def test_update_notification(self):
         notification = self.notification_service.create_notification(
@@ -253,7 +255,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -265,7 +267,7 @@ class TestNotificationService:
         )
 
         assert updated_notification.title == "Updated Test Notification"
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 0
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
 
     def test_update_notification_changing_send_after_to_the_past(self):
         notification = self.notification_service.create_notification(
@@ -274,7 +276,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -287,7 +289,7 @@ class TestNotificationService:
         )
 
         assert updated_notification.send_after == new_send_after
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
 
     def test_update_notification_changing_send_after_to_none(self):
         notification = self.notification_service.create_notification(
@@ -296,7 +298,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -308,7 +310,7 @@ class TestNotificationService:
         )
 
         assert updated_notification.send_after is None
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
 
     def test_send_pending_notifications(self):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
@@ -318,7 +320,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -329,7 +331,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -338,7 +340,7 @@ class TestNotificationService:
         with freeze_time(send_after + datetime.timedelta(days=1)):
             self.notification_service.send_pending_notifications()
 
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
     
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_notifications(self, mock_send):
@@ -349,7 +351,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -360,7 +362,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -371,7 +373,7 @@ class TestNotificationService:
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 self.notification_service.send_pending_notifications()
 
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 0
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
         mocked_logger.exception.assert_called_once()
     
     @patch("vintasend.services.notification_service.NotificationService.send")
@@ -383,7 +385,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -394,7 +396,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -405,7 +407,7 @@ class TestNotificationService:
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 self.notification_service.send_pending_notifications()
 
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 0
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
         assert mocked_logger.exception.call_count == 2
     
     @patch("vintasend.services.notification_service.NotificationService.send")
@@ -417,7 +419,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -428,7 +430,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -439,7 +441,7 @@ class TestNotificationService:
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 self.notification_service.send_pending_notifications()
 
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 0
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
         mocked_logger.exception.assert_called_once()
 
     def test_get_pending_notifications(self):
@@ -450,7 +452,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -461,7 +463,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -472,7 +474,7 @@ class TestNotificationService:
             title="Test Notification 3",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -501,7 +503,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -521,7 +523,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -539,7 +541,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -566,15 +568,15 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        notifications = self.notification_service.get_in_app_unread(user_id=1)
-        assert len(list(notifications)) == 1
-        assert notifications[0].id == in_app_notification.id
+        notifications = list(self.notification_service.get_in_app_unread(user_id=1))
+        assert len(notifications) == 1
+        assert (notifications)[0].id == in_app_notification.id
 
 
     @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter.send")
@@ -585,7 +587,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -606,19 +608,19 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
         pending_notifications_before = self.notification_service.get_all_future_notifications()
-        assert len(pending_notifications_before) == 1
+        assert len(list(pending_notifications_before)) == 1
 
         self.notification_service.cancel_notification(notification.id)
         
         pending_notifications_after = self.notification_service.get_all_future_notifications()
-        assert len(pending_notifications_after) == 0
+        assert len(list(pending_notifications_after)) == 0
 
     def test_get_all_future_notifications(self):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
@@ -628,7 +630,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -639,7 +641,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -652,7 +654,7 @@ class TestNotificationService:
             title="Send Immediately Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -665,7 +667,7 @@ class TestNotificationService:
             title="Delayed Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after - datetime.timedelta(days=10),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -682,7 +684,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -693,7 +695,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -706,7 +708,7 @@ class TestNotificationService:
             title="Send Immediately Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -719,7 +721,7 @@ class TestNotificationService:
             title="Delayed Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after - datetime.timedelta(days=10),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -727,11 +729,11 @@ class TestNotificationService:
 
         pending_notifications = self.notification_service.get_future_notifications(page=1, page_size=1)
         assert len(list(pending_notifications)) == 1
-        assert pending_notifications[0].id == notification1.id
+        assert list(pending_notifications)[0].id == notification1.id
 
         pending_notifications = self.notification_service.get_future_notifications(page=2, page_size=1)
         assert len(list(pending_notifications)) == 1
-        assert pending_notifications[0].id == notification2.id
+        assert list(pending_notifications)[0].id == notification2.id
 
         pending_notifications = self.notification_service.get_future_notifications(page=3, page_size=1)
         assert len(list(pending_notifications)) == 0
@@ -744,7 +746,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -755,7 +757,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -768,7 +770,7 @@ class TestNotificationService:
             title="Send Immediately Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -781,7 +783,7 @@ class TestNotificationService:
             title="Delayed Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after - datetime.timedelta(days=10),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -798,7 +800,7 @@ class TestNotificationService:
             title="Test Notification 1",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -809,7 +811,7 @@ class TestNotificationService:
             title="Test Notification 2",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -822,7 +824,7 @@ class TestNotificationService:
             title="Test Notification 3",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after + datetime.timedelta(days=3),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -835,7 +837,7 @@ class TestNotificationService:
             title="Send Immediately Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -848,7 +850,7 @@ class TestNotificationService:
             title="Delayed Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after - datetime.timedelta(days=10),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -856,11 +858,11 @@ class TestNotificationService:
 
         pending_notifications = self.notification_service.get_future_notifications_from_user(user_id=1, page=1, page_size=1)
         assert len(list(pending_notifications)) == 1
-        assert pending_notifications[0].id == notification1.id
+        assert list(pending_notifications)[0].id == notification1.id
 
         pending_notifications = self.notification_service.get_future_notifications_from_user(user_id=1, page=2, page_size=1)
         assert len(list(pending_notifications)) == 1
-        assert pending_notifications[0].id == notification2.id
+        assert list(pending_notifications)[0].id == notification2.id
 
         pending_notifications = self.notification_service.get_future_notifications_from_user(user_id=1, page=3, page_size=1)
         assert len(list(pending_notifications)) == 0
@@ -1015,7 +1017,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -1042,7 +1044,7 @@ class TestNotificationService:
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(self.notification_service.notification_adapters[0].sent_emails) == 1
+        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
 
     def test_delayed_send_with_unsupported_notification_type(self):
         self.notification_service = NotificationService(
@@ -1069,7 +1071,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=send_after,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -1108,7 +1110,7 @@ class TestNotificationService:
             title="Test Notification",
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
-            context_kwargs={"test": "test"},
+            context_kwargs=NotificationContextDict({"test": "test"}),
             send_after=None,
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
@@ -1135,3 +1137,17 @@ class TestNotificationService:
         )
 
         assert len(self.notification_service.notification_backend.notifications) == 1
+
+    def test_instanciate_with_adapters_and_backend_instances_instead_of_string(self):
+        notification_backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        notification_adapters = [
+            FakeEmailAdapter(backend=notification_backend, template_renderer=FakeTemplateRenderer()),
+        ]
+
+        service = NotificationService(
+            notification_adapters=notification_adapters,
+            notification_backend=notification_backend,
+        )
+
+        assert service.notification_backend == notification_backend
+        assert service.notification_adapters == notification_adapters

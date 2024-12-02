@@ -2,8 +2,9 @@ import datetime
 import logging
 import uuid
 from collections.abc import Callable, Iterable
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, Unpack, cast, overload
 
+from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.utils.singleton_utils import SingletonMeta
 from vintasend.constants import NotificationTypes
 from vintasend.exceptions import (
@@ -20,6 +21,7 @@ from vintasend.services.dataclasses import (
     UpdateNotificationKwargs,
 )
 from vintasend.services.helpers import get_notification_adapters, get_notification_backend
+from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
 
 
@@ -27,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class Contexts(metaclass=SingletonMeta):
-    _contexts: ClassVar[dict] = {}
+    _contexts: ClassVar[dict[str, Callable[[Any], NotificationContextDict]]] = {}
 
     def register_function(self, key: str, func: Callable[[Any], NotificationContextDict]):
         self._contexts[key] = func
@@ -45,21 +47,48 @@ def register_context(key: str):
     return decorator
 
 
-class NotificationService:
+def get_class_path(cls: Any) -> str:
+    return f"{cls.__class__.__module__}.{cls.__class__.__name__}"
+
+
+A = TypeVar("A", bound=BaseNotificationAdapter)
+B = TypeVar("B", bound=BaseNotificationBackend)
+
+class NotificationService(Generic[A, B]):
+    notification_adapters: Iterable[A]
+    notification_backend: B
+
     def __init__(
         self,
-        notification_adapters: Iterable[tuple[str, str]] | None = None,
-        notification_backend: str | None = None,
+        notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None = None,
+        notification_backend: B | str | None = None,
         notification_backend_kwargs: dict | None = None,
     ):
-        self.notification_adapters_import_strs = notification_adapters
-        self.notification_backend_import_str = notification_backend
-        self.notification_adapters = get_notification_adapters(
-            notification_adapters, notification_backend, notification_backend_kwargs
-        )
-        self.notification_backend = get_notification_backend(
-            notification_backend, notification_backend_kwargs
-        )
+        if isinstance(notification_backend, BaseNotificationBackend):
+            self.notification_backend = cast(B, notification_backend)
+        else:
+            self.notification_backend = cast(B, get_notification_backend(
+                notification_backend, notification_backend_kwargs
+            ))
+        self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        if notification_adapters is None or self._check_is_adapters_tuple_iterable(notification_adapters):
+            self.notification_adapters = cast(Iterable[A], get_notification_adapters(
+                notification_adapters, self.notification_backend_import_str, notification_backend_kwargs if notification_backend_kwargs is not None else {}
+            ))
+        elif self._check_is_base_notification_adapter_iterable(notification_adapters):
+            self.notification_adapters = notification_adapters
+        else:
+            raise NotificationError("Invalid notification adapters")
+        self.notification_adapters_import_strs = [
+            (get_class_path(adapter), get_class_path(adapter.template_renderer)) for adapter in self.notification_adapters
+        ]
+        
+    def _check_is_base_notification_adapter_iterable(self, notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None) -> TypeGuard[Iterable[A]]:
+        return notification_adapters is not None and all(isinstance(adapter, BaseNotificationAdapter) for adapter in notification_adapters)
+        
+    def _check_is_adapters_tuple_iterable(self, notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None) -> TypeGuard[Iterable[tuple[str, str]]]:
+        return notification_adapters is not None and all(isinstance(adapter, tuple) and len(adapter) == 2 and isinstance(adapter[0], str) and isinstance(adapter[1], str) for adapter in notification_adapters)
 
     def send(self, notification: Notification) -> None:
         """
@@ -156,7 +185,7 @@ class NotificationService:
     def update_notification(
         self,
         notification_id: int | str | uuid.UUID,
-        **kwargs: UpdateNotificationKwargs,
+        **kwargs: Unpack[UpdateNotificationKwargs],
     ) -> Notification:
         """
         Update a notification and send it if it is due to be sent immediately.
@@ -173,7 +202,7 @@ class NotificationService:
         """
         notification = self.notification_backend.persist_notification_update(
             notification_id=notification_id,
-            **kwargs,
+            update_data=kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(tz=datetime.timezone.utc):
             self.send(notification)
@@ -239,10 +268,13 @@ class NotificationService:
         Parameters:
             notification: Notification - the notification to generate the context for
         """
+        context_function = Contexts().get_function(notification.context_name)
+        if context_function is None:
+            raise NotificationContextGenerationError("Context function not found")
         try:
-            return Contexts().get_function(notification.context_name)(**notification.context_kwargs)
+            return context_function(*[],**notification.context_kwargs)
         except Exception as e:  # noqa: BLE001
-            raise NotificationContextGenerationError("Failed sending notification") from e
+            raise NotificationContextGenerationError("Failed getting notification context") from e
 
     def send_pending_notifications(self) -> None:
         """
@@ -375,5 +407,5 @@ class NotificationService:
             # adapter might have a dynamic inheritance, so we need to check if it has the delayed_send method
             # instead of using isinstance
             if hasattr(adapter, "delayed_send"):
-                adapter = cast(AsyncBaseNotificationAdapter, adapter)
-                adapter.delayed_send(notification_dict=notification_dict, context_dict=context_dict)
+                async_adapter = cast(AsyncBaseNotificationAdapter, adapter)
+                async_adapter.delayed_send(notification_dict=notification_dict, context_dict=context_dict)

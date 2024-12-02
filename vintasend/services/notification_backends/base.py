@@ -2,7 +2,7 @@ import datetime
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Unpack
 
 
 if TYPE_CHECKING:
