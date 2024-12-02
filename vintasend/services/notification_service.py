@@ -2,7 +2,12 @@ import datetime
 import logging
 import uuid
 from collections.abc import Callable, Iterable
-from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, Unpack, cast
+from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, cast
+
+try:
+    from typing import Unpack
+except ImportError:
+    from typing_extensions import Unpack
 
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.utils.singleton_utils import SingletonMeta
