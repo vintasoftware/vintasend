@@ -2,6 +2,7 @@ from collections.abc import Iterable
 from typing import Any, cast
 
 from vintasend.app_settings import NotificationSettings
+
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (

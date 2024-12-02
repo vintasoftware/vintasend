@@ -2,7 +2,7 @@ import datetime
 import logging
 import uuid
 from collections.abc import Callable, Iterable
-from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, Unpack, cast, overload
+from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, Unpack, cast
 
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.utils.singleton_utils import SingletonMeta
@@ -51,7 +51,7 @@ def get_class_path(cls: Any) -> str:
     return f"{cls.__class__.__module__}.{cls.__class__.__name__}"
 
 
-A = TypeVar("A", bound=BaseNotificationAdapter)
+A = TypeVar("A", BaseNotificationAdapter, AsyncBaseNotificationAdapter)
 B = TypeVar("B", bound=BaseNotificationBackend)
 
 class NotificationService(Generic[A, B]):
@@ -404,8 +404,9 @@ class NotificationService(Generic[A, B]):
         for adapter in self.notification_adapters:
             if adapter.notification_type.value != notification_dict.get("notification_type"):
                 continue
+
             # adapter might have a dynamic inheritance, so we need to check if it has the delayed_send method
             # instead of using isinstance
-            if hasattr(adapter, "delayed_send"):
+            if isinstance(adapter, AsyncBaseNotificationAdapter):
                 async_adapter = cast(AsyncBaseNotificationAdapter, adapter)
                 async_adapter.delayed_send(notification_dict=notification_dict, context_dict=context_dict)

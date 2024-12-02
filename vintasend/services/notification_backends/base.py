@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 
 class BaseNotificationBackend(ABC):
+    backend_kwargs: dict
+
     class Meta:
         abstract = True
 

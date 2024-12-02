@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, cast, Generic, TypeVar, overload
 
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplateRenderer
@@ -43,15 +43,24 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
     def __init__(self, template_renderer: T, backend: str, backend_kwargs: dict | None = None) -> None:
         ...
 
-    @abstractmethod
     def __init__(self, template_renderer: T | str, backend: B | str | None, backend_kwargs: dict | None = None) -> None:
         """
         Initialize the notification adapter.
 
-        :param backend: The backend to use to persist the notifications.
         :param template_renderer: The template renderer to use to render the notification templates.
+        :param backend: The backend to use to persist the notifications.
+        :param backend_kwargs: The backend kwargs to pass to the backend in case backend is an import string.
         """
-        raise NotImplementedError
+        from vintasend.services.helpers import get_notification_backend, get_template_renderer
+
+        if backend is not None and isinstance(backend, BaseNotificationBackend):
+            self.backend = cast(B, backend)
+        else:
+            self.backend = cast(B, get_notification_backend(backend, backend_kwargs))
+        if isinstance(template_renderer, str):
+            self.template_renderer = cast(T, get_template_renderer(template_renderer))
+        else:
+            self.template_renderer = template_renderer
 
     @abstractmethod
     def send(self, notification: "Notification", context: "NotificationContextDict") -> None:

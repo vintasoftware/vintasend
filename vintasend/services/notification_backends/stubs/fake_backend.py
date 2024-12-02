@@ -11,8 +11,11 @@ from vintasend.exceptions import NotificationNotFoundError
 
 class FakeFileBackend(BaseNotificationBackend):
     notifications: list[Notification]
+    database_file_name: str
+    backend_kwargs: dict
 
     def __init__(self, database_file_name: str = "notifications.json"):
+        self.backend_kwargs = {"database_file_name": database_file_name}
         self.database_file_name = database_file_name
         try:
             notifications_file = open(self.database_file_name, encoding="utf-8")
