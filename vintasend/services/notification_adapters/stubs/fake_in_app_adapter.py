@@ -2,9 +2,8 @@ from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 from vintasend.constants import NotificationTypes
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
-from vintasend.services.helpers import get_notification_backend, get_template_renderer
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplateRenderer
+from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
 if TYPE_CHECKING:
@@ -13,7 +12,7 @@ if TYPE_CHECKING:
 
 
 B = TypeVar("B", bound=BaseNotificationBackend)
-T = TypeVar("T", bound=BaseTemplateRenderer)
+T = TypeVar("T", bound=BaseNotificationTemplateRenderer)
 
 
 class FakeInAppAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):

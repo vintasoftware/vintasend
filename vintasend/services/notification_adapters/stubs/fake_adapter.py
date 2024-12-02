@@ -7,11 +7,11 @@ from vintasend.services.notification_adapters.base import BaseNotificationAdapte
 from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
 from vintasend.services.helpers import get_notification_backend, get_template_renderer
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplateRenderer
+from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplatedEmailRenderer
 
 
 B = TypeVar("B", bound=BaseNotificationBackend)
-T = TypeVar("T", bound=BaseTemplateRenderer)
+T = TypeVar("T", bound=BaseTemplatedEmailRenderer)
 
 class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
     notification_type = NotificationTypes.EMAIL

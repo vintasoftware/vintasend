@@ -5,9 +5,7 @@ from vintasend.app_settings import NotificationSettings
 
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
-    BaseTemplateRenderer,
-)
+from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
 def _import_class(import_string: str) -> Any:
@@ -85,7 +83,7 @@ def get_notification_backend(
     return cast(BaseNotificationBackend, backend)
 
 
-def get_template_renderer(template_renderer_import_str: str) -> BaseTemplateRenderer:
+def get_template_renderer(template_renderer_import_str: str) -> BaseNotificationTemplateRenderer:
     try:
         template_renderer_cls = _import_class(template_renderer_import_str)
     except (ImportError, ModuleNotFoundError) as e:
@@ -100,9 +98,9 @@ def get_template_renderer(template_renderer_import_str: str) -> BaseTemplateRend
             f"Notifications Template Renderer Error: Could not instantiate {template_renderer_import_str}"
         ) from e
     
-    if not isinstance(template_renderer, BaseTemplateRenderer):
+    if not isinstance(template_renderer, BaseNotificationTemplateRenderer):
         raise ValueError(
             f"Notifications Template Renderer Error: {template_renderer_import_str} is not a valid template renderer"
         )
 
-    return cast(BaseTemplateRenderer, template_renderer)
+    return cast(BaseNotificationTemplateRenderer, template_renderer)

@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, cast, Generic, TypeVar, overload
 
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplateRenderer
+from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
 if TYPE_CHECKING:
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 B = TypeVar("B", bound=BaseNotificationBackend)
-T = TypeVar("T", bound=BaseTemplateRenderer)
+T = TypeVar("T", bound=BaseNotificationTemplateRenderer)
 
 class BaseNotificationAdapter(Generic[B, T], ABC):
     """

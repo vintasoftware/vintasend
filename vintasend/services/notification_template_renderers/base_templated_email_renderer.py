@@ -19,7 +19,7 @@ class TemplatedEmail(NotificationSendInput):
     body: str
 
 
-class BaseTemplateRenderer(BaseNotificationTemplateRenderer):
+class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer):
     @abstractmethod
     def render(
         self, notification: Notification, context: "NotificationContextDict"
