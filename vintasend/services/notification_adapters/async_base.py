@@ -1,7 +1,9 @@
 from abc import abstractmethod
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import Protocol, TypedDict, runtime_checkable, TypeVar, Generic
 
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
+from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
 class NotificationDict(TypedDict):
@@ -25,7 +27,11 @@ class AsyncNotificationProtocol(Protocol):
         ...
 
 
-class AsyncBaseNotificationAdapter(AsyncNotificationProtocol, BaseNotificationAdapter):
+B = TypeVar("B", bound=BaseNotificationBackend)
+T = TypeVar("T", bound=BaseNotificationTemplateRenderer)
+
+
+class AsyncBaseNotificationAdapter(Generic[B, T], AsyncNotificationProtocol, BaseNotificationAdapter[B, T]):
     @abstractmethod
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
         raise NotImplementedError
