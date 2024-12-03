@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 
 class BaseNotificationBackend(ABC):
+    backend_import_str: str
     backend_kwargs: dict
 
     class Meta:
