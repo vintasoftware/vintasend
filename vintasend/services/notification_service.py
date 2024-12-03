@@ -28,6 +28,7 @@ from vintasend.services.dataclasses import (
 from vintasend.services.helpers import get_notification_adapters, get_notification_backend
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
+from vintasend.services.utils import get_class_path
 
 
 logger = logging.getLogger(__name__)
@@ -50,10 +51,6 @@ def register_context(key: str):
         return func
 
     return decorator
-
-
-def get_class_path(cls: Any) -> str:
-    return f"{cls.__class__.__module__}.{cls.__class__.__name__}"
 
 
 A = TypeVar("A", BaseNotificationAdapter, AsyncBaseNotificationAdapter)

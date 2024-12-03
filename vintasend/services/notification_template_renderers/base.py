@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from vintasend.services.utils import get_class_path
+
 
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import Notification
@@ -21,6 +23,10 @@ class BaseNotificationTemplateRenderer(ABC):
 
     The notification template renderer is responsible for rendering the notification templates.
     """
+    template_renderer_import_str: str
+
+    def __init__(self):
+        self.template_renderer_import_str = get_class_path(self)
 
     @abstractmethod
     def render(

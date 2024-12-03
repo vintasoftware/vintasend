@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
+from vintasend.services.utils import get_class_path
+
 
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import (
@@ -18,6 +20,10 @@ class BaseNotificationBackend(ABC):
 
     class Meta:
         abstract = True
+
+    def __init__(self, *args, **kwargs):
+        self.backend_import_str = get_class_path(self)
+        self.backend_kwargs = kwargs
 
     @abstractmethod
     def get_all_pending_notifications(self) -> Iterable["Notification"]:
