@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Protocol, TypedDict, runtime_checkable, TypeVar, Generic
+from typing import Any, Protocol, TypedDict, runtime_checkable, TypeVar, Generic
 
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
@@ -53,7 +53,7 @@ class AsyncBaseNotificationAdapter(Generic[B, T], AsyncNotificationProtocol, Bas
     def serialize_config(self) -> dict:
         return self.backend.config
 
-    def restore_config(self, config: dict) -> dict:
+    def restore_config(self, config: dict) -> Any:
         return config
 
     @abstractmethod
