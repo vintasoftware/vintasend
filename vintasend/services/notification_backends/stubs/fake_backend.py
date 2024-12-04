@@ -156,6 +156,7 @@ class FakeFileBackend(BaseNotificationBackend):
         for key, value in update_data.items():
             setattr(notification, key, value)
 
+        self._store_notifications()
         return notification
 
     def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification:
@@ -229,14 +230,19 @@ class Config:
         self.config_a = config_a if config_a is not None else Decimal("1.0")
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         self.config_b = config_b if config_b is not None else now
-        
 
+        
 class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
     config: Config
 
     def __init__(self, database_file_name: str = "notifications.json", config: Config | None = None):
         self.config = config or Config()
         super().__init__(database_file_name=database_file_name)
+
+    def _store_notifications(self):
+        assert self.config.config_a == Decimal("1.0")
+        assert isinstance(self.config.config_b, datetime.datetime)
+        super()._store_notifications()
 
 
 class InvalidBackend():
