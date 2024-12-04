@@ -28,6 +28,12 @@ class AsyncNotificationProtocol(Protocol):
 
     def restore_backend_kwargs(self, backend_kwargs: dict) -> dict:
         ...
+    
+    def serialize_config(self) -> dict:
+        ...
+
+    def restore_config(self, config: dict) -> dict:
+        ...
 
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
         ...
@@ -43,6 +49,12 @@ class AsyncBaseNotificationAdapter(Generic[B, T], AsyncNotificationProtocol, Bas
 
     def restore_backend_kwargs(self, backend_kwargs: dict) -> dict:
         return backend_kwargs
+    
+    def serialize_config(self) -> dict:
+        return self.backend.config
+
+    def restore_config(self, config: dict) -> dict:
+        return config
 
     @abstractmethod
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:

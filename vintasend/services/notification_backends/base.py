@@ -24,8 +24,8 @@ class BaseNotificationBackend(ABC):
 
     def __init__(self, *args, **kwargs):
         self.backend_import_str = get_class_path(self)
+        self.config = kwargs.pop("config")
         self.backend_kwargs = kwargs
-        self.config = kwargs.get("config")
 
     @abstractmethod
     def get_all_pending_notifications(self) -> Iterable["Notification"]:
