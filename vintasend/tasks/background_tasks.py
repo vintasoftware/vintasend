@@ -25,6 +25,9 @@ def send_notification(
             adapter_intances[0].restore_config(config) if config else None
         )
 
-    NotificationService(
-        adapters, backend, desserialized_backend_kwargs, desserialized_config
-    ).delayed_send(notification, context)
+    try:
+        NotificationService(
+            adapters, backend, desserialized_backend_kwargs, desserialized_config
+        ).delayed_send(notification, context)
+    except Exception as e:
+        logger.exception("Error sending notification: %s", e)
