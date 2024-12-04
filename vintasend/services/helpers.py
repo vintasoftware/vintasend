@@ -18,12 +18,13 @@ def get_notification_adapters(
     adapters_imports_strs: Iterable[tuple[str, str]] | None,
     backend: str | None = None,
     backend_kwargs: dict | None = None,
+    config: Any = None
 ) -> list[BaseNotificationAdapter]:
     default_adapters = []
     adapters_imports_strs_with_default = (
         adapters_imports_strs
         if adapters_imports_strs is not None
-        else NotificationSettings().NOTIFICATION_ADAPTERS
+        else NotificationSettings(config).NOTIFICATION_ADAPTERS
     )
     for adapter_import_string, template_renderer_import_str in adapters_imports_strs_with_default:
         try:
@@ -38,6 +39,7 @@ def get_notification_adapters(
                 template_renderer_import_str,
                 backend if backend else NotificationSettings().NOTIFICATION_BACKEND,
                 backend_kwargs,
+                config,
             )
         except Exception as e:  # noqa: BLE001
             raise ValueError(
@@ -54,12 +56,12 @@ def get_notification_adapters(
 
 
 def get_notification_backend(
-    backend_import_str: str | None, backend_kwargs: dict | None = None
+    backend_import_str: str | None, backend_kwargs: dict | None = None, config: Any = None
 ) -> BaseNotificationBackend:
     backend_import_str_with_fallback = (
         backend_import_str
         if backend_import_str is not None
-        else NotificationSettings().NOTIFICATION_BACKEND
+        else NotificationSettings(config).NOTIFICATION_BACKEND
     )
 
     try:

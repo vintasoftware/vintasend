@@ -23,6 +23,12 @@ class NotificationDict(TypedDict):
 
 @runtime_checkable
 class AsyncNotificationProtocol(Protocol):
+    def serialize_backend_kwargs(self) -> dict:
+        ...
+
+    def restore_backend_kwargs(self, backend_kwargs: dict) -> dict:
+        ...
+
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
         ...
 
@@ -32,6 +38,12 @@ T = TypeVar("T", bound=BaseNotificationTemplateRenderer)
 
 
 class AsyncBaseNotificationAdapter(Generic[B, T], AsyncNotificationProtocol, BaseNotificationAdapter[B, T]):
+    def serialize_backend_kwargs(self) -> dict:
+        return self.backend.backend_kwargs
+
+    def restore_backend_kwargs(self, backend_kwargs: dict) -> dict:
+        return backend_kwargs
+
     @abstractmethod
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
         raise NotImplementedError

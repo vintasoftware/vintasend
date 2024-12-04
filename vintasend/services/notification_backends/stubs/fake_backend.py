@@ -1,4 +1,5 @@
 import datetime
+from decimal import Decimal
 import json
 import os
 import uuid
@@ -218,6 +219,19 @@ class FakeFileBackend(BaseNotificationBackend):
         notification.context_used = context
         self._store_notifications()
     
+
+
+class Config:
+    def __init__(self):
+        self.config_a = Decimal("1.0")
+        self.config_b = datetime.datetime.now(tz=datetime.timezone.utc)
+        
+
+class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
+    def __init__(self, database_file_name: str = "notifications.json", config: Config | None = None):
+        self.config = config or Config()
+        super().__init__(database_file_name=database_file_name)
+
 
 class InvalidBackend():
     def __init__(self, *_args, **_kwargs):

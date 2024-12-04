@@ -5,7 +5,6 @@ from vintasend.constants import NotificationTypes
 from vintasend.services.dataclasses import Notification, NotificationContextDict
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
-from vintasend.services.helpers import get_notification_backend, get_template_renderer
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplatedEmailRenderer
 

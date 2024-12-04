@@ -65,18 +65,22 @@ class NotificationService(Generic[A, B]):
         notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None = None,
         notification_backend: B | str | None = None,
         notification_backend_kwargs: dict | None = None,
+        config: Any = None,
     ):
         if isinstance(notification_backend, BaseNotificationBackend):
             self.notification_backend = cast(B, notification_backend)
         else:
             self.notification_backend = cast(B, get_notification_backend(
-                notification_backend, notification_backend_kwargs
+                notification_backend, notification_backend_kwargs, config
             ))
         self.notification_backend_import_str = get_class_path(self.notification_backend)
 
         if notification_adapters is None or self._check_is_adapters_tuple_iterable(notification_adapters):
             self.notification_adapters = cast(Iterable[A], get_notification_adapters(
-                notification_adapters, self.notification_backend_import_str, notification_backend_kwargs if notification_backend_kwargs is not None else {}
+                notification_adapters, 
+                self.notification_backend_import_str, 
+                notification_backend_kwargs if notification_backend_kwargs is not None else {},
+                config,
             ))
         elif self._check_is_base_notification_adapter_iterable(notification_adapters):
             self.notification_adapters = notification_adapters

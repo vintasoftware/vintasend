@@ -2,7 +2,7 @@ import datetime
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vintasend.services.utils import get_class_path
 
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 class BaseNotificationBackend(ABC):
     backend_import_str: str
     backend_kwargs: dict
+    config: Any
 
     class Meta:
         abstract = True
@@ -24,6 +25,7 @@ class BaseNotificationBackend(ABC):
     def __init__(self, *args, **kwargs):
         self.backend_import_str = get_class_path(self)
         self.backend_kwargs = kwargs
+        self.config = kwargs.get("config")
 
     @abstractmethod
     def get_all_pending_notifications(self) -> Iterable["Notification"]:

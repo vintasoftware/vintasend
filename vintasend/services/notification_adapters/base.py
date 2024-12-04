@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, cast, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, Any, cast, Generic, TypeVar, overload
 
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
@@ -44,7 +44,13 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
     def __init__(self, template_renderer: T, backend: str, backend_kwargs: dict | None = None) -> None:
         ...
 
-    def __init__(self, template_renderer: T | str, backend: B | str | None, backend_kwargs: dict | None = None) -> None:
+    def __init__(
+        self, 
+        template_renderer: T | str, 
+        backend: B | str | None, 
+        backend_kwargs: dict | None = None,
+        config: Any = None
+    ) -> None:
         """
         Initialize the notification adapter.
 
@@ -57,13 +63,14 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
         if backend is not None and isinstance(backend, BaseNotificationBackend):
             self.backend = cast(B, backend)
         else:
-            self.backend = cast(B, get_notification_backend(backend, backend_kwargs))
+            self.backend = cast(B, get_notification_backend(backend, backend_kwargs, config))
         if isinstance(template_renderer, str):
             self.template_renderer = cast(T, get_template_renderer(template_renderer))
         else:
             self.template_renderer = template_renderer
 
         self.adapter_import_str = f"{self.__module__}.{self.__class__.__name__}"
+        self.config = config
 
     @abstractmethod
     def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
