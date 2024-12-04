@@ -24,7 +24,7 @@ class BaseNotificationBackend(ABC):
 
     def __init__(self, *args, **kwargs):
         self.backend_import_str = get_class_path(self)
-        self.config = kwargs.pop("config")
+        self.config = kwargs.pop("config", None)
         self.backend_kwargs = kwargs
 
     @abstractmethod
