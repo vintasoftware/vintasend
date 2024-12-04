@@ -26,6 +26,7 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
 
     backend: B
     template_renderer: T
+    adapter_import_str: str
 
     @overload
     def __init__(self, template_renderer: T, backend: B, backend_kwargs: None = None) -> None:
@@ -61,6 +62,8 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
             self.template_renderer = cast(T, get_template_renderer(template_renderer))
         else:
             self.template_renderer = template_renderer
+
+        self.adapter_import_str = f"{self.__module__}.{self.__class__.__name__}"
 
     @abstractmethod
     def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
