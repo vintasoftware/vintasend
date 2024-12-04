@@ -228,6 +228,8 @@ class Config:
         
 
 class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
+    config: Config
+
     def __init__(self, database_file_name: str = "notifications.json", config: Config | None = None):
         self.config = config or Config()
         super().__init__(database_file_name=database_file_name)
