@@ -32,7 +32,7 @@ class AsyncNotificationProtocol(Protocol):
     def serialize_config(self) -> dict:
         ...
 
-    def restore_config(self, config: dict) -> dict:
+    def restore_config(self, config: dict) -> Any:
         ...
 
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
