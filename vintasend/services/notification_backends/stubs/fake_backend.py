@@ -14,8 +14,8 @@ class FakeFileBackend(BaseNotificationBackend):
     notifications: list[Notification]
     database_file_name: str
 
-    def __init__(self, database_file_name: str = "notifications.json"):
-        super().__init__(database_file_name=database_file_name)
+    def __init__(self, database_file_name: str = "notifications.json", **kwargs):
+        super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
         try:
             notifications_file = open(self.database_file_name, encoding="utf-8")
@@ -236,8 +236,7 @@ class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
     config: Config
 
     def __init__(self, database_file_name: str = "notifications.json", config: Config | None = None):
-        self.config = config or Config()
-        super().__init__(database_file_name=database_file_name)
+        super().__init__(database_file_name=database_file_name, config=config)
 
     def _store_notifications(self):
         assert self.config.config_a == Decimal("1.0")
