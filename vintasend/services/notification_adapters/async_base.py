@@ -51,10 +51,11 @@ class AsyncBaseNotificationAdapter(Generic[B, T], AsyncNotificationProtocol, Bas
         return backend_kwargs
     
     def serialize_config(self) -> dict:
-        return self.backend.config
+        return self.config
 
     def restore_config(self, config: dict) -> Any:
-        return config
+        self.config = config
+        return self.config
 
     @abstractmethod
     def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
