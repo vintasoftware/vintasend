@@ -221,10 +221,14 @@ class FakeFileBackend(BaseNotificationBackend):
     
 
 
+
 class Config:
-    def __init__(self):
-        self.config_a = Decimal("1.0")
-        self.config_b = datetime.datetime.now(tz=datetime.timezone.utc)
+    def __init__(
+        self, config_a: Decimal | None = None, config_b: datetime.datetime | None = None
+    ):
+        self.config_a = config_a if config_a is not None else Decimal("1.0")
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        self.config_b = config_b if config_b is not None else now
         
 
 class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
