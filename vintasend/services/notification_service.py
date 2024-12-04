@@ -27,7 +27,7 @@ from vintasend.services.dataclasses import (
 )
 from vintasend.services.helpers import get_notification_adapters, get_notification_backend
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
+from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter, NotificationDict
 from vintasend.services.utils import get_class_path
 
 
@@ -407,7 +407,7 @@ class NotificationService(Generic[A, B]):
         """
         return self.notification_backend.cancel_notification(notification_id)
 
-    def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
+    def delayed_send(self, notification_dict: NotificationDict, context_dict: dict) -> None:
         """
         Send a notification using the appropriate adapter with a delay.
 
@@ -426,8 +426,28 @@ class NotificationService(Generic[A, B]):
             if adapter.notification_type.value != notification_dict.get("notification_type"):
                 continue
 
-            # adapter might have a dynamic inheritance, so we need to check if it has the delayed_send method
-            # instead of using isinstance
-            if isinstance(adapter, AsyncBaseNotificationAdapter):
-                async_adapter = cast(AsyncBaseNotificationAdapter, adapter)
-                async_adapter.delayed_send(notification_dict=notification_dict, context_dict=context_dict)
+            if not isinstance(adapter, AsyncBaseNotificationAdapter):
+                return None
+            
+            async_adapter = cast(AsyncBaseNotificationAdapter, adapter)
+            try:
+                async_adapter.delayed_send(
+                    notification_dict=notification_dict, 
+                    context_dict=context_dict
+                )
+            except Exception as e:  # noqa: BLE001
+                try:
+                    raise NotificationSendError("Failed to send notification") from e
+                except NotificationSendError as e:
+                    try:
+                        self.notification_backend.mark_pending_as_failed(notification_dict["id"])
+                    except NotificationUpdateError:
+                        raise NotificationMarkFailedError(
+                            "Failed to mark notification as failed"
+                        ) from e
+                    raise e
+            try:
+                self.notification_backend.mark_pending_as_sent(notification_dict["id"])
+                self.notification_backend.store_context_used(notification_dict["id"], context_dict)
+            except NotificationUpdateError as e:
+                raise NotificationMarkSentError("Failed to mark notification as sent") from e

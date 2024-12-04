@@ -35,7 +35,7 @@ class AsyncNotificationProtocol(Protocol):
     def restore_config(self, config: dict) -> Any:
         ...
 
-    def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
+    def delayed_send(self, notification_dict: NotificationDict, context_dict: dict) -> None:
         ...
 
 
@@ -58,5 +58,5 @@ class AsyncBaseNotificationAdapter(Generic[B, T], AsyncNotificationProtocol, Bas
         return self.config
 
     @abstractmethod
-    def delayed_send(self, notification_dict: dict, context_dict: dict) -> None:
+    def delayed_send(self, notification_dict: NotificationDict, context_dict: dict) -> None:
         raise NotImplementedError

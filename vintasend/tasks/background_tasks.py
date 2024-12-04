@@ -1,8 +1,7 @@
 import logging
-from typing import Iterable
 
-from vintasend.services.helpers import get_notification_adapters, get_notification_backend
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
+from vintasend.services.helpers import get_notification_adapters
+from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter, NotificationDict
 from vintasend.services.notification_service import NotificationService
 
 
@@ -10,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 def send_notification(
-    notification: dict,
+    notification: NotificationDict,
     context: dict,
     adapters: list[tuple[str, str]] | None = None,
     backend: str | None = None,
