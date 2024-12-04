@@ -86,11 +86,26 @@ class NotificationService(Generic[A, B]):
             (get_class_path(adapter), get_class_path(adapter.template_renderer)) for adapter in self.notification_adapters
         ]
         
-    def _check_is_base_notification_adapter_iterable(self, notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None) -> TypeGuard[Iterable[A]]:
-        return notification_adapters is not None and all(isinstance(adapter, BaseNotificationAdapter) for adapter in notification_adapters)
+    def _check_is_base_notification_adapter_iterable(
+        self, 
+        notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None
+    ) -> TypeGuard[Iterable[A]]:
+        return notification_adapters is not None and all(
+            isinstance(adapter, BaseNotificationAdapter) 
+            for adapter in notification_adapters
+        )
         
-    def _check_is_adapters_tuple_iterable(self, notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None) -> TypeGuard[Iterable[tuple[str, str]]]:
-        return notification_adapters is not None and all(isinstance(adapter, tuple) and len(adapter) == 2 and isinstance(adapter[0], str) and isinstance(adapter[1], str) for adapter in notification_adapters)
+    def _check_is_adapters_tuple_iterable(
+        self, 
+        notification_adapters: Iterable[A] | Iterable[tuple[str, str]] | None
+    ) -> TypeGuard[Iterable[tuple[str, str]]]:
+        return notification_adapters is not None and all(
+            (isinstance(adapter, tuple) or isinstance(adapter, list)) 
+            and len(adapter) == 2 
+            and isinstance(adapter[0], str) 
+            and isinstance(adapter[1], str) 
+            for adapter in notification_adapters
+        )
 
     def send(self, notification: Notification) -> None:
         """
