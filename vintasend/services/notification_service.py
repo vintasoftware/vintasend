@@ -139,6 +139,8 @@ class NotificationService(Generic[A, B]):
                     notification=notification,
                     context=context,
                 )
+                if isinstance(adapter, AsyncBaseNotificationAdapter):
+                    return
             except Exception as e:  # noqa: BLE001
                 try:
                     raise NotificationSendError("Failed to send notification") from e
