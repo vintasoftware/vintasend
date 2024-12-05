@@ -3,7 +3,7 @@ from typing import Any, cast
 
 from vintasend.app_settings import NotificationSettings
 
-from vintasend.services.notification_adapters.asynio_base import AsyncIOBaseNotificationAdapter
+from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend

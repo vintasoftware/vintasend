@@ -12,7 +12,7 @@ try:
 except ImportError:
     from typing_extensions import Unpack
 
-from vintasend.services.notification_adapters.asynio_base import AsyncIOBaseNotificationAdapter
+from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.utils.singleton_utils import SingletonMeta
 from vintasend.constants import NotificationTypes
