@@ -1174,6 +1174,9 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
     def teardown_method(self, method):
         FakeFileBackend(database_file_name="service-tests-notifications.json").clear()
 
+    def teardown_class(self) -> None:
+        FakeFileBackend(database_file_name="service-tests-notifications.json").clear()
+
     def create_notification_context(self, test):
         if test != "test":
             raise ValueError()
