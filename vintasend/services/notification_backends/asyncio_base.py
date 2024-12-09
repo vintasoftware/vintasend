@@ -3,12 +3,17 @@ import asyncio
 import datetime
 import uuid
 from typing import TYPE_CHECKING, Iterable
-from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.utils import get_class_path
 
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
 
 class AsyncIOBaseNotificationBackend(ABC):
+    def __init__(self, *args, **kwargs):
+        self.backend_import_str = get_class_path(self)
+        self.config = kwargs.pop("config", None)
+        self.backend_kwargs = kwargs
+
     @abstractmethod
     async def get_all_pending_notifications(self) -> Iterable["Notification"]:
         ...
