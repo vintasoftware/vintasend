@@ -22,6 +22,6 @@ class TemplatedEmail(NotificationSendInput):
 class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer):
     @abstractmethod
     def render(
-        self, notification: Notification, context: "NotificationContextDict"
+        self, notification: Notification, context: "NotificationContextDict", **kwargs
     ) -> TemplatedEmail:
         raise NotImplementedError

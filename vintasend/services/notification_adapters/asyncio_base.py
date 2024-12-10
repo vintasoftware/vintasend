@@ -1,10 +1,9 @@
-
-
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, cast, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast, overload
 
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
+
 
 if TYPE_CHECKING:
     from vintasend.constants import NotificationTypes
@@ -28,30 +27,55 @@ class AsyncIOBaseNotificationAdapter(Generic[B, T], ABC):
     backend: B
     template_renderer: T
     adapter_import_str: str
-    is_async: bool = True
+    adapter_kwargs: dict
 
     @overload
-    def __init__(self, template_renderer: T, backend: B, backend_kwargs: None = None) -> None:
-        ...
-    
-    @overload
-    def __init__(self, template_renderer: str, backend: str, backend_kwargs: dict | None = None) -> None:
-        ...
+    def __init__(
+        self,
+        template_renderer: T,
+        backend: B,
+        backend_kwargs: None = None,
+        config: Any = None,
+        **kwargs,
+    ) -> None: ...
 
     @overload
-    def __init__(self, template_renderer: str, backend: B, backend_kwargs: None = None) -> None:
-        ...
+    def __init__(
+        self,
+        template_renderer: str,
+        backend: str,
+        backend_kwargs: dict | None = None,
+        config: Any = None,
+        **kwargs,
+    ) -> None: ...
 
     @overload
-    def __init__(self, template_renderer: T, backend: str, backend_kwargs: dict | None = None) -> None:
-        ...
+    def __init__(
+        self,
+        template_renderer: str,
+        backend: B,
+        backend_kwargs: None = None,
+        config: Any = None,
+        **kwargs,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        template_renderer: T,
+        backend: str,
+        backend_kwargs: dict | None = None,
+        config: Any = None,
+        **kwargs,
+    ) -> None: ...
 
     def __init__(
-        self, 
-        template_renderer: T | str, 
-        backend: B | str | None, 
+        self,
+        template_renderer: T | str,
+        backend: B | str | None,
         backend_kwargs: dict | None = None,
-        config: Any = None
+        config: Any = None,
+        **kwargs,
     ) -> None:
         """
         Initialize the notification adapter.
@@ -60,12 +84,19 @@ class AsyncIOBaseNotificationAdapter(Generic[B, T], ABC):
         :param backend: The backend to use to persist the notifications.
         :param backend_kwargs: The backend kwargs to pass to the backend in case backend is an import string.
         """
-        from vintasend.services.helpers import get_asyncio_notification_backend, get_template_renderer
+        from vintasend.services.helpers import (
+            get_asyncio_notification_backend,
+            get_template_renderer,
+        )
+
+        self.adapter_kwargs = kwargs
 
         if backend is not None and isinstance(backend, AsyncIOBaseNotificationBackend):
             self.backend = cast(B, backend)
         else:
-            self.backend = cast(B, get_asyncio_notification_backend(backend, backend_kwargs, config))
+            self.backend = cast(
+                B, get_asyncio_notification_backend(backend, backend_kwargs, config)
+            )
         if isinstance(template_renderer, str):
             self.template_renderer = cast(T, get_template_renderer(template_renderer))
         else:

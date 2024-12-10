@@ -31,13 +31,7 @@ class NotificationContextDict(dict):
             raise TypeError("Keys must be strings")
         if not isinstance(
             value,
-            (
-                int
-                | float
-                | str
-                | list
-                | dict
-            ),
+            (int | float | str | list | dict),
         ):
             raise TypeError("Value must be an int, float, str, list, or dict")
         if isinstance(value, list):
@@ -76,7 +70,7 @@ class Notification:
     context_used: dict | None = None
 
 
-class UpdateNotificationKwargs(TypedDict, total=False): 
+class UpdateNotificationKwargs(TypedDict, total=False):
     title: str
     body_template: str
     context_name: str

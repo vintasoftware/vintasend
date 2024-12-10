@@ -1,16 +1,15 @@
 import asyncio
 import datetime
-from decimal import Decimal
 import json
 import os
 import uuid
-from typing import Iterable
+from decimal import Decimal
 
 from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
-from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.exceptions import NotificationNotFoundError
+from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
+from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
+from vintasend.services.notification_backends.base import BaseNotificationBackend
 
 
 class FakeFileBackend(BaseNotificationBackend):
@@ -255,6 +254,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
+        super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
         try:
             notifications_file = open(self.database_file_name, encoding="utf-8")

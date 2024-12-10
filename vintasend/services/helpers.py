@@ -2,7 +2,6 @@ from collections.abc import Iterable
 from typing import Any, cast
 
 from vintasend.app_settings import NotificationSettings
-
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -16,11 +15,46 @@ def _import_class(import_string: str) -> Any:
     return getattr(module, class_name)
 
 
+def get_asyncio_notification_adapter_cls(adapter_import_str: str) -> Any:
+    try:
+        adapter_cls = _import_class(adapter_import_str)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise ValueError(
+            f"Notifications Adapter Error: Could not import {adapter_import_str}"
+        ) from e
+
+    if not issubclass(adapter_cls, AsyncIOBaseNotificationAdapter):
+        raise ValueError(
+            f"Notifications Adapter Error: {adapter_import_str} is not a valid AsyncIO notification adapter"
+        )
+
+    return adapter_cls
+
+
+def get_notification_adapter_cls(adapter_import_str: str) -> Any:
+    try:
+        adapter_cls = _import_class(adapter_import_str)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise ValueError(
+            f"Notifications Adapter Error: Could not import {adapter_import_str}"
+        ) from e
+
+    if not issubclass(adapter_cls, BaseNotificationAdapter):
+        raise ValueError(
+            f"Notifications Adapter Error: {adapter_import_str} is not a valid notification adapter"
+        )
+
+    return adapter_cls
+
+
 def get_notification_adapters(
-    adapters_imports_strs: Iterable[tuple[str, str]] | None,
+    adapters_imports_strs: Iterable[
+        tuple[str | tuple[str, dict[str, Any]], str | tuple[str, dict[str, Any]]]
+    ]
+    | None,
     backend: str | None = None,
     backend_kwargs: dict | None = None,
-    config: Any = None
+    config: Any = None,
 ) -> list[BaseNotificationAdapter]:
     default_adapters = []
     adapters_imports_strs_with_default = (
@@ -28,12 +62,16 @@ def get_notification_adapters(
         if adapters_imports_strs is not None
         else NotificationSettings(config).NOTIFICATION_ADAPTERS
     )
-    for adapter_import_string, template_renderer_import_str in adapters_imports_strs_with_default:
+    for adapter_import_str, template_renderer_import_str in adapters_imports_strs_with_default:
+        adapter_kwargs: dict = {}
+        if isinstance(adapter_import_str, tuple):
+            adapter_import_str, adapter_kwargs = adapter_import_str
+
         try:
-            adapter_cls = _import_class(adapter_import_string)
+            adapter_cls = _import_class(adapter_import_str)
         except (ImportError, ModuleNotFoundError) as e:
             raise ValueError(
-                f"Notifications Adapter Error: Could not import {adapter_import_string}"
+                f"Notifications Adapter Error: Could not import {adapter_import_str}"
             ) from e
 
         try:
@@ -42,15 +80,16 @@ def get_notification_adapters(
                 backend if backend else NotificationSettings().NOTIFICATION_BACKEND,
                 backend_kwargs,
                 config,
+                **adapter_kwargs,
             )
         except Exception as e:  # noqa: BLE001
             raise ValueError(
-                f"Notifications Adapter Error: Could not instantiate {adapter_import_string}"
+                f"Notifications Adapter Error: Could not instantiate {adapter_import_str}"
             ) from e
 
         if not isinstance(adapter, BaseNotificationAdapter):
             raise ValueError(
-                f"Notifications Adapter Error: {adapter_import_string} is not a valid notification adapter"
+                f"Notifications Adapter Error: {adapter_import_str} is not a valid notification adapter"
             )
 
         default_adapters.append(cast(BaseNotificationAdapter, adapter))
@@ -58,10 +97,13 @@ def get_notification_adapters(
 
 
 def get_asyncio_notification_adapters(
-    adapters_imports_strs: Iterable[tuple[str, str]] | None,
+    adapters_imports_strs: Iterable[
+        tuple[str | tuple[str, dict[str, Any]], str | tuple[str, dict[str, Any]]]
+    ]
+    | None,
     backend: str | None = None,
     backend_kwargs: dict | None = None,
-    config: Any = None
+    config: Any = None,
 ) -> list[AsyncIOBaseNotificationAdapter]:
     default_adapters = []
     adapters_imports_strs_with_default = (
@@ -69,12 +111,15 @@ def get_asyncio_notification_adapters(
         if adapters_imports_strs is not None
         else NotificationSettings(config).NOTIFICATION_ADAPTERS
     )
-    for adapter_import_string, template_renderer_import_str in adapters_imports_strs_with_default:
+    for adapter_import_str, template_renderer_import_str in adapters_imports_strs_with_default:
+        adapter_kwargs: dict = {}
+        if isinstance(adapter_import_str, tuple):
+            adapter_import_str, adapter_kwargs = adapter_import_str
         try:
-            adapter_cls = _import_class(adapter_import_string)
+            adapter_cls = _import_class(adapter_import_str)
         except (ImportError, ModuleNotFoundError) as e:
             raise ValueError(
-                f"Notifications Adapter Error: Could not import {adapter_import_string}"
+                f"Notifications Adapter Error: Could not import {adapter_import_str}"
             ) from e
 
         try:
@@ -83,15 +128,16 @@ def get_asyncio_notification_adapters(
                 backend if backend else NotificationSettings().NOTIFICATION_BACKEND,
                 backend_kwargs,
                 config,
+                **adapter_kwargs,
             )
         except Exception as e:  # noqa: BLE001
             raise ValueError(
-                f"Notifications Adapter Error: Could not instantiate {adapter_import_string}"
+                f"Notifications Adapter Error: Could not instantiate {adapter_import_str}"
             ) from e
 
         if not isinstance(adapter, AsyncIOBaseNotificationAdapter):
             raise ValueError(
-                f"Notifications Adapter Error: {adapter_import_string} is not a valid notification adapter"
+                f"Notifications Adapter Error: {adapter_import_str} is not a valid notification adapter"
             )
 
         default_adapters.append(cast(AsyncIOBaseNotificationAdapter, adapter))
@@ -153,12 +199,18 @@ def get_asyncio_notification_backend(
 
     if not isinstance(backend, AsyncIOBaseNotificationBackend):
         raise ValueError(
-            f"Notifications Backend Error: {backend_import_str_with_fallback} is not a valid notification backend"
+            f"Notifications Backend Error: {backend_import_str_with_fallback} is not a valid AsyncIO notification backend"
         )
     return cast(AsyncIOBaseNotificationBackend, backend)
 
 
-def get_template_renderer(template_renderer_import_str: str) -> BaseNotificationTemplateRenderer:
+def get_template_renderer(
+    template_renderer_import_str: str | tuple[str, dict[str, Any]],
+) -> BaseNotificationTemplateRenderer:
+    template_renderer_kwargs: dict[str, Any] = {}
+    if isinstance(template_renderer_import_str, tuple):
+        template_renderer_import_str, template_renderer_kwargs = template_renderer_import_str
+
     try:
         template_renderer_cls = _import_class(template_renderer_import_str)
     except (ImportError, ModuleNotFoundError) as e:
@@ -167,12 +219,12 @@ def get_template_renderer(template_renderer_import_str: str) -> BaseNotification
         ) from e
 
     try:
-        template_renderer = template_renderer_cls()
+        template_renderer = template_renderer_cls(**template_renderer_kwargs)
     except Exception as e:  # noqa: BLE001
         raise ValueError(
             f"Notifications Template Renderer Error: Could not instantiate {template_renderer_import_str}"
         ) from e
-    
+
     if not isinstance(template_renderer, BaseNotificationTemplateRenderer):
         raise ValueError(
             f"Notifications Template Renderer Error: {template_renderer_import_str} is not a valid template renderer"

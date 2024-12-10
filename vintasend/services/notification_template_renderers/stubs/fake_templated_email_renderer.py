@@ -17,7 +17,7 @@ class FakeTemplateRendererWithException(BaseTemplatedEmailRenderer):
         raise NotificationBodyTemplateRenderingError("Fake error")
 
 
-class InvalidTemplateRenderer():
+class InvalidTemplateRenderer:
     pass
 
 

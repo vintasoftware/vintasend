@@ -1,20 +1,26 @@
 import asyncio
 import datetime
-from typing import TYPE_CHECKING, cast, Generic, TypeVar, overload
 import uuid
+from typing import TYPE_CHECKING, Generic, TypeVar, cast, overload
 
 from vintasend.constants import NotificationTypes
 from vintasend.services.dataclasses import Notification, NotificationContextDict
+from vintasend.services.notification_adapters.async_base import (
+    AsyncBaseNotificationAdapter,
+    NotificationDict,
+)
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter, NotificationDict
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_template_renderers.base_templated_email_renderer import BaseTemplatedEmailRenderer
+from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
+    BaseTemplatedEmailRenderer,
+)
 
 
 B = TypeVar("B", bound=BaseNotificationBackend)
 T = TypeVar("T", bound=BaseTemplatedEmailRenderer)
+
 
 class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
     notification_type = NotificationTypes.EMAIL
@@ -32,6 +38,7 @@ class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
 
 
 BAIO = TypeVar("BAIO", bound=AsyncIOBaseNotificationBackend)
+
 
 class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[BAIO, T]):
     notification_type = NotificationTypes.EMAIL
@@ -73,19 +80,17 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
         )
         return Notification(
             id=(
-                self._convert_to_uuid(notification_dict["id"]) 
-                if isinstance(notification_dict["id"], str) 
+                self._convert_to_uuid(notification_dict["id"])
+                if isinstance(notification_dict["id"], str)
                 else notification_dict["id"]
             ),
             user_id=(
-                self._convert_to_uuid(notification_dict["user_id"]) 
-                if isinstance(notification_dict["user_id"], str) 
+                self._convert_to_uuid(notification_dict["user_id"])
+                if isinstance(notification_dict["user_id"], str)
                 else notification_dict["user_id"]
             ),
             context_kwargs={
-                key: self._convert_to_uuid(value) 
-                if isinstance(value, str) 
-                else value 
+                key: self._convert_to_uuid(value) if isinstance(value, str) else value
                 for key, value in notification_dict["context_kwargs"].items()
             },
             send_after=send_after,
@@ -99,6 +104,7 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
             preheader_template=notification_dict["preheader_template"],
         )
 
-class InvalidAdapter():
+
+class InvalidAdapter:
     def __init__(self, *_args, **_kwargs):
         pass

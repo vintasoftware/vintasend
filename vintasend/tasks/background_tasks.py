@@ -1,7 +1,13 @@
 import logging
+from typing import Any
 
-from vintasend.services.helpers import get_notification_adapters
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter, NotificationDict
+from vintasend.services.helpers import (
+    get_notification_adapter_cls,
+)
+from vintasend.services.notification_adapters.async_base import (
+    AsyncBaseNotificationAdapter,
+    NotificationDict,
+)
 from vintasend.services.notification_service import NotificationService
 
 
@@ -11,23 +17,43 @@ logger = logging.getLogger(__name__)
 def send_notification(
     notification: NotificationDict,
     context: dict,
-    adapters: list[tuple[str, str]] | None = None,
-    backend: str | None = None,
+    adapters: list[tuple[str | tuple[str, dict[str, Any]], str | tuple[str, dict[str, Any]]]],
+    backend: str,
     backend_kwargs: dict | None = None,
     config: dict | None = None,
 ):
-    adapter_intances = get_notification_adapters(adapters, backend, backend_kwargs)
-    if isinstance(adapter_intances[0], AsyncBaseNotificationAdapter):
-        desserialized_backend_kwargs = (
-            adapter_intances[0].restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
-        )
-        desserialized_config = (
-            adapter_intances[0].restore_config(config) if config else None
-        )
+    adapter_cls = get_notification_adapter_cls(
+        adapters[0][0] if isinstance(adapters[0][0], str) else adapters[0][0][0]
+    )
+    
+    # we only send a single adapter to async notifications
+    if not isinstance(adapter_cls, AsyncBaseNotificationAdapter):
+        return
+    
+    desserialized_backend_kwargs = (
+        adapter_cls.restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
+    )
+    desserialized_config = (
+        adapter_cls.restore_config(config) if config else None
+    )
+    desserialized_adapter_kwargs = (
+        adapter_cls.restore_adapter_kwargs(adapters[0][0][1]) if isinstance(adapters[0][0], tuple) else {}
+    )
 
+    desserialized_template_renderer_kwargs = (
+        adapter_cls.restore_template_renderer_kwargs(adapters[0][1][1])
+        if isinstance(adapters[0][1], tuple)
+        else {}
+    )
+
+    adapters_import_tuple = (
+        (adapters[0][0][0], desserialized_adapter_kwargs), 
+        (adapters[0][1][0], desserialized_template_renderer_kwargs)
+    )
     try:
-        NotificationService(
-            adapters, backend, desserialized_backend_kwargs, desserialized_config
-        ).delayed_send(notification, context)
+        service: NotificationService[Any, Any] = NotificationService(
+            [adapters_import_tuple], backend, desserialized_backend_kwargs, desserialized_config
+        )
+        service.delayed_send(notification, context)
     except Exception as e:
         logger.exception("Error sending notification: %s", e)

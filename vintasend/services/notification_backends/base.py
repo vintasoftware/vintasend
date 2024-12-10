@@ -44,11 +44,15 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> Iterable["Notification"]:
+    def get_all_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID
+    ) -> Iterable["Notification"]:
         raise NotImplementedError
 
     @abstractmethod
-    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> Iterable["Notification"]:
+    def get_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> Iterable["Notification"]:
         raise NotImplementedError
 
     @abstractmethod
@@ -116,7 +120,7 @@ class BaseNotificationBackend(ABC):
     @abstractmethod
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         raise NotImplementedError
-    
+
     @abstractmethod
     def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
         raise NotImplementedError

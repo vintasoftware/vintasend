@@ -23,10 +23,13 @@ class BaseNotificationTemplateRenderer(ABC):
 
     The notification template renderer is responsible for rendering the notification templates.
     """
-    template_renderer_import_str: str
 
-    def __init__(self):
+    template_renderer_import_str: str
+    template_renderer_kwargs: dict
+
+    def __init__(self, **kwargs):
         self.template_renderer_import_str = get_class_path(self)
+        self.template_renderer_kwargs = kwargs
 
     @abstractmethod
     def render(
