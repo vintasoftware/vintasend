@@ -57,10 +57,11 @@ def get_notification_adapters(
     config: Any = None,
 ) -> list[BaseNotificationAdapter]:
     default_adapters = []
+    app_settings = NotificationSettings(config)
     adapters_imports_strs_with_default = (
         adapters_imports_strs
         if adapters_imports_strs is not None
-        else NotificationSettings(config).NOTIFICATION_ADAPTERS
+        else app_settings.NOTIFICATION_ADAPTERS
     )
     for adapter_import_str, template_renderer_import_str in adapters_imports_strs_with_default:
         adapter_kwargs: dict = {}
@@ -77,7 +78,7 @@ def get_notification_adapters(
         try:
             adapter = adapter_cls(
                 template_renderer_import_str,
-                backend if backend else NotificationSettings().NOTIFICATION_BACKEND,
+                backend if backend else app_settings.NOTIFICATION_BACKEND,
                 backend_kwargs,
                 config,
                 **adapter_kwargs,
@@ -106,10 +107,11 @@ def get_asyncio_notification_adapters(
     config: Any = None,
 ) -> list[AsyncIOBaseNotificationAdapter]:
     default_adapters = []
+    app_settings = NotificationSettings(config)
     adapters_imports_strs_with_default = (
         adapters_imports_strs
         if adapters_imports_strs is not None
-        else NotificationSettings(config).NOTIFICATION_ADAPTERS
+        else app_settings.NOTIFICATION_ADAPTERS
     )
     for adapter_import_str, template_renderer_import_str in adapters_imports_strs_with_default:
         adapter_kwargs: dict = {}
@@ -125,7 +127,7 @@ def get_asyncio_notification_adapters(
         try:
             adapter = adapter_cls(
                 template_renderer_import_str,
-                backend if backend else NotificationSettings().NOTIFICATION_BACKEND,
+                backend if backend else app_settings.NOTIFICATION_BACKEND,
                 backend_kwargs,
                 config,
                 **adapter_kwargs,
@@ -147,10 +149,11 @@ def get_asyncio_notification_adapters(
 def get_notification_backend(
     backend_import_str: str | None, backend_kwargs: dict | None = None, config: Any = None
 ) -> BaseNotificationBackend:
+    app_settings = NotificationSettings(config)
     backend_import_str_with_fallback = (
         backend_import_str
         if backend_import_str is not None
-        else NotificationSettings(config).NOTIFICATION_BACKEND
+        else app_settings.NOTIFICATION_BACKEND
     )
 
     try:
@@ -177,10 +180,11 @@ def get_notification_backend(
 def get_asyncio_notification_backend(
     backend_import_str: str | None, backend_kwargs: dict | None = None, config: Any = None
 ) -> AsyncIOBaseNotificationBackend:
+    app_settings = NotificationSettings(config)
     backend_import_str_with_fallback = (
         backend_import_str
         if backend_import_str is not None
-        else NotificationSettings(config).NOTIFICATION_BACKEND
+        else app_settings.NOTIFICATION_BACKEND
     )
 
     try:

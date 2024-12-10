@@ -1,6 +1,8 @@
 import os
 from typing import Any, TypedDict, cast
 
+from vintasend.utils.singleton_utils import SingletonMeta
+
 
 class NotificationSettingsDict(TypedDict):
     NOTIFICATION_ADAPTERS: list[tuple[str, str]]
@@ -132,7 +134,7 @@ def get_config(setting_name: str, config: Any = None):
         return {}
 
 
-class NotificationSettings:
+class NotificationSettings(metaclass=SingletonMeta):
     NOTIFICATION_ADAPTERS: list[tuple[str, str]]
     NOTIFICATION_BACKEND: str
     NOTIFICATION_MODEL: str | None

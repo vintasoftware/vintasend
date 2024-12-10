@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, cast
 
+from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 
 
@@ -81,6 +82,10 @@ class NotificationService(Generic[A, B]):
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
     ):
+        # initialize the notification settings singleton for the first time
+        # to ensure all components have access to the same settings
+        NotificationSettings(config)
+
         if isinstance(notification_backend, BaseNotificationBackend):
             self.notification_backend = cast(B, notification_backend)
         else:
