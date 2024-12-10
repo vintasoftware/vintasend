@@ -3,7 +3,7 @@ import datetime
 import logging
 import uuid
 from collections.abc import Callable, Iterable
-from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, cast, overload, override
+from typing import Any, ClassVar, Generic, TypeGuard, TypeVar, cast
 
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 
