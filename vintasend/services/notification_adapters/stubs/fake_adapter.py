@@ -1,7 +1,6 @@
-import asyncio
 import datetime
 import uuid
-from typing import TYPE_CHECKING, Generic, TypeVar, cast, overload
+from typing import Generic, TypeVar
 
 from vintasend.constants import NotificationTypes
 from vintasend.services.dataclasses import Notification, NotificationContextDict
