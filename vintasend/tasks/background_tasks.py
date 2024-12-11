@@ -22,12 +22,12 @@ def send_notification(
     backend_kwargs: dict | None = None,
     config: dict | None = None,
 ):
+    # Get the adapter class, only a single adapter is supported
     adapter_cls = get_notification_adapter_cls(
         adapters[0][0] if isinstance(adapters[0][0], str) else adapters[0][0][0]
     )
     
-    # we only send a single adapter to async notifications
-    if not isinstance(adapter_cls, AsyncBaseNotificationAdapter):
+    if not issubclass(adapter_cls, AsyncBaseNotificationAdapter):
         return
     
     desserialized_backend_kwargs = (
