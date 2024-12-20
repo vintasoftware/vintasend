@@ -79,3 +79,4 @@ class UpdateNotificationKwargs(TypedDict, total=False):
     send_after: datetime.datetime | None
     subject_template: str | None
     preheader_template: str | None
+    metadata: dict | None
