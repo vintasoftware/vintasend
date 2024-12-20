@@ -65,6 +65,13 @@ notifications_service.create_notification(
 )
 ```
 
+### Scheduled notifications
+
+VintaSend schedules notifications by creating them on the database for sending when the `send_after` value has passed. The sending isn't done automatically but we have a service method called `send_pending_notifications` to send all pending notifications found in the database.
+
+You need to call the `send_pending_notifications` service method in a cron job or a tool like Celery Beat.
+
+
 ## Glossary
 
 * **Notification Backend**: It is a class that implements the methods necessary for VintaSend services to create, update, and retrieve Notifications from da database.
