@@ -1,9 +1,11 @@
-from abc import ABC, abstractmethod
 import asyncio
 import datetime
 import uuid
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable
+
 from vintasend.services.utils import get_class_path
+
 
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
@@ -58,6 +60,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         send_after: datetime.datetime | None,
         subject_template: str,
         preheader_template: str,
+        metadata: dict | None = None,
         lock: asyncio.Lock | None = None
     ) -> "Notification":
         ...
