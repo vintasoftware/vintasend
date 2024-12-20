@@ -85,6 +85,7 @@ class FakeFileBackend(BaseNotificationBackend):
             "preheader_template": notification.preheader_template,
             "status": notification.status,
             "context_used": notification.context_used,
+            "metadata": notification.metadata,
         }
 
     def _convert_json_to_notification(self, notification: dict) -> Notification:
@@ -105,6 +106,7 @@ class FakeFileBackend(BaseNotificationBackend):
             preheader_template=notification["preheader_template"],
             status=notification["status"],
             context_used=notification.get("context_used"),
+            metadata=notification.get("metadata"),
         )
 
     def _store_notifications(self):
@@ -132,6 +134,7 @@ class FakeFileBackend(BaseNotificationBackend):
         send_after: datetime.datetime | None,
         subject_template: str,
         preheader_template: str,
+        metadata: dict | None = None,
     ) -> Notification:
         notification = Notification(
             id=str(uuid.uuid4()),
@@ -145,6 +148,7 @@ class FakeFileBackend(BaseNotificationBackend):
             subject_template=subject_template,
             preheader_template=preheader_template,
             status=NotificationStatus.PENDING_SEND.value,
+            metadata=metadata,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -373,6 +377,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         send_after: datetime.datetime | None,
         subject_template: str,
         preheader_template: str,
+        metadata: dict | None = None,
         lock: asyncio.Lock | None = None,
     ) -> Notification:
         notification = Notification(
@@ -387,6 +392,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             subject_template=subject_template,
             preheader_template=preheader_template,
             status=NotificationStatus.PENDING_SEND.value,
+            metadata=metadata,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)

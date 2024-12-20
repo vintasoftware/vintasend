@@ -19,6 +19,7 @@ class NotificationDict(TypedDict):
     preheader_template: str
     status: str
     context_used: dict | None
+    metadata: dict | None
 
 
 @runtime_checkable

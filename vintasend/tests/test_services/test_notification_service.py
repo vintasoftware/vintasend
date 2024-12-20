@@ -1,18 +1,38 @@
 import datetime
 import uuid
-import pytest
-from unittest import TestCase, IsolatedAsyncioTestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
+
+import pytest
 from freezegun import freeze_time
+
 from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.exceptions import NotificationError, NotificationNotFoundError, NotificationSendError, NotificationMarkFailedError, NotificationMarkSentError, NotificationUpdateError
-from vintasend.services import notification_service
+from vintasend.exceptions import (
+    NotificationError,
+    NotificationMarkFailedError,
+    NotificationMarkSentError,
+    NotificationNotFoundError,
+    NotificationSendError,
+    NotificationUpdateError,
+)
 from vintasend.services.dataclasses import Notification, NotificationContextDict
 from vintasend.services.notification_adapters.async_base import NotificationDict
-from vintasend.services.notification_adapters.stubs.fake_adapter import FakeAsyncIOEmailAdapter, FakeEmailAdapter
-from vintasend.services.notification_backends.stubs.fake_backend import FakeAsyncIOFileBackend, FakeFileBackend
-from vintasend.services.notification_service import AsyncIONotificationService, NotificationService, register_context
-from vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer import FakeTemplateRenderer
+from vintasend.services.notification_adapters.stubs.fake_adapter import (
+    FakeAsyncIOEmailAdapter,
+    FakeEmailAdapter,
+)
+from vintasend.services.notification_backends.stubs.fake_backend import (
+    FakeAsyncIOFileBackend,
+    FakeFileBackend,
+)
+from vintasend.services.notification_service import (
+    AsyncIONotificationService,
+    NotificationService,
+    register_context,
+)
+from vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer import (
+    FakeTemplateRenderer,
+)
 
 
 def notification_to_dict(notification: "Notification") -> NotificationDict:
@@ -32,6 +52,7 @@ def notification_to_dict(notification: "Notification") -> NotificationDict:
         preheader_template=notification.preheader_template,
         status=notification.status,
         context_used=notification.context_used,
+        metadata=notification.metadata,
     )
 
 class NotificationServiceTestCase(TestCase):
