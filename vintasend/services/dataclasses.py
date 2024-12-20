@@ -68,6 +68,7 @@ class Notification:
     preheader_template: str
     status: str
     context_used: dict | None = None
+    metadata: dict | None = None
 
 
 class UpdateNotificationKwargs(TypedDict, total=False):

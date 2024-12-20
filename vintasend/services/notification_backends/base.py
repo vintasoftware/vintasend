@@ -67,6 +67,7 @@ class BaseNotificationBackend(ABC):
         send_after: datetime.datetime | None,
         subject_template: str,
         preheader_template: str,
+        metadata: dict | None = None,
     ) -> "Notification":
         raise NotImplementedError
 

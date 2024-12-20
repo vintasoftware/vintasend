@@ -222,6 +222,7 @@ class NotificationService(Generic[A, B]):
         send_after: datetime.datetime | None = None,
         subject_template: str = "",
         preheader_template: str = "",
+        metadata: dict | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -253,6 +254,7 @@ class NotificationService(Generic[A, B]):
             send_after=send_after,
             subject_template=subject_template,
             preheader_template=preheader_template,
+            metadata=metadata,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
