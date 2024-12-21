@@ -207,7 +207,11 @@ class NotificationService(Generic[A, B]):
                     raise e
             try:
                 self.notification_backend.mark_pending_as_sent(notification.id)
-                self.notification_backend.store_context_used(notification.id, context)
+                self.notification_backend.store_context_used(
+                    notification.id, 
+                    context,
+                    adapter.adapter_import_str,
+                )
             except NotificationUpdateError as e:
                 raise NotificationMarkSentError("Failed to mark notification as sent") from e
 
@@ -532,7 +536,11 @@ class NotificationService(Generic[A, B]):
                     raise e
             try:
                 self.notification_backend.mark_pending_as_sent(notification_dict["id"])
-                self.notification_backend.store_context_used(notification_dict["id"], context_dict)
+                self.notification_backend.store_context_used(
+                    notification_dict["id"], 
+                    context_dict,
+                    async_adapter.adapter_import_str,
+                )
             except NotificationUpdateError as e:
                 raise NotificationMarkSentError("Failed to mark notification as sent") from e
 
@@ -651,7 +659,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                     raise e
             try:
                 await self.notification_backend.mark_pending_as_sent(notification.id, lock)
-                await self.notification_backend.store_context_used(notification.id, context, lock)
+                await self.notification_backend.store_context_used(
+                    notification.id, 
+                    context, 
+                    adapter.adapter_import_str,
+                    lock
+                )
             except NotificationUpdateError as e:
                 raise NotificationMarkSentError("Failed to mark notification as sent") from e
         return None

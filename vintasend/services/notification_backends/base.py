@@ -123,5 +123,10 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
+    def store_context_used(
+        self, 
+        notification_id: int | str | uuid.UUID, 
+        context: dict,
+        adapter_import_str: str,
+    ) -> None:
         raise NotImplementedError

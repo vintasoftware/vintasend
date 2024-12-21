@@ -129,7 +129,11 @@ class AsyncIOBaseNotificationBackend(ABC):
     
     @abstractmethod
     async def store_context_used(
-        self, notification_id: int | str | uuid.UUID, context: dict, lock: asyncio.Lock | None = None
+        self, 
+        notification_id: int | str | uuid.UUID, 
+        context: dict,
+        adapter_import_str: str, 
+        lock: asyncio.Lock | None = None,
     ) -> None:
         ...
     
