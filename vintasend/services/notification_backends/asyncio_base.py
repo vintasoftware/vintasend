@@ -60,7 +60,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         send_after: datetime.datetime | None,
         subject_template: str,
         preheader_template: str,
-        metadata: dict | None = None,
+        adapter_extra_parameters: dict | None = None,
         lock: asyncio.Lock | None = None
     ) -> "Notification":
         ...

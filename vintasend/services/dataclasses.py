@@ -68,7 +68,8 @@ class Notification:
     preheader_template: str
     status: str
     context_used: dict | None = None
-    metadata: dict | None = None
+    adapter_used: str | None = None
+    adapter_extra_parameters: dict | None = None
 
 
 class UpdateNotificationKwargs(TypedDict, total=False):
@@ -79,4 +80,4 @@ class UpdateNotificationKwargs(TypedDict, total=False):
     send_after: datetime.datetime | None
     subject_template: str | None
     preheader_template: str | None
-    metadata: dict | None
+    adapter_extra_parameters: dict | None

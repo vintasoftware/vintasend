@@ -52,7 +52,7 @@ def notification_to_dict(notification: "Notification") -> NotificationDict:
         preheader_template=notification.preheader_template,
         status=notification.status,
         context_used=notification.context_used,
-        metadata=notification.metadata,
+        adapter_extra_parameters=notification.adapter_extra_parameters,
     )
 
 class NotificationServiceTestCase(TestCase):
