@@ -43,23 +43,35 @@ class FakeFileBackend(BaseNotificationBackend):
     def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
         return self.__paginate_notifications(self.get_all_future_notifications(), page, page_size)
 
-    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> list[Notification]:
-        return self.__paginate_notifications(self.get_all_future_notifications_from_user(user_id), page, page_size)
+    def get_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> list[Notification]:
+        return self.__paginate_notifications(
+            self.get_all_future_notifications_from_user(user_id), page, page_size
+        )
 
     def get_all_future_notifications(self) -> list[Notification]:
         return [
             n
             for n in self.notifications
             if n.status == NotificationStatus.PENDING_SEND.value
-            and (n.send_after is not None and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc))
+            and (
+                n.send_after is not None
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
+            )
         ]
 
-    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> list[Notification]:
+    def get_all_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID
+    ) -> list[Notification]:
         return [
             n
             for n in self.notifications
             if n.status == NotificationStatus.PENDING_SEND.value
-            and (n.send_after is not None and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc))
+            and (
+                n.send_after is not None
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
+            )
             and str(n.user_id) == str(user_id)
         ]
 
@@ -68,7 +80,10 @@ class FakeFileBackend(BaseNotificationBackend):
             n
             for n in self.notifications
             if n.status == NotificationStatus.PENDING_SEND.value
-            and (n.send_after is None or n.send_after <= datetime.datetime.now(tz=datetime.timezone.utc))
+            and (
+                n.send_after is None
+                or n.send_after <= datetime.datetime.now(tz=datetime.timezone.utc)
+            )
         ]
 
     def _convert_notification_to_json(self, notification: Notification) -> dict:
@@ -211,35 +226,45 @@ class FakeFileBackend(BaseNotificationBackend):
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
-        return self.__paginate_notifications(self.filter_all_in_app_unread_notifications(user_id), page, page_size)
+        return self.__paginate_notifications(
+            self.filter_all_in_app_unread_notifications(user_id), page, page_size
+        )
 
-    def __paginate_notifications(self, notifications: list[Notification], page: int, page_size: int):
+    def __paginate_notifications(
+        self, notifications: list[Notification], page: int, page_size: int
+    ):
         # page is 1-indexed
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
-    
+
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         notification = self.get_notification(notification_id)
         return str(notification.context_kwargs.get("email", "testemail@example.com"))
-    
-    def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
+
+    def store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: dict,
+        adapter_import_str: str,
+    ) -> None:
         notification = self.get_notification(notification_id)
         notification.context_used = context
+        notification.adapter_used = adapter_import_str
         self._store_notifications()
 
 
 class Config:
-    def __init__(
-        self, config_a: Decimal | None = None, config_b: datetime.datetime | None = None
-    ):
+    def __init__(self, config_a: Decimal | None = None, config_b: datetime.datetime | None = None):
         self.config_a = config_a if config_a is not None else Decimal("1.0")
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         self.config_b = config_b if config_b is not None else now
 
-        
+
 class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
     config: Config
 
-    def __init__(self, database_file_name: str = "notifications.json", config: Config | None = None):
+    def __init__(
+        self, database_file_name: str = "notifications.json", config: Config | None = None
+    ):
         super().__init__(database_file_name=database_file_name, config=config)
 
     def _store_notifications(self):
@@ -248,7 +273,7 @@ class FakeFileBackendWithNonSerializableKWArgs(FakeFileBackend):
         super()._store_notifications()
 
 
-class InvalidBackend():
+class InvalidBackend:
     def __init__(self, *_args, **_kwargs):
         pass
 
@@ -282,25 +307,39 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             pass
 
     async def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
-        return self.__paginate_notifications(await self.get_all_future_notifications(), page, page_size)
+        return self.__paginate_notifications(
+            await self.get_all_future_notifications(), page, page_size
+        )
 
-    async def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> list[Notification]:
-        return self.__paginate_notifications(await self.get_all_future_notifications_from_user(user_id), page, page_size)
+    async def get_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> list[Notification]:
+        return self.__paginate_notifications(
+            await self.get_all_future_notifications_from_user(user_id), page, page_size
+        )
 
     async def get_all_future_notifications(self) -> list[Notification]:
         return [
             n
             for n in self.notifications
             if n.status == NotificationStatus.PENDING_SEND.value
-            and (n.send_after is not None and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc))
+            and (
+                n.send_after is not None
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
+            )
         ]
 
-    async def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> list[Notification]:
+    async def get_all_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID
+    ) -> list[Notification]:
         return [
             n
             for n in self.notifications
             if n.status == NotificationStatus.PENDING_SEND.value
-            and (n.send_after is not None and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc))
+            and (
+                n.send_after is not None
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
+            )
             and str(n.user_id) == str(user_id)
         ]
 
@@ -309,7 +348,10 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             n
             for n in self.notifications
             if n.status == NotificationStatus.PENDING_SEND.value
-            and (n.send_after is None or n.send_after <= datetime.datetime.now(tz=datetime.timezone.utc))
+            and (
+                n.send_after is None
+                or n.send_after <= datetime.datetime.now(tz=datetime.timezone.utc)
+            )
         ]
 
     def _convert_notification_to_json(self, notification: Notification) -> dict:
@@ -399,7 +441,10 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         return notification
 
     async def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        update_data: UpdateNotificationKwargs,
+        lock: asyncio.Lock | None = None,
     ) -> Notification:
         notification = await self.get_notification(notification_id)
 
@@ -409,25 +454,33 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         await self._store_notifications(lock)
         return notification
 
-    async def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None) -> Notification:
+    async def mark_pending_as_sent(
+        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+    ) -> Notification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         await self._store_notifications(lock)
         return notification
 
-    async def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None) -> Notification:
+    async def mark_pending_as_failed(
+        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+    ) -> Notification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
         await self._store_notifications(lock)
         return notification
 
-    async def mark_sent_as_read(self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None) -> Notification:
+    async def mark_sent_as_read(
+        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+    ) -> Notification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         await self._store_notifications(lock)
         return notification
 
-    async def cancel_notification(self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None) -> None:
+    async def cancel_notification(
+        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+    ) -> None:
         notification = await self.get_notification(notification_id)
         self.notifications.remove(notification)
         await self._store_notifications(lock)
@@ -458,14 +511,23 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         in_app_unread_notifications = await self.filter_all_in_app_unread_notifications(user_id)
         return self.__paginate_notifications(in_app_unread_notifications, page, page_size)
 
-    def __paginate_notifications(self, notifications: list[Notification], page: int, page_size: int):
+    def __paginate_notifications(
+        self, notifications: list[Notification], page: int, page_size: int
+    ):
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
-    
+
     async def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         notification = await self.get_notification(notification_id)
         return str(notification.context_kwargs.get("email", "testemail@example.com"))
-    
-    async def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict, lock: asyncio.Lock | None = None) -> None:
+
+    async def store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: dict,
+        adapter_import_str: str,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
         notification = await self.get_notification(notification_id)
         notification.context_used = context
+        notification.adapter_used = adapter_import_str
         await self._store_notifications(lock)
