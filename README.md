@@ -55,7 +55,7 @@ notifications_service.create_notification(
     notification_type=NotificationTypes.EMAIL,
     title="My Notification", # this is just for auditing purposes
     body_template="my/notification/template/path.html",
-    context_name="my_context_generator,
+    context_name="my_context_generator",
     context_kwargs={
         "user_id": user.id,
     },
