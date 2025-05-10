@@ -32,29 +32,31 @@ jobs:
           poetry run tox
         env:
           OPENAI_API_KEY: "sk-fake-test-key-123"
-
-      - name: Coveralls Parallel
+          
+      - name: Generate XML coverage report
         run: |
-          poetry run coveralls
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COVERALLS_SERVICE_NAME: "github-actions"
-          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
-          COVERALLS_FLAG_NAME: python-coverage-${{ matrix.python-version }}
-          COVERALLS_PARALLEL: true
+          poetry run coverage xml -o coverage-${{ matrix.python-version }}.xml
+          
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          files: ./coverage-${{ matrix.python-version }}.xml
+          flags: python-${{ matrix.python-version }}
+          name: codecov-${{ matrix.python-version }}
 
-  coveralls:
-    name: Coveralls
+  codecov:
+    name: Codecov Finalization
 
-    # Wait for Django and Frontend to finish before starting due to Coveralls parallel
+    # Wait for test jobs to finish
     needs: [build-python]
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Coveralls Finished
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          parallel-finished: true
-          carryforward: "python-coverage-3.10,python-coverage-3.11,python-coverage-3.12,python-coverage-3.13"
+      # We don't need a separate finalization step for Codecov
+      # as each Python version job already uploaded its coverage data
+      - name: Codecov Information
+        run: |
+          echo "Coverage data for all Python versions has been uploaded to Codecov"
