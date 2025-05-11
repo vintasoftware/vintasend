@@ -41,22 +41,8 @@ jobs:
         uses: codecov/codecov-action@v3
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          slug: vintasoftware/vintasend
           fail_ci_if_error: false
           files: ./coverage-${{ matrix.python-version }}.xml
           flags: python-${{ matrix.python-version }}
           name: codecov-${{ matrix.python-version }}
-
-  codecov:
-    name: Codecov Finalization
-
-    # Wait for test jobs to finish
-    needs: [build-python]
-
-    runs-on: ubuntu-latest
-
-    steps:
-      # We don't need a separate finalization step for Codecov
-      # as each Python version job already uploaded its coverage data
-      - name: Codecov Information
-        run: |
-          echo "Coverage data for all Python versions has been uploaded to Codecov"
