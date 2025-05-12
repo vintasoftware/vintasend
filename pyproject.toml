@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "vintasend"
-version = "0.1.1"
+version = "0.1.2"
 description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
