@@ -5,12 +5,10 @@ description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
 readme = "README.md"
-
-[tool.poetry.packages]
-vintasend = { include = "vintasend" }
-
-[tool.poetry.include]
-files = ["vintasend/py.typed"]
+packages = [{ include = "vintasend" }]
+include = [
+  { path = "vintasend/py.typed", format = "wheel" }
+]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<3.14"
