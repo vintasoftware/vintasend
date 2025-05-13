@@ -1,10 +1,16 @@
 [tool.poetry]
 name = "vintasend"
-version = "0.1.2"
+version = "0.1.4"
 description = "A flexible package for implementing transactional notifications"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
 readme = "README.md"
+
+[tool.poetry.packages]
+vintasend = { include = "vintasend" }
+
+[tool.poetry.include]
+files = ["vintasend/py.typed"]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<3.14"
