@@ -4,16 +4,21 @@ import json
 import os
 import uuid
 from decimal import Decimal
+from typing import cast
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import NotificationNotFoundError
-from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
+from vintasend.services.dataclasses import (
+    Notification,
+    OneOffNotification,
+    UpdateNotificationKwargs,
+)
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 
 
 class FakeFileBackend(BaseNotificationBackend):
-    notifications: list[Notification]
+    notifications: list[Notification | OneOffNotification]
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
@@ -40,17 +45,20 @@ class FakeFileBackend(BaseNotificationBackend):
         except FileNotFoundError:
             pass
 
-    def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
-        return self.__paginate_notifications(self.get_all_future_notifications(), page, page_size)
+    def get_future_notifications(self, page: int, page_size: int) -> list[Notification | OneOffNotification]:
+        return cast(
+            list[Notification | OneOffNotification],
+            self.__paginate_notifications(self.get_all_future_notifications(), page, page_size)
+        )
 
     def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> list[Notification]:
-        return self.__paginate_notifications(
+    ) -> list[Notification | OneOffNotification]:
+        return cast(list[Notification | OneOffNotification], self.__paginate_notifications(
             self.get_all_future_notifications_from_user(user_id), page, page_size
-        )
+        ))
 
-    def get_all_future_notifications(self) -> list[Notification]:
+    def get_all_future_notifications(self) -> list[Notification | OneOffNotification]:
         return [
             n
             for n in self.notifications
@@ -63,7 +71,7 @@ class FakeFileBackend(BaseNotificationBackend):
 
     def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> list[Notification]:
+    ) -> list[Notification | OneOffNotification]:
         return [
             n
             for n in self.notifications
@@ -72,10 +80,13 @@ class FakeFileBackend(BaseNotificationBackend):
                 n.send_after is not None
                 and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
             )
-            and str(n.user_id) == str(user_id)
+            and (
+                (isinstance(n, Notification) and str(n.user_id) == str(user_id))
+                or isinstance(n, OneOffNotification)  # OneOffNotifications don't have user_id
+            )
         ]
 
-    def get_all_pending_notifications(self) -> list[Notification]:
+    def get_all_pending_notifications(self) -> list[Notification | OneOffNotification]:
         return [
             n
             for n in self.notifications
@@ -86,43 +97,88 @@ class FakeFileBackend(BaseNotificationBackend):
             )
         ]
 
-    def _convert_notification_to_json(self, notification: Notification) -> dict:
-        return {
-            "id": str(notification.id),
-            "user_id": str(notification.user_id),
-            "notification_type": notification.notification_type,
-            "title": notification.title,
-            "body_template": notification.body_template,
-            "context_name": notification.context_name,
-            "context_kwargs": notification.context_kwargs,
-            "send_after": notification.send_after.isoformat() if notification.send_after else None,
-            "subject_template": notification.subject_template,
-            "preheader_template": notification.preheader_template,
-            "status": notification.status,
-            "context_used": notification.context_used,
-            "adapter_extra_parameters": notification.adapter_extra_parameters,
-        }
+    def _convert_notification_to_json(self, notification: Notification | OneOffNotification) -> dict:
+        if isinstance(notification, OneOffNotification):
+            return {
+                "id": str(notification.id),
+                "email_or_phone": notification.email_or_phone,
+                "first_name": notification.first_name,
+                "last_name": notification.last_name,
+                "notification_type": notification.notification_type,
+                "title": notification.title,
+                "body_template": notification.body_template,
+                "context_name": notification.context_name,
+                "context_kwargs": notification.context_kwargs,
+                "send_after": notification.send_after.isoformat() if notification.send_after else None,
+                "subject_template": notification.subject_template,
+                "preheader_template": notification.preheader_template,
+                "status": notification.status,
+                "context_used": notification.context_used,
+                "adapter_extra_parameters": notification.adapter_extra_parameters,
+                "is_one_off": True,
+            }
+        else:
+            return {
+                "id": str(notification.id),
+                "user_id": str(notification.user_id),
+                "notification_type": notification.notification_type,
+                "title": notification.title,
+                "body_template": notification.body_template,
+                "context_name": notification.context_name,
+                "context_kwargs": notification.context_kwargs,
+                "send_after": notification.send_after.isoformat() if notification.send_after else None,
+                "subject_template": notification.subject_template,
+                "preheader_template": notification.preheader_template,
+                "status": notification.status,
+                "context_used": notification.context_used,
+                "adapter_extra_parameters": notification.adapter_extra_parameters,
+                "is_one_off": False,
+            }
 
-    def _convert_json_to_notification(self, notification: dict) -> Notification:
-        return Notification(
-            id=notification["id"],
-            user_id=notification["user_id"],
-            notification_type=notification["notification_type"],
-            title=notification["title"],
-            body_template=notification["body_template"],
-            context_name=notification["context_name"],
-            context_kwargs=notification["context_kwargs"],
-            send_after=(
-                datetime.datetime.fromisoformat(notification["send_after"])
-                if notification["send_after"]
-                else None
-            ),
-            subject_template=notification["subject_template"],
-            preheader_template=notification["preheader_template"],
-            status=notification["status"],
-            context_used=notification.get("context_used"),
-            adapter_extra_parameters=notification.get("adapter_extra_parameters"),
-        )
+    def _convert_json_to_notification(self, notification: dict) -> Notification | OneOffNotification:
+        # Determine if this is a OneOffNotification based on presence of email_or_phone field
+        if "email_or_phone" in notification:
+            return OneOffNotification(
+                id=notification["id"],
+                email_or_phone=notification["email_or_phone"],
+                first_name=notification["first_name"],
+                last_name=notification["last_name"],
+                notification_type=notification["notification_type"],
+                title=notification["title"],
+                body_template=notification["body_template"],
+                context_name=notification["context_name"],
+                context_kwargs=notification["context_kwargs"],
+                send_after=(
+                    datetime.datetime.fromisoformat(notification["send_after"])
+                    if notification["send_after"]
+                    else None
+                ),
+                subject_template=notification["subject_template"],
+                preheader_template=notification["preheader_template"],
+                status=notification["status"],
+                context_used=notification.get("context_used"),
+                adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+            )
+        else:
+            return Notification(
+                id=notification["id"],
+                user_id=notification["user_id"],
+                notification_type=notification["notification_type"],
+                title=notification["title"],
+                body_template=notification["body_template"],
+                context_name=notification["context_name"],
+                context_kwargs=notification["context_kwargs"],
+                send_after=(
+                    datetime.datetime.fromisoformat(notification["send_after"])
+                    if notification["send_after"]
+                    else None
+                ),
+                subject_template=notification["subject_template"],
+                preheader_template=notification["preheader_template"],
+                status=notification["status"],
+                context_used=notification.get("context_used"),
+                adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+            )
 
     def _store_notifications(self):
         json_output_file = open(self.database_file_name, "w", encoding="utf-8")
@@ -132,7 +188,7 @@ class FakeFileBackend(BaseNotificationBackend):
         )
         json_output_file.close()
 
-    def get_pending_notifications(self, page: int, page_size: int) -> list[Notification]:
+    def get_pending_notifications(self, page: int, page_size: int) -> list[Notification | OneOffNotification]:
         # page is 1-indexed
         return self.get_all_pending_notifications()[
             ((page - 1) * page_size) : ((page - 1) * page_size) + page_size
@@ -169,9 +225,44 @@ class FakeFileBackend(BaseNotificationBackend):
         self._store_notifications()
         return notification
 
+    def persist_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None,
+        subject_template: str,
+        preheader_template: str,
+        adapter_extra_parameters: dict | None = None,
+    ) -> OneOffNotification:
+        notification = OneOffNotification(
+            id=uuid.uuid4(),
+            email_or_phone=email_or_phone,
+            first_name=first_name,
+            last_name=last_name,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template,
+            preheader_template=preheader_template,
+            status=NotificationStatus.PENDING_SEND.value,
+            adapter_extra_parameters=adapter_extra_parameters,
+        )
+        self.notifications.append(notification)
+        self._store_notifications()
+        return notification
+
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
 
         for key, value in update_data.items():
@@ -180,19 +271,19 @@ class FakeFileBackend(BaseNotificationBackend):
         self._store_notifications()
         return notification
 
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         self._store_notifications()
         return notification
 
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
         self._store_notifications()
         return notification
 
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         self._store_notifications()
@@ -205,7 +296,7 @@ class FakeFileBackend(BaseNotificationBackend):
 
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         try:
             return next(n for n in self.notifications if str(n.id) == str(notification_id))
         except StopIteration as e:
@@ -214,10 +305,13 @@ class FakeFileBackend(BaseNotificationBackend):
     def filter_all_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID
     ) -> list[Notification]:
+        from vintasend.services.dataclasses import OneOffNotification
+
         notifications = [
             n
             for n in self.notifications
-            if n.user_id == user_id
+            if not isinstance(n, OneOffNotification)
+            and n.user_id == user_id
             and n.status == NotificationStatus.SENT.value
             and n.notification_type == NotificationTypes.IN_APP.value
         ]
@@ -226,13 +320,13 @@ class FakeFileBackend(BaseNotificationBackend):
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
-        return self.__paginate_notifications(
+        return cast(list[Notification], self.__paginate_notifications(
             self.filter_all_in_app_unread_notifications(user_id), page, page_size
-        )
+        ))
 
     def __paginate_notifications(
-        self, notifications: list[Notification], page: int, page_size: int
-    ):
+        self, notifications: list[Notification | OneOffNotification] | list[Notification], page: int, page_size: int
+    ) -> list[Notification | OneOffNotification] | list[Notification]:
         # page is 1-indexed
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
 
@@ -279,7 +373,7 @@ class InvalidBackend:
 
 
 class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
-    notifications: list[Notification]
+    notifications: list[Notification | OneOffNotification]
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
@@ -307,18 +401,18 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             pass
 
     async def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
-        return self.__paginate_notifications(
+        return cast(list[Notification], self.__paginate_notifications(
             await self.get_all_future_notifications(), page, page_size
-        )
+        ))
 
     async def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
-        return self.__paginate_notifications(
+        return cast(list[Notification], self.__paginate_notifications(
             await self.get_all_future_notifications_from_user(user_id), page, page_size
-        )
+        ))
 
-    async def get_all_future_notifications(self) -> list[Notification]:
+    async def get_all_future_notifications(self) -> list[Notification | OneOffNotification]:
         return [
             n
             for n in self.notifications
@@ -331,11 +425,12 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> list[Notification]:
+    ) -> list[Notification | OneOffNotification]:
         return [
             n
             for n in self.notifications
-            if n.status == NotificationStatus.PENDING_SEND.value
+            if isinstance(n, Notification)
+            and n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is not None
                 and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
@@ -343,7 +438,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             and str(n.user_id) == str(user_id)
         ]
 
-    async def get_all_pending_notifications(self) -> list[Notification]:
+    async def get_all_pending_notifications(self) -> list[Notification | OneOffNotification]:
         return [
             n
             for n in self.notifications
@@ -354,10 +449,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             )
         ]
 
-    def _convert_notification_to_json(self, notification: Notification) -> dict:
-        return {
+    def _convert_notification_to_json(self, notification: Notification | OneOffNotification) -> dict:
+        base_dict = {
             "id": str(notification.id),
-            "user_id": str(notification.user_id),
             "notification_type": notification.notification_type,
             "title": notification.title,
             "body_template": notification.body_template,
@@ -370,25 +464,61 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             "context_used": notification.context_used,
         }
 
-    def _convert_json_to_notification(self, notification: dict) -> Notification:
-        return Notification(
-            id=notification["id"],
-            user_id=notification["user_id"],
-            notification_type=notification["notification_type"],
-            title=notification["title"],
-            body_template=notification["body_template"],
-            context_name=notification["context_name"],
-            context_kwargs=notification["context_kwargs"],
-            send_after=(
-                datetime.datetime.fromisoformat(notification["send_after"])
-                if notification["send_after"]
-                else None
-            ),
-            subject_template=notification["subject_template"],
-            preheader_template=notification["preheader_template"],
-            status=notification["status"],
-            context_used=notification.get("context_used"),
-        )
+        if isinstance(notification, OneOffNotification):
+            base_dict.update({
+                "email_or_phone": notification.email_or_phone,
+                "first_name": notification.first_name,
+                "last_name": notification.last_name,
+            })
+        else:
+            base_dict["user_id"] = str(notification.user_id)
+
+        return base_dict
+
+    def _convert_json_to_notification(self, notification: dict) -> Notification | OneOffNotification:
+        # Determine if this is a OneOffNotification based on presence of email_or_phone field
+        if "email_or_phone" in notification:
+            return OneOffNotification(
+                id=notification["id"],
+                email_or_phone=notification["email_or_phone"],
+                first_name=notification["first_name"],
+                last_name=notification["last_name"],
+                notification_type=notification["notification_type"],
+                title=notification["title"],
+                body_template=notification["body_template"],
+                context_name=notification["context_name"],
+                context_kwargs=notification["context_kwargs"],
+                send_after=(
+                    datetime.datetime.fromisoformat(notification["send_after"])
+                    if notification["send_after"]
+                    else None
+                ),
+                subject_template=notification["subject_template"],
+                preheader_template=notification["preheader_template"],
+                status=notification["status"],
+                context_used=notification.get("context_used"),
+                adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+            )
+        else:
+            return Notification(
+                id=notification["id"],
+                user_id=notification["user_id"],
+                notification_type=notification["notification_type"],
+                title=notification["title"],
+                body_template=notification["body_template"],
+                context_name=notification["context_name"],
+                context_kwargs=notification["context_kwargs"],
+                send_after=(
+                    datetime.datetime.fromisoformat(notification["send_after"])
+                    if notification["send_after"]
+                    else None
+                ),
+                subject_template=notification["subject_template"],
+                preheader_template=notification["preheader_template"],
+                status=notification["status"],
+                context_used=notification.get("context_used"),
+                adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+            )
 
     async def _store_notifications(self, lock: asyncio.Lock | None = None):
         if lock is not None:
@@ -402,7 +532,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         if lock is not None:
             lock.release()
 
-    async def get_pending_notifications(self, page: int, page_size: int) -> list[Notification]:
+    async def get_pending_notifications(self, page: int, page_size: int) -> list[Notification | OneOffNotification]:
         pending_notifications = await self.get_all_pending_notifications()
         return pending_notifications[
             ((page - 1) * page_size) : ((page - 1) * page_size) + page_size
@@ -440,12 +570,48 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         await self._store_notifications(lock)
         return notification
 
+    async def persist_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None,
+        subject_template: str,
+        preheader_template: str,
+        adapter_extra_parameters: dict | None = None,
+        lock: asyncio.Lock | None = None,
+    ) -> OneOffNotification:
+        notification = OneOffNotification(
+            id=uuid.uuid4(),
+            email_or_phone=email_or_phone,
+            first_name=first_name,
+            last_name=last_name,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template,
+            preheader_template=preheader_template,
+            status=NotificationStatus.PENDING_SEND.value,
+            adapter_extra_parameters=adapter_extra_parameters,
+        )
+        self.notifications.append(notification)
+        await self._store_notifications(lock)
+        return notification
+
     async def persist_notification_update(
         self,
         notification_id: int | str | uuid.UUID,
         update_data: UpdateNotificationKwargs,
         lock: asyncio.Lock | None = None,
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
 
         for key, value in update_data.items():
@@ -456,7 +622,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def mark_pending_as_sent(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         await self._store_notifications(lock)
@@ -464,7 +630,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def mark_pending_as_failed(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
         await self._store_notifications(lock)
@@ -472,7 +638,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def mark_sent_as_read(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         await self._store_notifications(lock)
@@ -487,7 +653,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         try:
             return next(n for n in self.notifications if str(n.id) == str(notification_id))
         except StopIteration as e:
@@ -499,7 +665,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notifications = [
             n
             for n in self.notifications
-            if n.user_id == user_id
+            if not isinstance(n, OneOffNotification)
+            and n.user_id == user_id
             and n.status == NotificationStatus.SENT.value
             and n.notification_type == NotificationTypes.IN_APP.value
         ]
@@ -509,11 +676,11 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
         in_app_unread_notifications = await self.filter_all_in_app_unread_notifications(user_id)
-        return self.__paginate_notifications(in_app_unread_notifications, page, page_size)
+        return cast(list[Notification], self.__paginate_notifications(in_app_unread_notifications, page, page_size))
 
     def __paginate_notifications(
-        self, notifications: list[Notification], page: int, page_size: int
-    ):
+        self, notifications: list[Notification | OneOffNotification] | list[Notification], page: int, page_size: int
+    ) -> list[Notification | OneOffNotification] | list[Notification]:
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
 
     async def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:

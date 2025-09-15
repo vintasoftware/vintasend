@@ -71,6 +71,24 @@ class Notification:
     adapter_used: str | None = None
     adapter_extra_parameters: dict | None = None
 
+@dataclass
+class OneOffNotification:
+    id: int | str | uuid.UUID  # noqa: A003
+    email_or_phone: str
+    first_name: str
+    last_name: str
+    notification_type: str
+    title: str
+    body_template: str
+    context_name: str
+    context_kwargs: dict[str, int | str | uuid.UUID]
+    send_after: datetime.datetime | None
+    subject_template: str
+    preheader_template: str
+    status: str
+    context_used: dict | None = None
+    adapter_used: str | None = None
+    adapter_extra_parameters: dict | None = None
 
 class UpdateNotificationKwargs(TypedDict, total=False):
     title: str

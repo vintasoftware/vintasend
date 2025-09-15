@@ -8,7 +8,11 @@ from vintasend.services.utils import get_class_path
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
+    from vintasend.services.dataclasses import (
+        Notification,
+        OneOffNotification,
+        UpdateNotificationKwargs,
+    )
 
 class AsyncIOBaseNotificationBackend(ABC):
     def __init__(self, *args, **kwargs):
@@ -17,35 +21,35 @@ class AsyncIOBaseNotificationBackend(ABC):
         self.backend_kwargs = kwargs
 
     @abstractmethod
-    async def get_all_pending_notifications(self) -> Iterable["Notification"]:
+    async def get_all_pending_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         ...
 
     @abstractmethod
     async def get_pending_notifications(
         self, page: int, page_size: int
-    ) -> Iterable["Notification"]:
+    ) -> Iterable["Notification | OneOffNotification"]:
         ...
 
     @abstractmethod
-    async def get_all_future_notifications(self) -> Iterable["Notification"]:
+    async def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         ...
 
     @abstractmethod
     async def get_future_notifications(
         self, page: int, page_size: int
-    ) -> Iterable["Notification"]:
+    ) -> Iterable["Notification | OneOffNotification"]:
         ...
 
     @abstractmethod
     async def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable["Notification"]:
+    ) -> Iterable["Notification | OneOffNotification"]:
         ...
 
     @abstractmethod
     async def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable["Notification"]:
+    ) -> Iterable["Notification | OneOffNotification"]:
         ...
 
     @abstractmethod
@@ -66,15 +70,34 @@ class AsyncIOBaseNotificationBackend(ABC):
         ...
 
     @abstractmethod
+    async def persist_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None,
+        subject_template: str,
+        preheader_template: str,
+        adapter_extra_parameters: dict | None = None,
+        lock: asyncio.Lock | None = None
+    ) -> "OneOffNotification":
+        ...
+
+    @abstractmethod
     async def persist_notification_update(
         self,
         notification_id: int | str | uuid.UUID,
         update_data: "UpdateNotificationKwargs",
         lock: asyncio.Lock | None = None,
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         """
         Update a notification in the backend. This method should return the updated notification.
-        Notifications that have already been sent should not be updated. 
+        Notifications that have already been sent should not be updated.
         If a notification has already been sent, the method should raise a NotificationUpdateError.
         """
         ...
@@ -82,19 +105,19 @@ class AsyncIOBaseNotificationBackend(ABC):
     @abstractmethod
     async def mark_pending_as_sent(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         ...
 
     @abstractmethod
     async def mark_pending_as_failed(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         ...
 
     @abstractmethod
     async def mark_sent_as_read(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         ...
 
     @abstractmethod
@@ -106,7 +129,7 @@ class AsyncIOBaseNotificationBackend(ABC):
     @abstractmethod
     async def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         ...
 
     @abstractmethod
@@ -126,14 +149,13 @@ class AsyncIOBaseNotificationBackend(ABC):
         self, notification_id: int | str | uuid.UUID
     ) -> str:
         ...
-    
+
     @abstractmethod
     async def store_context_used(
-        self, 
-        notification_id: int | str | uuid.UUID, 
+        self,
+        notification_id: int | str | uuid.UUID,
         context: dict,
-        adapter_import_str: str, 
+        adapter_import_str: str,
         lock: asyncio.Lock | None = None,
     ) -> None:
         ...
-    

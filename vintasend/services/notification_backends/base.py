@@ -10,6 +10,7 @@ from vintasend.services.utils import get_class_path
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import (
         Notification,
+        OneOffNotification,
         UpdateNotificationKwargs,
     )
 
@@ -28,31 +29,31 @@ class BaseNotificationBackend(ABC):
         self.backend_kwargs = kwargs
 
     @abstractmethod
-    def get_all_pending_notifications(self) -> Iterable["Notification"]:
+    def get_all_pending_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
-    def get_pending_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
+    def get_pending_notifications(self, page: int, page_size: int) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
-    def get_all_future_notifications(self) -> Iterable["Notification"]:
+    def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
-    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
+    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
     def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable["Notification"]:
+    ) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
     def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable["Notification"]:
+    ) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
@@ -72,11 +73,29 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def persist_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None,
+        subject_template: str,
+        preheader_template: str,
+        adapter_extra_parameters: dict | None = None,
+    ) -> "OneOffNotification":
+        raise NotImplementedError
+
+    @abstractmethod
     def persist_notification_update(
         self,
         notification_id: int | str | uuid.UUID,
         update_data: "UpdateNotificationKwargs",
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         """
         Update a notification in the backend. This method should return the updated notification.
         Notifications that have already been sent should not be updated. If a notification has already been sent,
@@ -85,15 +104,15 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> "Notification":
+    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> "Notification":
+    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> "Notification":
+    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod
@@ -103,7 +122,7 @@ class BaseNotificationBackend(ABC):
     @abstractmethod
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
-    ) -> "Notification":
+    ) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod
@@ -124,8 +143,8 @@ class BaseNotificationBackend(ABC):
 
     @abstractmethod
     def store_context_used(
-        self, 
-        notification_id: int | str | uuid.UUID, 
+        self,
+        notification_id: int | str | uuid.UUID,
         context: dict,
         adapter_import_str: str,
     ) -> None:

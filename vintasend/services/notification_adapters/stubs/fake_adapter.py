@@ -1,12 +1,13 @@
 import datetime
 import uuid
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 from vintasend.constants import NotificationTypes
-from vintasend.services.dataclasses import Notification, NotificationContextDict
+from vintasend.services.dataclasses import Notification, NotificationContextDict, OneOffNotification
 from vintasend.services.notification_adapters.async_base import (
     AsyncBaseNotificationAdapter,
     NotificationDict,
+    OneOffNotificationDict,
 )
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
@@ -25,13 +26,13 @@ class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
     notification_type = NotificationTypes.EMAIL
     backend: B
     template_renderer: T
-    sent_emails: list[tuple["Notification", "NotificationContextDict"]] = []
+    sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict"]] = []
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.sent_emails = []
 
-    def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
+    def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         self.template_renderer.render(notification, context)
         self.sent_emails.append((notification, context))
 
@@ -43,13 +44,13 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
     notification_type = NotificationTypes.EMAIL
     backend: BAIO
     template_renderer: T
-    sent_emails: list[tuple["Notification", "NotificationContextDict"]] = []
+    sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict"]] = []
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.sent_emails = []
 
-    async def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
+    async def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         self.template_renderer.render(notification, context)
         self.sent_emails.append((notification, context))
 
@@ -57,11 +58,19 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
 class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEmailAdapter[B, T]):
     notification_type = NotificationTypes.EMAIL
 
-    def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
+    def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         pass
 
-    def delayed_send(self, notification_dict: NotificationDict, context_dict: dict) -> None:
-        notification = self.notification_from_dict(notification_dict)
+    def delayed_send(self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict) -> None:
+        notification: "Notification | OneOffNotification"
+        if "email_or_phone" in notification_dict:
+            # This is a OneOffNotificationDict
+            one_off_dict: OneOffNotificationDict = notification_dict  # type: ignore
+            notification = self.one_off_notification_from_dict(one_off_dict)
+        else:
+            # This is a NotificationDict
+            regular_dict: NotificationDict = notification_dict  # type: ignore
+            notification = self.notification_from_dict(regular_dict)
         context = NotificationContextDict(**context_dict)
         super().send(notification, context)
 
@@ -88,6 +97,36 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
                 if isinstance(notification_dict["user_id"], str)
                 else notification_dict["user_id"]
             ),
+            context_kwargs={
+                key: self._convert_to_uuid(value) if isinstance(value, str) else value
+                for key, value in notification_dict["context_kwargs"].items()
+            },
+            send_after=send_after,
+            status=notification_dict["status"],
+            context_used=notification_dict["context_used"],
+            notification_type=notification_dict["notification_type"],
+            title=notification_dict["title"],
+            body_template=notification_dict["body_template"],
+            context_name=notification_dict["context_name"],
+            subject_template=notification_dict["subject_template"],
+            preheader_template=notification_dict["preheader_template"],
+        )
+
+    def one_off_notification_from_dict(self, notification_dict: OneOffNotificationDict) -> "OneOffNotification":
+        send_after = (
+            datetime.datetime.fromisoformat(notification_dict["send_after"])
+            if notification_dict["send_after"]
+            else None
+        )
+        return OneOffNotification(
+            id=(
+                self._convert_to_uuid(notification_dict["id"])
+                if isinstance(notification_dict["id"], str)
+                else notification_dict["id"]
+            ),
+            email_or_phone=notification_dict["email_or_phone"],
+            first_name=notification_dict["first_name"],
+            last_name=notification_dict["last_name"],
             context_kwargs={
                 key: self._convert_to_uuid(value) if isinstance(value, str) else value
                 for key, value in notification_dict["context_kwargs"].items()
