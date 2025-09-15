@@ -7,7 +7,11 @@ from vintasend.services.notification_template_renderers.base import BaseNotifica
 
 if TYPE_CHECKING:
     from vintasend.constants import NotificationTypes
-    from vintasend.services.dataclasses import Notification, NotificationContextDict
+    from vintasend.services.dataclasses import (
+        Notification,
+        NotificationContextDict,
+        OneOffNotification,
+    )
 
 
 B = TypeVar("B", bound=AsyncIOBaseNotificationBackend)
@@ -106,7 +110,7 @@ class AsyncIOBaseNotificationAdapter(Generic[B, T], ABC):
         self.config = config
 
     @abstractmethod
-    async def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
+    async def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         """
         Send the notification to the user.
 

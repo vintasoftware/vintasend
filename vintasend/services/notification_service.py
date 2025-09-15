@@ -26,6 +26,7 @@ from vintasend.exceptions import (
 from vintasend.services.dataclasses import (
     Notification,
     NotificationContextDict,
+    OneOffNotification,
     UpdateNotificationKwargs,
 )
 from vintasend.services.helpers import (
@@ -160,7 +161,7 @@ class NotificationService(Generic[A, B]):
             for adapter in notification_adapters
         )
 
-    def send(self, notification: Notification) -> None:
+    def send(self, notification: Notification | OneOffNotification) -> None:
         """
         Send a notification using the appropriate adapter
 
@@ -208,7 +209,7 @@ class NotificationService(Generic[A, B]):
             try:
                 self.notification_backend.mark_pending_as_sent(notification.id)
                 self.notification_backend.store_context_used(
-                    notification.id, 
+                    notification.id,
                     context,
                     adapter.adapter_import_str,
                 )
@@ -261,7 +262,52 @@ class NotificationService(Generic[A, B]):
             adapter_extra_parameters=adapter_extra_parameters,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
+            tz=datetime.UTC
+        ):
+            self.send(notification)
+        return notification
+
+    def create_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: NotificationContextDict,
+        send_after: datetime.datetime | None = None,
+        subject_template: str = "",
+        preheader_template: str = "",
+        adapter_extra_parameters: dict | None = None,
+    ) -> "OneOffNotification":
+        """
+        Create a one-off notification and send it if it is due to be sent immediately.
+
+        This method may raise the following exceptions:
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if the adapter fails to send the notification.
+            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        """
+        notification = self.notification_backend.persist_one_off_notification(
+            email_or_phone=email_or_phone,
+            first_name=first_name,
+            last_name=last_name,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template,
+            preheader_template=preheader_template,
+            adapter_extra_parameters=adapter_extra_parameters,
+        )
+        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
+            tz=datetime.UTC
         ):
             self.send(notification)
         return notification
@@ -270,7 +316,7 @@ class NotificationService(Generic[A, B]):
         self,
         notification_id: int | str | uuid.UUID,
         **kwargs: Unpack[UpdateNotificationKwargs],
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         """
         Update a notification and send it if it is due to be sent immediately.
 
@@ -289,23 +335,23 @@ class NotificationService(Generic[A, B]):
             update_data=kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
+            tz=datetime.UTC
         ):
             self.send(notification)
         return notification
 
-    def get_all_future_notifications(self) -> Iterable[Notification]:
+    def get_all_future_notifications(self) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
         Returns:
-            Iterable[Notification] - the future notifications
+            Iterable[Notification | OneOffNotification] - the future notifications
         """
         return self.notification_backend.get_all_future_notifications()
 
     def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable[Notification]:
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -313,13 +359,13 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
 
         Returns:
-            Iterable[Notification] - the future notifications from the user
+            Iterable[Notification | OneOffNotification] - the future notifications from the user
         """
         return self.notification_backend.get_all_future_notifications_from_user(user_id)
 
     def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable[Notification]:
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -329,13 +375,13 @@ class NotificationService(Generic[A, B]):
             page_size: int - the number of notifications per page
 
         Returns:
-            Iterable[Notification] - the selected page of the future notifications from the user
+            Iterable[Notification | OneOffNotification] - the selected page of the future notifications from the user
         """
         return self.notification_backend.get_future_notifications_from_user(
             user_id, page, page_size
         )
 
-    def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
+    def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -345,7 +391,7 @@ class NotificationService(Generic[A, B]):
             page_size: int - the number of notifications per page
 
         Returns:
-            Iterable[Notification] - the future notifications
+            Iterable[Notification | OneOffNotification] - the future notifications
         """
         return self.notification_backend.get_future_notifications(page, page_size)
 
@@ -363,7 +409,7 @@ class NotificationService(Generic[A, B]):
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
         return not asyncio.iscoroutinefunction(context_function)
 
-    def get_notification_context(self, notification: Notification) -> NotificationContextDict:
+    def get_notification_context(self, notification: Notification | OneOffNotification) -> NotificationContextDict:
         """
         Generate the context for a notification. It uses the context_name and context_kwargs from the notification.
         Contexts are registered using the @register_context decorator.
@@ -419,7 +465,7 @@ class NotificationService(Generic[A, B]):
         logger.info("Sent %s notifications", notifications_sent)
         logger.info("Failed to send %s notifications", notifications_failed)
 
-    def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
+    def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
 
@@ -428,11 +474,11 @@ class NotificationService(Generic[A, B]):
             page_size: int - the number of notifications per page
 
         Returns:
-            Iterable[Notification] - the pending notifications
+            Iterable[Notification | OneOffNotification] - the pending notifications
         """
         return self.notification_backend.get_pending_notifications(page, page_size)
 
-    def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
@@ -440,11 +486,11 @@ class NotificationService(Generic[A, B]):
             notification_id: int | str | uuid.UUID - the ID of the notification to get
 
         Returns:
-            Notification - the notification
+            Notification | OneOffNotification - the notification
         """
         return self.notification_backend.get_notification(notification_id)
 
-    def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification:
+    def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         """
         Mark a notification as read.
 
@@ -455,7 +501,7 @@ class NotificationService(Generic[A, B]):
             notification: Notification - the notification to mark as read
 
         Returns:
-            Notification - the updated notification
+            Notification | OneOffNotification- the updated notification
         """
         return self.notification_backend.mark_sent_as_read(notification_id)
 
@@ -537,7 +583,7 @@ class NotificationService(Generic[A, B]):
             try:
                 self.notification_backend.mark_pending_as_sent(notification_dict["id"])
                 self.notification_backend.store_context_used(
-                    notification_dict["id"], 
+                    notification_dict["id"],
                     context_dict,
                     async_adapter.adapter_import_str,
                 )
@@ -610,7 +656,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             for adapter in notification_adapters
         )
 
-    async def send(self, notification: Notification, lock: asyncio.Lock | None = None) -> None:
+    async def send(self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None) -> None:
         """
         Send a notification using the appropriate adapter
 
@@ -622,7 +668,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            notification: Notification - the notification to be sent
+            notification: Notification | OneOffNotification - the notification to be sent
         """
         try:
             context = await self.get_notification_context(notification)
@@ -660,8 +706,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             try:
                 await self.notification_backend.mark_pending_as_sent(notification.id, lock)
                 await self.notification_backend.store_context_used(
-                    notification.id, 
-                    context, 
+                    notification.id,
+                    context,
                     adapter.adapter_import_str,
                     lock
                 )
@@ -715,7 +761,51 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             adapter_extra_parameters=adapter_extra_parameters,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
+            tz=datetime.UTC
+        ):
+            await self.send(notification)
+        return notification
+
+    async def create_one_off_notification(
+        self,
+        email_or_phone: str,
+        first_name: str,
+        last_name: str,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: NotificationContextDict,
+        send_after: datetime.datetime | None = None,
+        subject_template: str = "",
+        preheader_template: str = "",
+        adapter_extra_parameters: dict | None = None,
+    ) ->  OneOffNotification:
+        """
+        Create a one-off notification and send it if it is due to be sent immediately.
+        This method may raise the following exceptions:
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if the adapter fails to send the notification.
+            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        """
+        notification = await self.notification_backend.persist_one_off_notification(
+            email_or_phone=email_or_phone,
+            first_name=first_name,
+            last_name=last_name,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template,
+            preheader_template=preheader_template,
+            adapter_extra_parameters=adapter_extra_parameters,
+        )
+        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
+            tz=datetime.UTC
         ):
             await self.send(notification)
         return notification
@@ -724,7 +814,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         self,
         notification_id: int | str | uuid.UUID,
         **kwargs: Unpack[UpdateNotificationKwargs],
-    ) -> Notification:
+    ) -> Notification | OneOffNotification:
         """
         Update a notification and send it if it is due to be sent immediately.
 
@@ -743,23 +833,23 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             update_data=kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
+            tz=datetime.UTC
         ):
             await self.send(notification)
         return notification
 
-    async def get_all_future_notifications(self) -> Iterable[Notification]:
+    async def get_all_future_notifications(self) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
         Returns:
-            Iterable[Notification] - the future notifications
+            Iterable[Notification | OneOffNotification] - the future notifications
         """
         return await self.notification_backend.get_all_future_notifications()
 
     async def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable[Notification]:
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -767,13 +857,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
 
         Returns:
-            Iterable[Notification] - the future notifications from the user
+            Iterable[Notification | OneOffNotification] - the future notifications from the user
         """
         return await self.notification_backend.get_all_future_notifications_from_user(user_id)
 
     async def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable[Notification]:
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -783,13 +873,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             page_size: int - the number of notifications per page
 
         Returns:
-            Iterable[Notification] - the selected page of the future notifications from the user
+            Iterable[Notification | OneOffNotification] - the selected page of the future notifications from the user
         """
         return await self.notification_backend.get_future_notifications_from_user(
             user_id, page, page_size
         )
 
-    async def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
+    async def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -799,11 +889,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             page_size: int - the number of notifications per page
 
         Returns:
-            Iterable[Notification] - the future notifications
+            Iterable[Notification | OneOffNotification] - the future notifications
         """
         return await self.notification_backend.get_future_notifications(page, page_size)
 
-    async def get_notification_context(self, notification: Notification) -> NotificationContextDict:
+    async def get_notification_context(self, notification: Notification | OneOffNotification) -> NotificationContextDict:
         """
         Generate the context for a notification. It uses the context_name and context_kwargs from the notification.
         Contexts are registered using the @register_context decorator.
@@ -841,7 +931,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         return not asyncio.iscoroutinefunction(context_function)
 
     async def _send_notification_with_error_logging(
-        self, notification: "Notification", lock: asyncio.Lock | None = None
+        self, notification: "Notification | OneOffNotification", lock: asyncio.Lock | None = None
     ) -> None:
         try:
             await self.send(notification, lock)
@@ -875,7 +965,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         )
         return None
 
-    async def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification]:
+    async def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
 
@@ -884,11 +974,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             page_size: int - the number of notifications per page
 
         Returns:
-            Iterable[Notification] - the pending notifications
+            Iterable[Notification | OneOffNotification] - the pending notifications
         """
         return await self.notification_backend.get_pending_notifications(page, page_size)
 
-    async def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification:
+    async def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
@@ -896,11 +986,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification_id: int | str | uuid.UUID - the ID of the notification to get
 
         Returns:
-            Notification - the notification
+            Notification | OneOffNotification - the notification
         """
         return await self.notification_backend.get_notification(notification_id)
 
-    async def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification:
+    async def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
         """
         Mark a notification as read.
 
@@ -911,7 +1001,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification: Notification - the notification to mark as read
 
         Returns:
-            Notification - the updated notification
+            Notification | OneOffNotification - the updated notification
         """
         return await self.notification_backend.mark_sent_as_read(notification_id)
 
@@ -948,6 +1038,6 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Cancel a notification.
 
         Parameters:
-            notifictaion_id: int | str | uuid.UUID - the ID of the notification to cancel
+            notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
         return await self.notification_backend.cancel_notification(notification_id)

@@ -7,7 +7,7 @@ from vintasend.services.notification_template_renderers.base import BaseNotifica
 
 if TYPE_CHECKING:
     from vintasend.constants import NotificationTypes
-    from vintasend.services.dataclasses import Notification
+    from vintasend.services.dataclasses import Notification, OneOffNotification
     from vintasend.services.notification_service import NotificationContextDict
 
 
@@ -93,7 +93,7 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
             self.backend = cast(B, backend)
         else:
             self.backend = cast(B, get_notification_backend(backend, backend_kwargs, config))
-        
+
         if isinstance(template_renderer, str) or isinstance(template_renderer, tuple):
             self.template_renderer = cast(T, get_template_renderer(template_renderer))
         else:
@@ -103,7 +103,7 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
         self.config = config
 
     @abstractmethod
-    def send(self, notification: "Notification", context: "NotificationContextDict") -> None:
+    def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         """
         Send the notification to the user.
 

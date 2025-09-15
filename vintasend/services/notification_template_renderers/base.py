@@ -5,7 +5,7 @@ from vintasend.services.utils import get_class_path
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import Notification
+    from vintasend.services.dataclasses import Notification, OneOffNotification
     from vintasend.services.notification_service import NotificationContextDict
 
 
@@ -33,7 +33,7 @@ class BaseNotificationTemplateRenderer(ABC):
 
     @abstractmethod
     def render(
-        self, notification: "Notification", context: "NotificationContextDict"
+        self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
     ) -> NotificationSendInput:
         """
         Render the notification template.
