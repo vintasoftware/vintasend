@@ -65,7 +65,7 @@ class FakeFileBackend(BaseNotificationBackend):
             if n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is not None
-                and n.send_after > datetime.datetime.now(tz=datetime.UTC)
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
             )
         ]
 
@@ -78,7 +78,7 @@ class FakeFileBackend(BaseNotificationBackend):
             if n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is not None
-                and n.send_after > datetime.datetime.now(tz=datetime.UTC)
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
             )
             and (
                 (isinstance(n, Notification) and str(n.user_id) == str(user_id))
@@ -93,7 +93,7 @@ class FakeFileBackend(BaseNotificationBackend):
             if n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is None
-                or n.send_after <= datetime.datetime.now(tz=datetime.UTC)
+                or n.send_after <= datetime.datetime.now(tz=datetime.timezone.utc)
             )
         ]
 
@@ -349,7 +349,7 @@ class FakeFileBackend(BaseNotificationBackend):
 class Config:
     def __init__(self, config_a: Decimal | None = None, config_b: datetime.datetime | None = None):
         self.config_a = config_a if config_a is not None else Decimal("1.0")
-        now = datetime.datetime.now(tz=datetime.UTC)
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         self.config_b = config_b if config_b is not None else now
 
 
@@ -419,7 +419,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             if n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is not None
-                and n.send_after > datetime.datetime.now(tz=datetime.UTC)
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
             )
         ]
 
@@ -433,7 +433,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             and n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is not None
-                and n.send_after > datetime.datetime.now(tz=datetime.UTC)
+                and n.send_after > datetime.datetime.now(tz=datetime.timezone.utc)
             )
             and str(n.user_id) == str(user_id)
         ]
@@ -445,7 +445,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             if n.status == NotificationStatus.PENDING_SEND.value
             and (
                 n.send_after is None
-                or n.send_after <= datetime.datetime.now(tz=datetime.UTC)
+                or n.send_after <= datetime.datetime.now(tz=datetime.timezone.utc)
             )
         ]
 

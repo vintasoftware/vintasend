@@ -262,7 +262,7 @@ class NotificationService(Generic[A, B]):
             adapter_extra_parameters=adapter_extra_parameters,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.UTC
+            tz=datetime.timezone.utc
         ):
             self.send(notification)
         return notification
@@ -307,7 +307,7 @@ class NotificationService(Generic[A, B]):
             adapter_extra_parameters=adapter_extra_parameters,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.UTC
+            tz=datetime.timezone.utc
         ):
             self.send(notification)
         return notification
@@ -335,7 +335,7 @@ class NotificationService(Generic[A, B]):
             update_data=kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.UTC
+            tz=datetime.timezone.utc
         ):
             self.send(notification)
         return notification
@@ -761,7 +761,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             adapter_extra_parameters=adapter_extra_parameters,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.UTC
+            tz=datetime.timezone.utc
         ):
             await self.send(notification)
         return notification
@@ -805,7 +805,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             adapter_extra_parameters=adapter_extra_parameters,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.UTC
+            tz=datetime.timezone.utc
         ):
             await self.send(notification)
         return notification
@@ -833,7 +833,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             update_data=kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.UTC
+            tz=datetime.timezone.utc
         ):
             await self.send(notification)
         return notification
