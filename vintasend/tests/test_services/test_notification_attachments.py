@@ -958,10 +958,10 @@ class TestNotificationServiceFileHandling(TestCase):
         mock_response.content = b"Mocked downloaded content"
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         url = "http://example.com/test.pdf"
         result = self.service._read_file_data(url)
-        
+
         # Should contain the mocked downloaded content
         assert result == b"Mocked downloaded content"
         mock_get.assert_called_once_with(url, timeout=30)
@@ -1059,10 +1059,10 @@ class TestNotificationServiceUrlHandling(TestCase):
         mock_response.content = b"Mocked document content"
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         url = "http://example.com/document.pdf"
         result = self.service._download_from_url(url)
-        
+
         # Should contain fake downloaded content
         assert result == b"Mocked document content"
         mock_get.assert_called_once_with(url, timeout=30)
@@ -1074,7 +1074,7 @@ class TestNotificationServiceUrlHandling(TestCase):
         mock_response = Mock()
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         urls = [
             "https://secure.example.com/file.pdf",
             "http://example.com/image.png",
@@ -1085,7 +1085,7 @@ class TestNotificationServiceUrlHandling(TestCase):
             mock_response.content = f"Mocked content {i}".encode()
             result = self.service._download_from_url(url)
             assert result == f"Mocked content {i}".encode()
-        
+
         # Verify all calls were made
         assert mock_get.call_count == len(urls)
         for url in urls:
@@ -1097,9 +1097,9 @@ class TestNotificationServiceUrlHandling(TestCase):
         # This test is for the sync version which doesn't have try/except for imports
         # But we can test the scenario where requests module fails to import
         mock_requests.get.side_effect = ImportError("No module named 'requests'")
-        
+
         url = "https://example.com/test-import.pdf"
-        
+
         with pytest.raises(ImportError):
             self.service._download_from_url(url)
 
@@ -1183,7 +1183,7 @@ class TestAsyncNotificationServiceFileHandling(IsolatedAsyncioTestCase):
         mock_response.content = b"Mocked async downloaded content"
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         url = "https://example.com/async-test.pdf"
         result = self.service._read_file_data(url)
 
@@ -1236,10 +1236,10 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
         mock_response.content = b"Mocked async document content"
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         url = "https://example.com/async-document.pdf"
         result = self.service._download_from_url(url)
-        
+
         assert result == b"Mocked async document content"
         mock_get.assert_called_once_with(url, timeout=30)
 
@@ -1251,11 +1251,11 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
             if name == 'requests':
                 raise ImportError("No module named 'requests'")
             return __import__(name, *args, **kwargs)
-        
+
         mock_import.side_effect = side_effect
-        
+
         url = "https://example.com/test-import.pdf"
-        
+
         with pytest.raises(ImportError, match="requests library is required"):
             self.service._download_from_url(url)
 
@@ -1266,7 +1266,7 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
         mock_response = Mock()
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         urls = [
             "https://secure.example.com/async-file.pdf",
             "http://example.com/async-image.png",
@@ -1277,7 +1277,7 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
             mock_response.content = f"Mocked async content {i}".encode()
             result = self.service._download_from_url(url)
             assert result == f"Mocked async content {i}".encode()
-        
+
         # Verify all calls were made
         assert mock_get.call_count == len(urls)
         for url in urls:
@@ -1329,7 +1329,7 @@ class TestFileHandlingEdgeCases(TestCase):
         mock_response = Mock()
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
-        
+
         urls_with_params = [
             "https://example.com/file.pdf?version=1&download=true",
             "http://example.com/image.png#preview",
@@ -1338,10 +1338,10 @@ class TestFileHandlingEdgeCases(TestCase):
 
         for i, url in enumerate(urls_with_params):
             assert self.service._is_url(url) is True
-            
+
             mock_response.content = f"Param content {i}".encode()
             result = self.service._download_from_url(url)
             assert result == f"Param content {i}".encode()
-        
+
         # Verify all calls were made
         assert mock_get.call_count == len(urls_with_params)
