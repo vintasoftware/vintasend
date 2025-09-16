@@ -297,17 +297,17 @@ class FakeFileBackend(BaseNotificationBackend):
 
         if isinstance(file, bytes):
             return file
-        elif isinstance(file, str):
+        if isinstance(file, str):
             if self._is_url(file):
                 return self._download_from_url(file)
             else:
                 # Read from file path
                 with open(file, 'rb') as f:
                     return f.read()
-        elif isinstance(file, Path):
+        if isinstance(file, Path):
             with open(file, 'rb') as f:
                 return f.read()
-        elif hasattr(file, 'read'):
+        if hasattr(file, 'read'):
             current_pos = file.tell() if hasattr(file, 'tell') else 0
             if hasattr(file, 'seek'):
                 file.seek(0)
@@ -317,8 +317,8 @@ class FakeFileBackend(BaseNotificationBackend):
             if isinstance(data, str):
                 return data.encode('utf-8')
             return data
-        else:
-            raise ValueError(f"Unsupported file type: {type(file)}")
+
+        raise ValueError(f"Unsupported file type: {type(file)}")
 
     def _is_url(self, file_str: str) -> bool:
         """Check if a string is a URL"""
@@ -544,17 +544,17 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
         if isinstance(file, bytes):
             return file
-        elif isinstance(file, str):
+        if isinstance(file, str):
             if self._is_url(file):
                 return self._download_from_url(file)
             else:
                 # Read from file path
                 with open(file, 'rb') as f:
                     return f.read()
-        elif isinstance(file, Path):
+        if isinstance(file, Path):
             with open(file, 'rb') as f:
                 return f.read()
-        elif hasattr(file, 'read'):
+        if hasattr(file, 'read'):
             current_pos = file.tell() if hasattr(file, 'tell') else 0
             if hasattr(file, 'seek'):
                 file.seek(0)
@@ -564,8 +564,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             if isinstance(data, str):
                 return data.encode('utf-8')
             return data
-        else:
-            raise ValueError(f"Unsupported file type: {type(file)}")
+
+        raise ValueError(f"Unsupported file type: {type(file)}")
 
     def _is_url(self, file_str: str) -> bool:
         """Check if a string is a URL"""

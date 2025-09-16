@@ -66,9 +66,8 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
         self.template_renderer.render(notification, context)
 
         # Capture attachment information for testing
-        attachment_info = []
-        for attachment in notification.attachments:
-            attachment_info.append({
+        attachment_info = [
+            {
                 'id': str(attachment.id),
                 'filename': attachment.filename,
                 'content_type': attachment.content_type,
@@ -76,7 +75,9 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
                 'is_inline': attachment.is_inline,
                 'description': attachment.description,
                 'checksum': attachment.checksum,
-            })
+            }
+            for attachment in notification.attachments
+        ]
 
         self.sent_emails.append((notification, context, attachment_info))
 
