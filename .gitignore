@@ -48,3 +48,4 @@ tmp_email/
 
 # built files
 dist/
+notifications.json

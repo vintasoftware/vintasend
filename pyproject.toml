@@ -15,6 +15,7 @@ python = ">=3.9,<3.14"
 typing-extensions = "^4.12.2"
 pytest-asyncio = "^0.24.0"
 packaging = "^25.0"
+requests = "^2.32.5"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -164,3 +165,7 @@ omit = [
 [tool.pytest.ini_options]
 python_files = ["test_*.py"]
 addopts = "--dist=loadscope"
+
+[[tool.mypy.overrides]]
+module = ["requests.*"]
+ignore_missing_imports = true
