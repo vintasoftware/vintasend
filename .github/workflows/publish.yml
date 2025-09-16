@@ -9,7 +9,7 @@ jobs:
   test-before-publish:
     name: Run tests before publishing
     runs-on: ubuntu-latest
-    
+
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
@@ -49,11 +49,11 @@ jobs:
     needs: [test-before-publish, check-tests]
     runs-on: ubuntu-latest
     if: ${{ needs.test-before-publish.result == 'success' }}
-    
+
     permissions:
       contents: write  # Needed to create GitHub releases
       id-token: write  # Needed for trusted publishing to PyPI
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -81,19 +81,6 @@ jobs:
       - name: Install dependencies
         run: poetry install --only=main
 
-      - name: Extract tag version
-        id: get_version
-        run: |
-          # Extract version from tag (remove 'v' prefix if present)
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Update version in pyproject.toml
-        run: |
-          # Update the version in pyproject.toml to match the tag
-          poetry version ${{ steps.get_version.outputs.version }}
-
       - name: Build package
         run: poetry build
 
@@ -111,26 +98,3 @@ jobs:
         run: |
           poetry config pypi-token.pypi $POETRY_PYPI_TOKEN_PYPI
           poetry publish
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-          name: Release ${{ steps.get_version.outputs.tag }}
-          body: |
-            ## Changes in ${{ steps.get_version.outputs.tag }}
-            
-            See the full changelog for details.
-            
-            ### Installation
-            ```bash
-            pip install vintasend==${{ steps.get_version.outputs.version }}
-            ```
-            
-            ### Poetry
-            ```bash
-            poetry add vintasend@${{ steps.get_version.outputs.version }}
-            ```
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

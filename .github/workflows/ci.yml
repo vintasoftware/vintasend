@@ -1,6 +1,6 @@
 name: CI
 
-on: [push, pull_request]
+on: [push]
 
 jobs:
   build-python:
@@ -32,11 +32,11 @@ jobs:
           poetry run tox
         env:
           OPENAI_API_KEY: "sk-fake-test-key-123"
-          
+
       - name: Generate XML coverage report
         run: |
           poetry run coverage xml -o coverage-${{ matrix.python-version }}.xml
-          
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
