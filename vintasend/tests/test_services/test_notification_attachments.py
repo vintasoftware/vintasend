@@ -14,8 +14,11 @@ Tests cover:
 import datetime
 import hashlib
 import io
+import os
+import tempfile
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -872,3 +875,473 @@ class TestAttachmentIntegration(TestCase):
 
         # Verify it was stored
         assert len(self.backend.notifications) == 1
+
+
+class TestNotificationServiceFileHandling(TestCase):
+    """Test the _read_file_data method in NotificationService"""
+
+    def setUp(self):
+        self.backend = FakeFileBackend()
+        self.adapter = FakeEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=self.backend,
+        )
+        self.service = NotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+
+        # Register context for testing
+        @register_context("file_test")
+        def test_context(context_kwargs):
+            return NotificationContextDict(context_kwargs)
+
+    def tearDown(self):
+        # Clear notifications after each test
+        if hasattr(self, 'backend'):
+            self.backend.notifications = []
+
+    def test_read_file_data_with_bytesio(self):
+        """Test _read_file_data with BytesIO object"""
+        test_data = b"BytesIO content"
+        file_obj = io.BytesIO(test_data)
+
+        # Set position to middle to test seek functionality
+        file_obj.seek(5)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == test_data
+
+        # Verify position was restored
+        assert file_obj.tell() == 5
+
+    def test_read_file_data_with_stringio(self):
+        """Test _read_file_data with StringIO object"""
+        test_data = "StringIO content"
+        file_obj = io.StringIO(test_data)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == test_data.encode('utf-8')
+
+    def test_read_file_data_with_file_path(self):
+        """Test _read_file_data with file path"""
+        # Create a temporary file
+        test_data = b"File path content"
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(test_data)
+            temp_file_path = temp_file.name
+
+        try:
+            result = self.service._read_file_data(temp_file_path)
+            assert result == test_data
+        finally:
+            os.unlink(temp_file_path)
+
+    def test_read_file_data_with_path_object(self):
+        """Test _read_file_data with pathlib.Path object"""
+        test_data = b"Path object content"
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(test_data)
+            temp_file_path = Path(temp_file.name)
+
+        try:
+            result = self.service._read_file_data(temp_file_path)
+            assert result == test_data
+        finally:
+            os.unlink(temp_file_path)
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_read_file_data_with_url(self, mock_get):
+        """Test _read_file_data with URL (should call _download_from_url)"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.content = b"Mocked downloaded content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        url = "http://example.com/test.pdf"
+        result = self.service._read_file_data(url)
+        
+        # Should contain the mocked downloaded content
+        assert result == b"Mocked downloaded content"
+        mock_get.assert_called_once_with(url, timeout=30)
+
+    def test_read_file_data_with_unsupported_type(self):
+        """Test _read_file_data with unsupported file type"""
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            self.service._read_file_data(12345)  # int is not supported
+
+    def test_read_file_data_with_bytes_should_fail(self):
+        """Test _read_file_data with raw bytes should fail (not a supported input)"""
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            self.service._read_file_data(b"raw bytes content")
+
+    def test_read_file_data_with_nonexistent_file(self):
+        """Test _read_file_data with non-existent file path"""
+        with pytest.raises(FileNotFoundError):
+            self.service._read_file_data("/path/that/does/not/exist.txt")
+
+    def test_read_file_data_seek_behavior_without_tell(self):
+        """Test _read_file_data with file object that doesn't support tell"""
+        class NoTellFile:
+            def __init__(self, data):
+                self.data = data
+                self.position = 0
+
+            def read(self):
+                return self.data[self.position:]
+
+            def seek(self, pos):
+                self.position = pos
+
+        test_data = b"No tell file content"
+        file_obj = NoTellFile(test_data)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == test_data
+
+    def test_read_file_data_no_seek_support(self):
+        """Test _read_file_data with file object that doesn't support seek"""
+        class NoSeekFile:
+            def __init__(self, data):
+                self.data = data
+
+            def read(self):
+                return self.data
+
+            def tell(self):
+                return 0
+
+        test_data = b"No seek file content"
+        file_obj = NoSeekFile(test_data)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == test_data
+
+
+class TestNotificationServiceUrlHandling(TestCase):
+    """Test the _download_from_url and _is_url methods in NotificationService"""
+
+    def setUp(self):
+        self.backend = FakeFileBackend()
+        self.adapter = FakeEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=self.backend,
+        )
+        self.service = NotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+
+    def test_is_url_detection(self):
+        """Test _is_url method with various URL schemes"""
+        test_cases = [
+            ("http://example.com/file.pdf", True),
+            ("https://example.com/file.pdf", True),
+            ("s3://bucket/file.pdf", True),
+            ("gs://bucket/file.pdf", True),
+            ("azure://container/file.pdf", True),
+            ("/local/path/file.pdf", False),
+            ("relative/path/file.pdf", False),
+            ("file.pdf", False),
+            ("ftp://example.com/file.pdf", False),  # Not supported
+        ]
+
+        for url, expected in test_cases:
+            result = self.service._is_url(url)
+            assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_download_from_url_success(self, mock_get):
+        """Test _download_from_url with successful download"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.content = b"Mocked document content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        url = "http://example.com/document.pdf"
+        result = self.service._download_from_url(url)
+        
+        # Should contain fake downloaded content
+        assert result == b"Mocked document content"
+        mock_get.assert_called_once_with(url, timeout=30)
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_download_from_url_different_schemes(self, mock_get):
+        """Test _download_from_url with different URL schemes"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        urls = [
+            "https://secure.example.com/file.pdf",
+            "http://example.com/image.png",
+            "https://api.example.com/data.json",
+        ]
+
+        for i, url in enumerate(urls):
+            mock_response.content = f"Mocked content {i}".encode()
+            result = self.service._download_from_url(url)
+            assert result == f"Mocked content {i}".encode()
+        
+        # Verify all calls were made
+        assert mock_get.call_count == len(urls)
+        for url in urls:
+            mock_get.assert_any_call(url, timeout=30)
+
+    @patch('vintasend.services.notification_service.requests')
+    def test_download_from_url_import_error(self, mock_requests):
+        """Test _download_from_url handles missing requests library"""
+        # This test is for the sync version which doesn't have try/except for imports
+        # But we can test the scenario where requests module fails to import
+        mock_requests.get.side_effect = ImportError("No module named 'requests'")
+        
+        url = "https://example.com/test-import.pdf"
+        
+        with pytest.raises(ImportError):
+            self.service._download_from_url(url)
+
+
+class TestAsyncNotificationServiceFileHandling(IsolatedAsyncioTestCase):
+    """Test the _read_file_data method in AsyncIONotificationService"""
+
+    async def asyncSetUp(self):
+        self.backend = FakeAsyncIOFileBackend()
+        self.adapter = FakeAsyncIOEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=self.backend,
+        )
+        self.service = AsyncIONotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+
+        # Register context for testing
+        @register_context("async_file_test")
+        def test_context(context_kwargs):
+            return NotificationContextDict(context_kwargs)
+
+    async def asyncTearDown(self):
+        # Clear backend
+        await self.backend.clear()
+
+    def test_async_read_file_data_with_bytesio(self):
+        """Test async _read_file_data with BytesIO object"""
+        test_data = b"Async BytesIO content"
+        file_obj = io.BytesIO(test_data)
+
+        # Set position to test seek functionality
+        file_obj.seek(3)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == test_data
+
+        # Verify position was restored
+        assert file_obj.tell() == 3
+
+    def test_async_read_file_data_with_stringio(self):
+        """Test async _read_file_data with StringIO object"""
+        test_data = "Async StringIO content"
+        file_obj = io.StringIO(test_data)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == test_data.encode('utf-8')
+
+    def test_async_read_file_data_with_file_path(self):
+        """Test async _read_file_data with file path"""
+        test_data = b"Async file path content"
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(test_data)
+            temp_file_path = temp_file.name
+
+        try:
+            result = self.service._read_file_data(temp_file_path)
+            assert result == test_data
+        finally:
+            os.unlink(temp_file_path)
+
+    def test_async_read_file_data_with_path_object(self):
+        """Test async _read_file_data with pathlib.Path object"""
+        test_data = b"Async Path object content"
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(test_data)
+            temp_file_path = Path(temp_file.name)
+
+        try:
+            result = self.service._read_file_data(temp_file_path)
+            assert result == test_data
+        finally:
+            os.unlink(temp_file_path)
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_async_read_file_data_with_url(self, mock_get):
+        """Test async _read_file_data with URL"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.content = b"Mocked async downloaded content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        url = "https://example.com/async-test.pdf"
+        result = self.service._read_file_data(url)
+
+        # Should contain the mocked downloaded content
+        assert result == b"Mocked async downloaded content"
+        mock_get.assert_called_once_with(url, timeout=30)
+
+    def test_async_read_file_data_with_unsupported_type(self):
+        """Test async _read_file_data with unsupported file type"""
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            self.service._read_file_data({"not": "supported"})
+
+
+class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
+    """Test the _download_from_url and _is_url methods in AsyncIONotificationService"""
+
+    async def asyncSetUp(self):
+        self.backend = FakeAsyncIOFileBackend()
+        self.adapter = FakeAsyncIOEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=self.backend,
+        )
+        self.service = AsyncIONotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+
+    def test_async_is_url_detection(self):
+        """Test async _is_url method with various URL schemes"""
+        test_cases = [
+            ("http://example.com/file.pdf", True),
+            ("https://example.com/file.pdf", True),
+            ("s3://bucket/file.pdf", True),
+            ("gs://bucket/file.pdf", True),
+            ("azure://container/file.pdf", True),
+            ("/local/path/file.pdf", False),
+            ("relative/path/file.pdf", False),
+            ("file.pdf", False),
+        ]
+
+        for url, expected in test_cases:
+            result = self.service._is_url(url)
+            assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_async_download_from_url_success(self, mock_get):
+        """Test async _download_from_url with successful download"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.content = b"Mocked async document content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        url = "https://example.com/async-document.pdf"
+        result = self.service._download_from_url(url)
+        
+        assert result == b"Mocked async document content"
+        mock_get.assert_called_once_with(url, timeout=30)
+
+    @patch('builtins.__import__')
+    def test_async_download_from_url_requests_import_error(self, mock_import):
+        """Test async _download_from_url handles missing requests library"""
+        # Mock __import__ to raise ImportError for 'requests' module
+        def side_effect(name, *args, **kwargs):
+            if name == 'requests':
+                raise ImportError("No module named 'requests'")
+            return __import__(name, *args, **kwargs)
+        
+        mock_import.side_effect = side_effect
+        
+        url = "https://example.com/test-import.pdf"
+        
+        with pytest.raises(ImportError, match="requests library is required"):
+            self.service._download_from_url(url)
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_async_download_from_url_different_schemes(self, mock_get):
+        """Test async _download_from_url with different URL schemes"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        urls = [
+            "https://secure.example.com/async-file.pdf",
+            "http://example.com/async-image.png",
+            "https://api.example.com/async-data.json",
+        ]
+
+        for i, url in enumerate(urls):
+            mock_response.content = f"Mocked async content {i}".encode()
+            result = self.service._download_from_url(url)
+            assert result == f"Mocked async content {i}".encode()
+        
+        # Verify all calls were made
+        assert mock_get.call_count == len(urls)
+        for url in urls:
+            mock_get.assert_any_call(url, timeout=30)
+class TestFileHandlingEdgeCases(TestCase):
+    """Test edge cases for file handling methods"""
+
+    def setUp(self):
+        self.backend = FakeFileBackend()
+        self.adapter = FakeEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=self.backend,
+        )
+        self.service = NotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+
+    def test_read_file_data_with_empty_bytes(self):
+        """Test _read_file_data with empty bytes should fail (not supported)"""
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            self.service._read_file_data(b"")
+
+    def test_read_file_data_with_empty_stringio(self):
+        """Test _read_file_data with empty StringIO"""
+        file_obj = io.StringIO("")
+        result = self.service._read_file_data(file_obj)
+        assert result == b""
+
+    def test_read_file_data_with_empty_bytesio(self):
+        """Test _read_file_data with empty BytesIO"""
+        file_obj = io.BytesIO(b"")
+        result = self.service._read_file_data(file_obj)
+        assert result == b""
+
+    def test_read_file_data_large_content(self):
+        """Test _read_file_data with large content"""
+        large_data = b"x" * 10000  # 10KB of data
+        file_obj = io.BytesIO(large_data)
+
+        result = self.service._read_file_data(file_obj)
+        assert result == large_data
+        assert len(result) == 10000
+
+    @patch('vintasend.services.notification_service.requests.get')
+    def test_url_handling_with_query_parameters(self, mock_get):
+        """Test URL handling with query parameters and fragments"""
+        # Mock the requests.get response
+        mock_response = Mock()
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        urls_with_params = [
+            "https://example.com/file.pdf?version=1&download=true",
+            "http://example.com/image.png#preview",
+            "https://api.example.com/data.json?format=pdf&size=large",
+        ]
+
+        for i, url in enumerate(urls_with_params):
+            assert self.service._is_url(url) is True
+            
+            mock_response.content = f"Param content {i}".encode()
+            result = self.service._download_from_url(url)
+            assert result == f"Param content {i}".encode()
+        
+        # Verify all calls were made
+        assert mock_get.call_count == len(urls_with_params)
