@@ -10,6 +10,7 @@ from vintasend.services.utils import get_class_path
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import (
         Notification,
+        NotificationAttachment,
         OneOffNotification,
         UpdateNotificationKwargs,
     )
@@ -65,6 +66,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list["NotificationAttachment"] | None = None,
         lock: asyncio.Lock | None = None
     ) -> "Notification":
         ...
@@ -84,6 +86,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list["NotificationAttachment"] | None = None,
         lock: asyncio.Lock | None = None
     ) -> "OneOffNotification":
         ...

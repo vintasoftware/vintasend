@@ -1,6 +1,6 @@
 import datetime
 import uuid
-from typing import Generic, TypeVar, cast
+from typing import Generic, TypeVar
 
 from vintasend.constants import NotificationTypes
 from vintasend.services.dataclasses import Notification, NotificationContextDict, OneOffNotification
@@ -26,15 +26,29 @@ class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
     notification_type = NotificationTypes.EMAIL
     backend: B
     template_renderer: T
-    sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict"]] = []
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.sent_emails = []
+        self.sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict", list[dict]]] = []
 
     def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         self.template_renderer.render(notification, context)
-        self.sent_emails.append((notification, context))
+
+        # Capture attachment information for testing
+        attachment_info = [
+            {
+                'id': str(attachment.id),
+                'filename': attachment.filename,
+                'content_type': attachment.content_type,
+                'size': attachment.size,
+                'is_inline': attachment.is_inline,
+                'description': attachment.description,
+                'checksum': attachment.checksum,
+            }
+            for attachment in notification.attachments
+        ]
+
+        self.sent_emails.append((notification, context, attachment_info))
 
 
 BAIO = TypeVar("BAIO", bound=AsyncIOBaseNotificationBackend)
@@ -44,15 +58,29 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
     notification_type = NotificationTypes.EMAIL
     backend: BAIO
     template_renderer: T
-    sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict"]] = []
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.sent_emails = []
+        self.sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict", list[dict]]] = []
 
     async def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
         self.template_renderer.render(notification, context)
-        self.sent_emails.append((notification, context))
+
+        # Capture attachment information for testing
+        attachment_info = [
+            {
+                'id': str(attachment.id),
+                'filename': attachment.filename,
+                'content_type': attachment.content_type,
+                'size': attachment.size,
+                'is_inline': attachment.is_inline,
+                'description': attachment.description,
+                'checksum': attachment.checksum,
+            }
+            for attachment in notification.attachments
+        ]
+
+        self.sent_emails.append((notification, context, attachment_info))
 
 
 class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEmailAdapter[B, T]):
@@ -110,6 +138,7 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
             context_name=notification_dict["context_name"],
             subject_template=notification_dict["subject_template"],
             preheader_template=notification_dict["preheader_template"],
+            attachments=[],  # Default to empty attachments for delayed sending
         )
 
     def one_off_notification_from_dict(self, notification_dict: OneOffNotificationDict) -> "OneOffNotification":
@@ -140,6 +169,7 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
             context_name=notification_dict["context_name"],
             subject_template=notification_dict["subject_template"],
             preheader_template=notification_dict["preheader_template"],
+            attachments=[],  # Default to empty attachments for delayed sending
         )
 
 

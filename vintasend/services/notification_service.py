@@ -5,6 +5,8 @@ import uuid
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
 
+import requests
+
 from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 
@@ -25,6 +27,7 @@ from vintasend.exceptions import (
 )
 from vintasend.services.dataclasses import (
     Notification,
+    NotificationAttachment,
     NotificationContextDict,
     OneOffNotification,
     UpdateNotificationKwargs,
@@ -161,6 +164,58 @@ class NotificationService(Generic[A, B]):
             for adapter in notification_adapters
         )
 
+    def _validate_attachments(self, attachments: list[NotificationAttachment]) -> list[NotificationAttachment]:
+        """Validate attachments and return the validated list"""
+        # For now, just pass through the attachments
+        # In the future, this can include validation logic like:
+        # - File size limits
+        # - Content type validation
+        # - URL validation
+        # - Security checks
+        for attachment in attachments:
+            if attachment.is_url():
+                # URL validation is already handled in the is_url() method
+                pass
+
+        return attachments
+
+    def _read_file_data(self, file) -> bytes:
+        """Read file data from various file-like object types"""
+        from pathlib import Path
+
+        if isinstance(file, str):
+            if self._is_url(file):
+                return self._download_from_url(file)
+            else:
+                # Read from file path
+                with open(file, 'rb') as f:
+                    return f.read()
+        elif isinstance(file, Path):
+            with open(file, 'rb') as f:
+                return f.read()
+        elif hasattr(file, 'read'):
+            current_pos = file.tell() if hasattr(file, 'tell') else 0
+            if hasattr(file, 'seek'):
+                file.seek(0)
+            data = file.read()
+            if hasattr(file, 'seek'):
+                file.seek(current_pos)
+            if isinstance(data, str):
+                return data.encode('utf-8')
+            return data
+        else:
+            raise ValueError(f"Unsupported file type: {type(file)}")
+
+    def _is_url(self, file_str: str) -> bool:
+        """Check if a string is a URL"""
+        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+
+    def _download_from_url(self, url: str) -> bytes:
+        """Download file content from URL"""
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.content
+
     def send(self, notification: Notification | OneOffNotification) -> None:
         """
         Send a notification using the appropriate adapter
@@ -228,6 +283,7 @@ class NotificationService(Generic[A, B]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -248,7 +304,10 @@ class NotificationService(Generic[A, B]):
             send_after: datetime.datetime | None - the date and time to send the notification
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
+            attachments: list[NotificationAttachment] | None - the list of attachments to include
         """
+        validated_attachments = self._validate_attachments(attachments or [])
+
         notification = self.notification_backend.persist_notification(
             user_id=user_id,
             notification_type=notification_type,
@@ -260,6 +319,7 @@ class NotificationService(Generic[A, B]):
             subject_template=subject_template,
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=validated_attachments,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -281,6 +341,7 @@ class NotificationService(Generic[A, B]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) -> "OneOffNotification":
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -292,6 +353,8 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         """
+        validated_attachments = self._validate_attachments(attachments or [])
+
         notification = self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
             first_name=first_name,
@@ -305,6 +368,7 @@ class NotificationService(Generic[A, B]):
             subject_template=subject_template,
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=validated_attachments,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -656,6 +720,63 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             for adapter in notification_adapters
         )
 
+    def _validate_attachments(self, attachments: list[NotificationAttachment]) -> list[NotificationAttachment]:
+        """Validate attachments and return the validated list"""
+        # For now, just pass through the attachments
+        # In the future, this can include validation logic like:
+        # - File size limits
+        # - Content type validation
+        # - URL validation
+        # - Security checks
+        for attachment in attachments:
+            if attachment.is_url():
+                # URL validation is already handled in the is_url() method
+                pass
+
+        return attachments
+
+    def _read_file_data(self, file) -> bytes:
+        """Read file data from various file-like object types"""
+        from pathlib import Path
+
+        if isinstance(file, str):
+            if self._is_url(file):
+                return self._download_from_url(file)
+            else:
+                # Read from file path
+                with open(file, 'rb') as f:
+                    return f.read()
+        elif isinstance(file, Path):
+            with open(file, 'rb') as f:
+                return f.read()
+        elif hasattr(file, 'read'):
+            current_pos = file.tell() if hasattr(file, 'tell') else 0
+            if hasattr(file, 'seek'):
+                file.seek(0)
+            data = file.read()
+            if hasattr(file, 'seek'):
+                file.seek(current_pos)
+            if isinstance(data, str):
+                return data.encode('utf-8')
+            return data
+        else:
+            raise ValueError(f"Unsupported file type: {type(file)}")
+
+    def _is_url(self, file_str: str) -> bool:
+        """Check if a string is a URL"""
+        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+
+    def _download_from_url(self, url: str) -> bytes:
+        """Download file content from URL"""
+        try:
+            import requests
+        except ImportError as e:
+            raise ImportError("requests library is required to download files from URLs") from e
+
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.content
+
     async def send(self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None) -> None:
         """
         Send a notification using the appropriate adapter
@@ -727,6 +848,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -747,7 +869,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             send_after: datetime.datetime | None - the date and time to send the notification
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
+            attachments: list[NotificationAttachment] | None - the list of attachments to include
         """
+        validated_attachments = self._validate_attachments(attachments or [])
+
         notification = await self.notification_backend.persist_notification(
             user_id=user_id,
             notification_type=notification_type,
@@ -759,6 +884,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             subject_template=subject_template,
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=validated_attachments,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -780,6 +906,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) ->  OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -790,6 +917,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         """
+        validated_attachments = self._validate_attachments(attachments or [])
+
         notification = await self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
             first_name=first_name,
@@ -803,6 +932,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             subject_template=subject_template,
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=validated_attachments,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc

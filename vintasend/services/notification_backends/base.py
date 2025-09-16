@@ -10,6 +10,7 @@ from vintasend.services.utils import get_class_path
 if TYPE_CHECKING:
     from vintasend.services.dataclasses import (
         Notification,
+        NotificationAttachment,
         OneOffNotification,
         UpdateNotificationKwargs,
     )
@@ -69,6 +70,7 @@ class BaseNotificationBackend(ABC):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list["NotificationAttachment"] | None = None,
     ) -> "Notification":
         raise NotImplementedError
 
@@ -87,6 +89,7 @@ class BaseNotificationBackend(ABC):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list["NotificationAttachment"] | None = None,
     ) -> "OneOffNotification":
         raise NotImplementedError
 

@@ -1,20 +1,53 @@
 import asyncio
 import datetime
+import hashlib
+import io
 import json
 import os
 import uuid
 from decimal import Decimal
-from typing import cast
+from typing import BinaryIO, cast
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import NotificationNotFoundError
 from vintasend.services.dataclasses import (
+    AttachmentFile,
     Notification,
+    NotificationAttachment,
     OneOffNotification,
+    StoredAttachment,
     UpdateNotificationKwargs,
 )
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+
+
+class FakeFileAttachmentFile(AttachmentFile):
+    """In-memory attachment file for testing"""
+
+    def __init__(self, file_data: bytes, filename: str):
+        self.file_data = file_data
+        self.filename = filename
+        self._deleted = False
+
+    def read(self) -> bytes:
+        if self._deleted:
+            raise FileNotFoundError("Attachment file has been deleted")
+        return self.file_data
+
+    def stream(self) -> BinaryIO:
+        if self._deleted:
+            raise FileNotFoundError("Attachment file has been deleted")
+        return io.BytesIO(self.file_data)
+
+    def url(self, expires_in: int = 3600) -> str:
+        # For testing, return a fake URL
+        return f"fake://attachment/{self.filename}?expires_in={expires_in}"
+
+    def delete(self) -> None:
+        # For in-memory storage, just mark as deleted
+        self._deleted = True
+        self.file_data = b""
 
 
 class FakeFileBackend(BaseNotificationBackend):
@@ -206,7 +239,10 @@ class FakeFileBackend(BaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) -> Notification:
+        stored_attachments = self._store_attachments(attachments or [])
+
         notification = Notification(
             id=str(uuid.uuid4()),
             user_id=user_id,
@@ -220,10 +256,79 @@ class FakeFileBackend(BaseNotificationBackend):
             preheader_template=preheader_template,
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=stored_attachments,
         )
         self.notifications.append(notification)
         self._store_notifications()
         return notification
+
+    def _store_attachments(self, attachments: list[NotificationAttachment]) -> list[StoredAttachment]:
+        """Store attachments in memory and return StoredAttachment instances"""
+        stored_attachments = []
+
+        for attachment in attachments:
+            # Read file data from various sources
+            file_data = self._read_attachment_data(attachment.file)
+            attachment_id = str(uuid.uuid4())
+
+            # Create fake attachment file
+            attachment_file = FakeFileAttachmentFile(file_data, attachment.filename)
+
+            stored_attachment = StoredAttachment(
+                id=attachment_id,
+                filename=attachment.filename,
+                content_type=attachment.content_type or 'application/octet-stream',
+                size=len(file_data),
+                checksum=hashlib.sha256(file_data).hexdigest(),
+                created_at=datetime.datetime.now(tz=datetime.timezone.utc),
+                file=attachment_file,
+                description=attachment.description,
+                is_inline=attachment.is_inline,
+                storage_metadata={"storage_type": "in_memory"},
+            )
+
+            stored_attachments.append(stored_attachment)
+
+        return stored_attachments
+
+    def _read_attachment_data(self, file) -> bytes:
+        """Read file data from various file-like object types"""
+        from pathlib import Path
+
+        if isinstance(file, bytes):
+            return file
+        if isinstance(file, str):
+            if self._is_url(file):
+                return self._download_from_url(file)
+            else:
+                # Read from file path
+                with open(file, 'rb') as f:
+                    return f.read()
+        if isinstance(file, Path):
+            with open(file, 'rb') as f:
+                return f.read()
+        if hasattr(file, 'read'):
+            current_pos = file.tell() if hasattr(file, 'tell') else 0
+            if hasattr(file, 'seek'):
+                file.seek(0)
+            data = file.read()
+            if hasattr(file, 'seek'):
+                file.seek(current_pos)
+            if isinstance(data, str):
+                return data.encode('utf-8')
+            return data
+
+        raise ValueError(f"Unsupported file type: {type(file)}")
+
+    def _is_url(self, file_str: str) -> bool:
+        """Check if a string is a URL"""
+        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+
+    def _download_from_url(self, url: str) -> bytes:
+        """Download file content from URL (simplified for testing)"""
+        # For testing purposes, return dummy data
+        # In a real implementation, this would use requests or similar
+        return f"Downloaded content from {url}".encode('utf-8')
 
     def persist_one_off_notification(
         self,
@@ -239,7 +344,10 @@ class FakeFileBackend(BaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
     ) -> OneOffNotification:
+        stored_attachments = self._store_attachments(attachments or [])
+
         notification = OneOffNotification(
             id=uuid.uuid4(),
             email_or_phone=email_or_phone,
@@ -255,6 +363,7 @@ class FakeFileBackend(BaseNotificationBackend):
             preheader_template=preheader_template,
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=stored_attachments,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -399,6 +508,74 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             os.remove(self.database_file_name)
         except FileNotFoundError:
             pass
+
+    def _store_attachments(self, attachments: list[NotificationAttachment]) -> list[StoredAttachment]:
+        """Store attachments in memory and return StoredAttachment instances"""
+        stored_attachments = []
+
+        for attachment in attachments:
+            # Read file data from various sources
+            file_data = self._read_attachment_data(attachment.file)
+            attachment_id = str(uuid.uuid4())
+
+            # Create fake attachment file
+            attachment_file = FakeFileAttachmentFile(file_data, attachment.filename)
+
+            stored_attachment = StoredAttachment(
+                id=attachment_id,
+                filename=attachment.filename,
+                content_type=attachment.content_type or 'application/octet-stream',
+                size=len(file_data),
+                checksum=hashlib.sha256(file_data).hexdigest(),
+                created_at=datetime.datetime.now(tz=datetime.timezone.utc),
+                file=attachment_file,
+                description=attachment.description,
+                is_inline=attachment.is_inline,
+                storage_metadata={"storage_type": "in_memory"},
+            )
+
+            stored_attachments.append(stored_attachment)
+
+        return stored_attachments
+
+    def _read_attachment_data(self, file) -> bytes:
+        """Read file data from various file-like object types"""
+        from pathlib import Path
+
+        if isinstance(file, bytes):
+            return file
+        if isinstance(file, str):
+            if self._is_url(file):
+                return self._download_from_url(file)
+            else:
+                # Read from file path
+                with open(file, 'rb') as f:
+                    return f.read()
+        if isinstance(file, Path):
+            with open(file, 'rb') as f:
+                return f.read()
+        if hasattr(file, 'read'):
+            current_pos = file.tell() if hasattr(file, 'tell') else 0
+            if hasattr(file, 'seek'):
+                file.seek(0)
+            data = file.read()
+            if hasattr(file, 'seek'):
+                file.seek(current_pos)
+            if isinstance(data, str):
+                return data.encode('utf-8')
+            return data
+
+        raise ValueError(f"Unsupported file type: {type(file)}")
+
+    def _is_url(self, file_str: str) -> bool:
+        """Check if a string is a URL"""
+        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+
+    def _download_from_url(self, url: str) -> bytes:
+        """Download file content from URL (simplified for testing)"""
+        # For testing purposes, return dummy data
+        # In a real implementation, this would use requests or similar
+        return f"Downloaded content from {url}".encode('utf-8')
 
     async def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
         return cast(list[Notification], self.__paginate_notifications(
@@ -550,8 +727,11 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
         lock: asyncio.Lock | None = None,
     ) -> Notification:
+        stored_attachments = self._store_attachments(attachments or [])
+
         notification = Notification(
             id=str(uuid.uuid4()),
             user_id=user_id,
@@ -565,6 +745,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             preheader_template=preheader_template,
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=stored_attachments,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -584,8 +765,11 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
+        attachments: list[NotificationAttachment] | None = None,
         lock: asyncio.Lock | None = None,
     ) -> OneOffNotification:
+        stored_attachments = self._store_attachments(attachments or [])
+
         notification = OneOffNotification(
             id=uuid.uuid4(),
             email_or_phone=email_or_phone,
@@ -601,6 +785,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             preheader_template=preheader_template,
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
+            attachments=stored_attachments,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)

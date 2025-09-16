@@ -1,7 +1,106 @@
 import datetime
+import io
+import mimetypes
 import uuid
-from dataclasses import dataclass
-from typing import TypedDict
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, BinaryIO, TypedDict
+
+
+# Type alias for supported file inputs (for creating notifications)
+FileAttachment = (
+    BinaryIO |           # File-like object with read()
+    io.BytesIO |         # In-memory bytes
+    io.StringIO |        # In-memory text
+    Path |               # Path object
+    str |                # File path string OR URL
+    bytes                # Raw bytes data
+)
+
+
+class AttachmentFile(ABC):
+    """Abstract interface for accessing stored attachment files"""
+
+    @abstractmethod
+    def read(self) -> bytes:
+        """Read the entire file content"""
+        pass
+
+    @abstractmethod
+    def stream(self) -> BinaryIO:
+        """Get a stream for reading the file"""
+        pass
+
+    @abstractmethod
+    def url(self, expires_in: int = 3600) -> str:
+        """Get a temporary URL for file access"""
+        pass
+
+    @abstractmethod
+    def delete(self) -> None:
+        """Delete the file from storage"""
+        pass
+
+
+@dataclass
+class NotificationAttachment:
+    """Input attachment for creating notifications"""
+    file: FileAttachment
+    filename: str
+    content_type: str | None = None  # Auto-detected if None
+    description: str | None = None
+    is_inline: bool = False
+
+    def __post_init__(self):
+        if self.content_type is None:
+            self.content_type = self._detect_content_type()
+
+    def _detect_content_type(self) -> str:
+        content_type, _ = mimetypes.guess_type(self.filename)
+        return content_type or 'application/octet-stream'
+
+    def is_url(self) -> bool:
+        """Check if file is a URL"""
+        return isinstance(self.file, str) and (
+            self.file.startswith('http://') or
+            self.file.startswith('https://') or
+            self.file.startswith('s3://') or
+            self.file.startswith('gs://') or
+            self.file.startswith('azure://')
+        )
+
+
+@dataclass
+class StoredAttachment:
+    """Represents an attachment stored by the backend"""
+    id: str | uuid.UUID
+    filename: str
+    content_type: str
+    size: int
+    checksum: str
+    created_at: datetime.datetime
+    file: AttachmentFile  # File access - abstracted through AttachmentFile interface
+    description: str | None = None
+    is_inline: bool = False
+    # Backend-specific storage metadata
+    storage_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def get_file_data(self) -> bytes:
+        """Get the raw file data"""
+        return self.file.read()
+
+    def get_file_stream(self) -> BinaryIO:
+        """Get a stream for reading the file (for large files)"""
+        return self.file.stream()
+
+    def get_file_url(self, expires_in: int = 3600) -> str:
+        """Get a temporary URL for file access (if supported by backend)"""
+        return self.file.url(expires_in)
+
+    def delete(self) -> None:
+        """Delete this attachment from storage"""
+        self.file.delete()
 
 
 class NotificationContextDict(dict):
@@ -70,6 +169,7 @@ class Notification:
     context_used: dict | None = None
     adapter_used: str | None = None
     adapter_extra_parameters: dict | None = None
+    attachments: list[StoredAttachment] = field(default_factory=list)
 
 @dataclass
 class OneOffNotification:
@@ -89,6 +189,7 @@ class OneOffNotification:
     context_used: dict | None = None
     adapter_used: str | None = None
     adapter_extra_parameters: dict | None = None
+    attachments: list[StoredAttachment] = field(default_factory=list)
 
 class UpdateNotificationKwargs(TypedDict, total=False):
     title: str
@@ -99,3 +200,4 @@ class UpdateNotificationKwargs(TypedDict, total=False):
     subject_template: str | None
     preheader_template: str | None
     adapter_extra_parameters: dict | None
+    attachments: list[StoredAttachment]
