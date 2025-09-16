@@ -14,6 +14,7 @@ Tests cover:
 import datetime
 import hashlib
 import io
+from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
 
 import pytest
@@ -704,9 +705,11 @@ class TestAttachmentValidation(TestCase):
             # (file_input, expected_success, description)
             (b"bytes content", True, "Direct bytes"),
             (io.BytesIO(b"bytesio content"), True, "BytesIO object"),
+            (io.StringIO("stringio content"), True, "StringIO object"),
             ("http://example.com/file.pdf", True, "HTTP URL"),
             ("https://example.com/file.pdf", True, "HTTPS URL"),
             ("s3://bucket/file.pdf", True, "S3 URL"),
+            (Path("/tmp/test_file.txt"), True, "Path object"),
         ]
 
         for file_input, _expected_success, description in test_cases:
@@ -731,6 +734,8 @@ class TestAttachmentValidation(TestCase):
             ("style.css", "text/css"),
             ("script.js", "text/javascript"),
             ("unknown.xyz", "chemical/x-xyz"),  # This is what Python's mimetypes library returns
+            ("README", "application/octet-stream"),  # File with no extension defaults to octet-stream
+            ("Makefile", "application/octet-stream"),  # Another file with no extension
         ]
 
         for filename, expected_content_type in test_cases:
