@@ -26,10 +26,10 @@ def send_notification(
     adapter_cls = get_notification_adapter_cls(
         adapters[0][0] if isinstance(adapters[0][0], str) else adapters[0][0][0]
     )
-    
+
     if not issubclass(adapter_cls, AsyncBaseNotificationAdapter):
         return
-    
+
     desserialized_backend_kwargs = (
         adapter_cls.restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
     )
@@ -47,8 +47,14 @@ def send_notification(
     )
 
     adapters_import_tuple = (
-        (adapters[0][0][0], desserialized_adapter_kwargs), 
-        (adapters[0][1][0], desserialized_template_renderer_kwargs)
+        (
+            adapters[0][0] if isinstance(adapters[0][0], str) else adapters[0][0][0],
+            desserialized_adapter_kwargs
+        ),
+        (
+            adapters[0][1] if isinstance(adapters[0][1], str) else adapters[0][1][0],
+            desserialized_template_renderer_kwargs
+        ),
     )
     try:
         service: NotificationService[Any, Any] = NotificationService(

@@ -152,7 +152,14 @@ class NotificationService(Generic[A, B]):
         return notification_adapters is not None and all(
             (isinstance(adapter, tuple) or isinstance(adapter, list))
             and len(adapter) == 2
-            and isinstance(adapter[0], str)
+            and (
+                isinstance(adapter[0], str)
+                or (
+                    isinstance(adapter[0], tuple)
+                    and isinstance(adapter[0][0], str)
+                    and isinstance(adapter[0][1], dict)
+                )
+            )
             and (
                 isinstance(adapter[1], str)
                 or (
