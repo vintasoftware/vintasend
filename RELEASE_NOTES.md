@@ -1,5 +1,15 @@
 # Release Notes
 
+## Version 1.0.1 (2025-09-16)
+
+### Bug Fixes
+- **Fixes bug on async adapters**: The instanciation of the service with strings wasn't enabling using adapters with kwargs
+
+### Build Improvements
+- Simplified publish workflow
+- Fix duplicate runs on every push
+
+
 ## Version 1.0.0 (2025-09-16)
 
 ### 🚀 Major Features
