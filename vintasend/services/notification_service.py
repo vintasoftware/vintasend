@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import inspect
 import logging
 import uuid
 from collections.abc import Callable, Iterable
@@ -471,14 +472,14 @@ class NotificationService(Generic[A, B]):
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], Coroutine[Any, Any, NotificationContextDict]]]:
-        return asyncio.iscoroutinefunction(context_function)
+        return inspect.iscoroutinefunction(context_function)
 
     def _is_sync_context_function(
         self,
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
-        return not asyncio.iscoroutinefunction(context_function)
+        return not inspect.iscoroutinefunction(context_function)
 
     def get_notification_context(self, notification: Notification | OneOffNotification) -> NotificationContextDict:
         """
@@ -1058,14 +1059,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], Coroutine[Any, Any, NotificationContextDict]]]:
-        return asyncio.iscoroutinefunction(context_function)
+        return inspect.iscoroutinefunction(context_function)
 
     def _is_sync_context_function(
         self,
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
-        return not asyncio.iscoroutinefunction(context_function)
+        return not inspect.iscoroutinefunction(context_function)
 
     async def _send_notification_with_error_logging(
         self, notification: "Notification | OneOffNotification", lock: asyncio.Lock | None = None
