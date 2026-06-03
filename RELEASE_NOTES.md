@@ -1,5 +1,15 @@
 # Release Notes
 
+## Version 1.1.0 (2026-06-03)
+
+### Build Improvements
+- Added Python 3.14 to the CI and tox test matrix
+- Bumped publish workflow to Python 3.13 for stable releases
+- Pinned local Python version via `.python-version`
+
+### Dependencies
+- Updated project dependencies (`pyproject.toml` / `poetry.lock`)
+
 ## Version 1.0.1 (2025-09-16)
 
 ### Bug Fixes
