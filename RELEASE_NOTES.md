@@ -1,5 +1,13 @@
 # Release Notes
 
+## Version 1.1.1 (2026-06-03)
+
+### Bug Fixes
+- Replaced deprecated `asyncio.iscoroutinefunction` with `inspect.iscoroutinefunction` (removal slated for Python 3.16)
+
+### Build Improvements
+- Widened Python constraint to `<3.15` and added `py314` to the tox envlist for full Python 3.14 support
+
 ## Version 1.1.0 (2026-06-03)
 
 ### Build Improvements
