@@ -22,7 +22,7 @@ To install `vintasend` you just need to run
 pip install vintasend
 ```
 
-**Disclaimer**: Although the VintaSend package is selfsufficient and can be used alone, you'd have to implement at lease one Backend, one Adapter, and one Template Renderer. We have a bunch of additional packages that implement these and need to be installed seprately depending on your needs. Please check [Officially supported packages](#officially-supported-packages) section.
+**Disclaimer**: Although the VintaSend package is self-sufficient and can be used alone, you'd have to implement at least one Backend, one Adapter, and one Template Renderer. We have a bunch of additional packages that implement these and need to be installed seprately depending on your needs. Please check [Officially supported packages](#officially-supported-packages) section.
 
 
 ## Getting Started
