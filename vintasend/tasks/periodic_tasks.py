@@ -12,12 +12,21 @@ def periodic_send_pending_notifications(
     config: dict | None = None,
 ):
     adapter_intances = get_notification_adapters(notification_adapters, backend_import_str, backend_kwargs)
-    if isinstance(adapter_intances[0], AsyncBaseNotificationAdapter):
-        desserialized_backend_kwargs = (
-            adapter_intances[0].restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
-        )
-        desserialized_config = adapter_intances[0].restore_config(config) if config else None
-    
+    desserialized_backend_kwargs = None
+    desserialized_config = None
+    for adapter in adapter_intances:
+        if isinstance(adapter, AsyncBaseNotificationAdapter):
+            desserialized_backend_kwargs = (
+                adapter.restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
+            )
+            desserialized_config = adapter.restore_config(config) if config else None
+
+            break
+
+    if not desserialized_backend_kwargs or not desserialized_config:
+        desserialized_backend_kwargs = backend_kwargs
+        desserialized_config = config
+
     NotificationService(
         notification_adapters=notification_adapters,
         notification_backend=backend_import_str,
