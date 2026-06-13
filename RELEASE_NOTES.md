@@ -1,5 +1,8 @@
 # Release Notes
 
+## Version 1.1.3 (2026-06-03)
+- Bumped version to follow the officially-supported implementations
+
 ## Version 1.1.2 (2026-06-03)
 - Fixed bug in periodic_send_pending_notifications. We were only sending notifications if the first adapter configured was async, now we're searching through the list.
 
