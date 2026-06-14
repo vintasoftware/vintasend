@@ -5,6 +5,7 @@ import io
 import json
 import os
 import uuid
+from collections.abc import Iterable
 from decimal import Decimal
 from typing import BinaryIO, cast
 
@@ -432,6 +433,54 @@ class FakeFileBackend(BaseNotificationBackend):
         return cast(list[Notification], self.__paginate_notifications(
             self.filter_all_in_app_unread_notifications(user_id), page, page_size
         ))
+
+    def filter_all_in_app_notifications(
+        self, user_id: int | str | uuid.UUID
+    ) -> list[Notification]:
+        notifications = [
+            n
+            for n in self.notifications
+            if not isinstance(n, OneOffNotification)
+            and n.user_id == user_id
+            and n.status in (NotificationStatus.SENT.value, NotificationStatus.READ.value)
+            and n.notification_type == NotificationTypes.IN_APP.value
+        ]
+        return cast(list[Notification], notifications)
+
+    def filter_in_app_notifications(
+        self, user_id: int | str | uuid.UUID, page: int = 1, page_size: int = 10
+    ) -> list[Notification]:
+        return cast(list[Notification], self.__paginate_notifications(
+            self.filter_all_in_app_notifications(user_id), page, page_size
+        ))
+
+    def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
+        return len(self.filter_all_in_app_notifications(user_id))
+
+    def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
+        return len(self.filter_all_in_app_unread_notifications(user_id))
+
+    def mark_sent_as_read_bulk(
+        self,
+        notification_ids: Iterable[int | str | uuid.UUID],
+        user_id: int | str | uuid.UUID | None = None,
+    ) -> list[Notification]:
+        ids = {str(i) for i in notification_ids}
+        result: list[Notification] = []
+        changed = False
+        for n in self.notifications:
+            if str(n.id) not in ids or isinstance(n, OneOffNotification):
+                continue
+            if user_id is not None and str(n.user_id) != str(user_id):
+                continue
+            if n.status == NotificationStatus.SENT.value:
+                n.status = NotificationStatus.READ.value
+                changed = True
+            if n.status == NotificationStatus.READ.value:
+                result.append(n)
+        if changed:
+            self._store_notifications()
+        return result
 
     def __paginate_notifications(
         self, notifications: list[Notification | OneOffNotification] | list[Notification], page: int, page_size: int
@@ -862,6 +911,54 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     ) -> list[Notification]:
         in_app_unread_notifications = await self.filter_all_in_app_unread_notifications(user_id)
         return cast(list[Notification], self.__paginate_notifications(in_app_unread_notifications, page, page_size))
+
+    async def filter_all_in_app_notifications(
+        self, user_id: int | str | uuid.UUID
+    ) -> list[Notification]:
+        notifications = [
+            n
+            for n in self.notifications
+            if not isinstance(n, OneOffNotification)
+            and n.user_id == user_id
+            and n.status in (NotificationStatus.SENT.value, NotificationStatus.READ.value)
+            and n.notification_type == NotificationTypes.IN_APP.value
+        ]
+        return cast(list[Notification], notifications)
+
+    async def filter_in_app_notifications(
+        self, user_id: int | str | uuid.UUID, page: int = 1, page_size: int = 10
+    ) -> list[Notification]:
+        in_app_notifications = await self.filter_all_in_app_notifications(user_id)
+        return cast(list[Notification], self.__paginate_notifications(in_app_notifications, page, page_size))
+
+    async def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
+        return len(await self.filter_all_in_app_notifications(user_id))
+
+    async def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
+        return len(await self.filter_all_in_app_unread_notifications(user_id))
+
+    async def mark_sent_as_read_bulk(
+        self,
+        notification_ids: Iterable[int | str | uuid.UUID],
+        user_id: int | str | uuid.UUID | None = None,
+        lock: asyncio.Lock | None = None,
+    ) -> list[Notification]:
+        ids = {str(i) for i in notification_ids}
+        result: list[Notification] = []
+        changed = False
+        for n in self.notifications:
+            if str(n.id) not in ids or isinstance(n, OneOffNotification):
+                continue
+            if user_id is not None and str(n.user_id) != str(user_id):
+                continue
+            if n.status == NotificationStatus.SENT.value:
+                n.status = NotificationStatus.READ.value
+                changed = True
+            if n.status == NotificationStatus.READ.value:
+                result.append(n)
+        if changed:
+            await self._store_notifications(lock)
+        return result
 
     def __paginate_notifications(
         self, notifications: list[Notification | OneOffNotification] | list[Notification], page: int, page_size: int

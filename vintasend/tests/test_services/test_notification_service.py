@@ -669,6 +669,106 @@ class NotificationServiceTestCase(TestCase):
         assert len(notifications) == 1
         assert (notifications)[0].id == in_app_notification.id
 
+    def _in_app_service(self):
+        return NotificationService(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_in_app_adapter.FakeInAppAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+            ],
+            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
+            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
+        )
+
+    def _create_in_app(self, service, user_id=1):
+        return service.create_notification(
+            user_id=user_id,
+            notification_type=NotificationTypes.IN_APP.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+    def test_get_in_app_notifications_returns_read_and_unread_paginated(self):
+        service = self._in_app_service()
+        created = [self._create_in_app(service) for _ in range(3)]
+        # Mark one as read -- it must still be returned by the "all" listing.
+        service.mark_read(created[0].id)
+
+        page1 = list(service.get_in_app_notifications(user_id=1, page=1, page_size=2))
+        page2 = list(service.get_in_app_notifications(user_id=1, page=2, page_size=2))
+
+        assert len(page1) == 2
+        assert len(page2) == 1
+        all_ids = {n.id for n in page1 + page2}
+        assert all_ids == {n.id for n in created}
+
+    def test_get_in_app_notifications_count(self):
+        service = self._in_app_service()
+        created = [self._create_in_app(service) for _ in range(3)]
+        service.mark_read(created[0].id)
+
+        assert service.get_in_app_notifications_count(user_id=1) == 3
+        assert service.get_in_app_unread_count(user_id=1) == 2
+
+    def test_in_app_list_and_count_require_in_app_adapter(self):
+        # self.notification_service only has an email adapter configured.
+        with pytest.raises(NotificationError):
+            self.notification_service.get_in_app_notifications(user_id=1)
+        with pytest.raises(NotificationError):
+            self.notification_service.get_in_app_notifications_count(user_id=1)
+        with pytest.raises(NotificationError):
+            self.notification_service.get_in_app_unread_count(user_id=1)
+
+    def test_mark_read_bulk_marks_sent_as_read(self):
+        service = self._in_app_service()
+        created = [self._create_in_app(service) for _ in range(3)]
+
+        result = list(service.mark_read_bulk([n.id for n in created]))
+
+        assert {n.id for n in result} == {n.id for n in created}
+        assert all(n.status == NotificationStatus.READ.value for n in result)
+        assert service.get_in_app_unread_count(user_id=1) == 0
+
+    def test_mark_read_bulk_is_idempotent(self):
+        service = self._in_app_service()
+        created = [self._create_in_app(service) for _ in range(2)]
+        ids = [n.id for n in created]
+
+        service.mark_read_bulk(ids)
+        # Re-marking already-read ids must not raise and must return final state.
+        result = list(service.mark_read_bulk(ids))
+        assert {n.id for n in result} == set(ids)
+        assert all(n.status == NotificationStatus.READ.value for n in result)
+
+    def test_mark_read_bulk_scopes_to_user(self):
+        service = self._in_app_service()
+        own = self._create_in_app(service, user_id=1)
+        foreign = self._create_in_app(service, user_id=2)
+
+        result = list(service.mark_read_bulk([own.id, foreign.id], user_id=1))
+
+        assert {n.id for n in result} == {own.id}
+        # Foreign notification stays unread/SENT.
+        assert service.get_notification(foreign.id).status == NotificationStatus.SENT.value
+
+    def test_mark_read_bulk_mixes_sent_read_and_missing(self):
+        service = self._in_app_service()
+        already_read = self._create_in_app(service)
+        service.mark_read(already_read.id)
+        sent = self._create_in_app(service)
+        missing_id = str(uuid.uuid4())
+
+        result = list(service.mark_read_bulk([already_read.id, sent.id, missing_id]))
+
+        assert {n.id for n in result} == {already_read.id, sent.id}
+        assert all(n.status == NotificationStatus.READ.value for n in result)
+
 
     @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter.send")
     def test_mark_notification_as_failed_if_sending_fails(self, mock_adapter_send):
@@ -1815,6 +1915,61 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         with pytest.raises(NotificationError):
             await self.notification_service.get_in_app_unread(user_id=1)
+
+    @pytest.mark.asyncio
+    async def test_in_app_list_and_count_require_in_app_adapter(self):
+        with pytest.raises(NotificationError):
+            await self.notification_service.get_in_app_notifications(user_id=1)
+        with pytest.raises(NotificationError):
+            await self.notification_service.get_in_app_notifications_count(user_id=1)
+        with pytest.raises(NotificationError):
+            await self.notification_service.get_in_app_unread_count(user_id=1)
+
+    def _make_in_app(self, user_id, status):
+        return Notification(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            notification_type=NotificationTypes.IN_APP.value,
+            title="Test Notification",
+            body_template="body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="subject.txt",
+            preheader_template="preheader.html",
+            status=status,
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_backend_in_app_list_count_and_bulk(self):
+        backend = FakeAsyncIOFileBackend(database_file_name="async-in-app-tests.json")
+        backend.notifications = [
+            self._make_in_app(1, NotificationStatus.SENT.value),
+            self._make_in_app(1, NotificationStatus.READ.value),
+            self._make_in_app(1, NotificationStatus.SENT.value),
+            self._make_in_app(2, NotificationStatus.SENT.value),
+            self._make_in_app(1, NotificationStatus.PENDING_SEND.value),
+        ]
+        try:
+            # all (read + unread), excludes PENDING_SEND, for user 1 -> 3
+            all_for_user = list(await backend.filter_all_in_app_notifications(1))
+            assert len(all_for_user) == 3
+            assert await backend.count_in_app_notifications(1) == 3
+            assert await backend.count_in_app_unread_notifications(1) == 2
+
+            page = list(await backend.filter_in_app_notifications(1, page=1, page_size=2))
+            assert len(page) == 2
+
+            sent_ids = [n.id for n in backend.notifications if n.user_id == 1 and n.status == NotificationStatus.SENT.value]
+            result = list(await backend.mark_sent_as_read_bulk(sent_ids, user_id=1))
+            assert {n.id for n in result} == set(sent_ids)
+            assert all(n.status == NotificationStatus.READ.value for n in result)
+            assert await backend.count_in_app_unread_notifications(1) == 0
+            # idempotent re-run
+            again = list(await backend.mark_sent_as_read_bulk(sent_ids, user_id=1))
+            assert {n.id for n in again} == set(sent_ids)
+        finally:
+            await backend.clear()
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter.send")
