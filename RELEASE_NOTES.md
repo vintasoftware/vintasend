@@ -1,5 +1,38 @@
 # Release Notes
 
+## Version 1.2.0 (2026-06-14)
+
+### Features
+
+* List ALL in-app notifications (read + unread) on the backend ABCs and services:
+  `filter_all_in_app_notifications` (unpaginated) and `filter_in_app_notifications(page, page_size)`
+  (paginated). "All" = `notification_type == IN_APP` and `status in (SENT, READ)`; internal
+  pipeline states (PENDING_SEND, FAILED, CANCELLED) are never exposed to end users.
+* Count helpers `count_in_app_notifications` and `count_in_app_unread_notifications` on the
+  backend ABCs (concrete defaults derived from the existing iterables; backends SHOULD override
+  for efficiency), and `get_in_app_notifications_count` / `get_in_app_unread_count` on the
+  services. Combined with the paginated list methods these let callers build
+  count / next / previous envelopes for both the unread and the all lists.
+* Service method `get_in_app_notifications(user_id, page=1, page_size=10)` mirroring
+  `get_in_app_unread` (including the "No in-app notification adapter found" guard).
+* Bulk mark-as-read: `mark_sent_as_read_bulk(notification_ids, user_id=None)` on the backend
+  ABCs and `mark_read_bulk(notification_ids, user_id=None)` on the services. Idempotent
+  (already-READ / missing / not-owned / non-SENT ids are skipped, never an error), optionally
+  scoped to `user_id` (rows owned by others are never touched), and returns the final READ state
+  for the requested ids.
+* `Notification` and `OneOffNotification` dataclasses gained optional `created` and `modified`
+  timestamp fields (`context_used` already existed), defaulting to `None` so existing
+  constructors and non-Django backends keep working.
+
+### Backwards compatibility
+
+* Three new abstract methods were added to `BaseNotificationBackend` and
+  `AsyncIOBaseNotificationBackend`: `filter_all_in_app_notifications`,
+  `filter_in_app_notifications`, and `mark_sent_as_read_bulk`. Custom backend subclasses MUST
+  implement them. The two `count_*` methods are concrete defaults, so they require no changes
+  but SHOULD be overridden for efficiency.
+* No existing method signature or semantic changed; this is an additive minor release.
+
 ## Version 1.1.3 (2026-06-03)
 - Bumped version to follow the officially-supported implementations
 
