@@ -170,6 +170,8 @@ class Notification:
     adapter_used: str | None = None
     adapter_extra_parameters: dict | None = None
     attachments: list[StoredAttachment] = field(default_factory=list)
+    created: datetime.datetime | None = None
+    modified: datetime.datetime | None = None
 
 @dataclass
 class OneOffNotification:
@@ -190,6 +192,8 @@ class OneOffNotification:
     adapter_used: str | None = None
     adapter_extra_parameters: dict | None = None
     attachments: list[StoredAttachment] = field(default_factory=list)
+    created: datetime.datetime | None = None
+    modified: datetime.datetime | None = None
 
 class UpdateNotificationKwargs(TypedDict, total=False):
     title: str

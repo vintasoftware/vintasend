@@ -577,6 +577,28 @@ class NotificationService(Generic[A, B]):
         """
         return self.notification_backend.mark_sent_as_read(notification_id)
 
+    def mark_read_bulk(
+        self,
+        notification_ids: Iterable[int | str | uuid.UUID],
+        user_id: int | str | uuid.UUID | None = None,
+    ) -> Iterable[Notification]:
+        """
+        Mark multiple notifications as read at once.
+
+        This is idempotent: ids that are already read, missing, not owned by
+        ``user_id`` (when provided), or in a non-SENT state are simply skipped --
+        no error is raised. When ``user_id`` is provided the update is scoped to
+        that user; passing it is strongly recommended for endpoint use.
+
+        Parameters:
+            notification_ids: Iterable[int | str | uuid.UUID] - the notifications to mark as read
+            user_id: int | str | uuid.UUID | None - optional owner scope
+
+        Returns:
+            Iterable[Notification] - the requested notifications that are read after the operation
+        """
+        return self.notification_backend.mark_sent_as_read_bulk(notification_ids, user_id=user_id)
+
     def get_in_app_unread(
         self,
         user_id: int | str | uuid.UUID,
@@ -604,6 +626,60 @@ class NotificationService(Generic[A, B]):
         return self.notification_backend.filter_in_app_unread_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
+
+    def get_in_app_notifications(
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Iterable[Notification]:
+        """
+        Get all in-app notifications (read + unread) for a user, paginated.
+
+        This method may raise the following exceptions:
+            * NotificationError if no in-app notification adapter is found.
+
+        Parameters:
+            user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            page: int - the page number to get
+            page_size: int - the number of notifications per page
+
+        Returns:
+            Iterable[Notification] - the in-app notifications
+        """
+        if not any(
+            a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
+        ):
+            raise NotificationError("No in-app notification adapter found")
+        return self.notification_backend.filter_in_app_notifications(
+            user_id=user_id, page=page, page_size=page_size
+        )
+
+    def get_in_app_notifications_count(self, user_id: int | str | uuid.UUID) -> int:
+        """
+        Get the total count of in-app notifications (read + unread) for a user.
+
+        This method may raise the following exceptions:
+            * NotificationError if no in-app notification adapter is found.
+        """
+        if not any(
+            a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
+        ):
+            raise NotificationError("No in-app notification adapter found")
+        return self.notification_backend.count_in_app_notifications(user_id)
+
+    def get_in_app_unread_count(self, user_id: int | str | uuid.UUID) -> int:
+        """
+        Get the total count of unread in-app notifications for a user.
+
+        This method may raise the following exceptions:
+            * NotificationError if no in-app notification adapter is found.
+        """
+        if not any(
+            a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
+        ):
+            raise NotificationError("No in-app notification adapter found")
+        return self.notification_backend.count_in_app_unread_notifications(user_id)
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -1143,6 +1219,30 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         return await self.notification_backend.mark_sent_as_read(notification_id)
 
+    async def mark_read_bulk(
+        self,
+        notification_ids: Iterable[int | str | uuid.UUID],
+        user_id: int | str | uuid.UUID | None = None,
+    ) -> Iterable[Notification]:
+        """
+        Mark multiple notifications as read at once.
+
+        This is idempotent: ids that are already read, missing, not owned by
+        ``user_id`` (when provided), or in a non-SENT state are simply skipped --
+        no error is raised. When ``user_id`` is provided the update is scoped to
+        that user; passing it is strongly recommended for endpoint use.
+
+        Parameters:
+            notification_ids: Iterable[int | str | uuid.UUID] - the notifications to mark as read
+            user_id: int | str | uuid.UUID | None - optional owner scope
+
+        Returns:
+            Iterable[Notification] - the requested notifications that are read after the operation
+        """
+        return await self.notification_backend.mark_sent_as_read_bulk(
+            notification_ids, user_id=user_id
+        )
+
     async def get_in_app_unread(
         self,
         user_id: int | str | uuid.UUID,
@@ -1170,6 +1270,60 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         return await self.notification_backend.filter_in_app_unread_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
+
+    async def get_in_app_notifications(
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> Iterable[Notification]:
+        """
+        Get all in-app notifications (read + unread) for a user, paginated.
+
+        This method may raise the following exceptions:
+            * NotificationError if no in-app notification adapter is found.
+
+        Parameters:
+            user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            page: int - the page number to get
+            page_size: int - the number of notifications per page
+
+        Returns:
+            Iterable[Notification] - the in-app notifications
+        """
+        if not any(
+            a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
+        ):
+            raise NotificationError("No in-app notification adapter found")
+        return await self.notification_backend.filter_in_app_notifications(
+            user_id=user_id, page=page, page_size=page_size
+        )
+
+    async def get_in_app_notifications_count(self, user_id: int | str | uuid.UUID) -> int:
+        """
+        Get the total count of in-app notifications (read + unread) for a user.
+
+        This method may raise the following exceptions:
+            * NotificationError if no in-app notification adapter is found.
+        """
+        if not any(
+            a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
+        ):
+            raise NotificationError("No in-app notification adapter found")
+        return await self.notification_backend.count_in_app_notifications(user_id)
+
+    async def get_in_app_unread_count(self, user_id: int | str | uuid.UUID) -> int:
+        """
+        Get the total count of unread in-app notifications for a user.
+
+        This method may raise the following exceptions:
+            * NotificationError if no in-app notification adapter is found.
+        """
+        if not any(
+            a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
+        ):
+            raise NotificationError("No in-app notification adapter found")
+        return await self.notification_backend.count_in_app_unread_notifications(user_id)
 
     async def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """

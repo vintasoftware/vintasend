@@ -158,6 +158,48 @@ VintaSend schedules notifications by creating them on the database for sending w
 
 You need to call the `send_pending_notifications` service method in a cron job or a tool like Celery Beat.
 
+### In-app notifications (listing, counts and marking as read)
+
+In-app notifications live in the same backend as every other notification. Once an in-app
+notification has been sent it has status `SENT`; once the user has seen it, it becomes `READ`.
+Internal pipeline states (`PENDING_SEND`, `FAILED`, `CANCELLED`) are never exposed by the in-app
+listing methods.
+
+All listing methods are paginated (`page` defaults to `1`, `page_size` to `10`) and pair with a
+`count_*` method so you can build `count` / `next` / `previous` envelopes. All of them require an
+in-app adapter to be configured, otherwise they raise `NotificationError`.
+
+```python
+# Unread only (status == SENT)
+unread = notification_service.get_in_app_unread(user_id, page=1, page_size=10)
+unread_count = notification_service.get_in_app_unread_count(user_id)
+
+# Read + unread ("all", status in SENT/READ), newest-first
+all_notifications = notification_service.get_in_app_notifications(user_id, page=1, page_size=10)
+all_count = notification_service.get_in_app_notifications_count(user_id)
+```
+
+To mark notifications as read you can mark a single one or do it in bulk:
+
+```python
+# Single — raises NotificationUpdateError if the notification is not currently SENT
+notification_service.mark_read(notification_id)
+
+# Bulk — idempotent. ids that are already read, missing, not owned by `user_id`
+# (when passed) or in a non-SENT state are simply skipped (never an error). Returns
+# the final READ state for the requested ids. Always pass `user_id` for endpoints so
+# you never touch another user's rows.
+read_notifications = notification_service.mark_read_bulk(
+    [id_1, id_2, id_3], user_id=user_id
+)
+```
+
+The `AsyncIONotificationService` exposes the same methods as coroutines (`await ...`).
+
+> Prefer the paginated `get_in_app_notifications` / `get_in_app_unread` plus the matching
+> `count_*` methods. The backend's unpaginated `filter_all_*` variants exist mainly for internal
+> and count use.
+
 
 ## Glossary
 
