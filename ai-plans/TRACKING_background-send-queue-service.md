@@ -175,9 +175,67 @@ Decisions carried into later phases:
 - `background_tasks.py` gains `async_send_notification(notification_id)` for asyncio hosts.
 - Extend the parity test so `delayed_send` and `register_queue_service` leave the allowlist.
 
+### Phase 3 — Background sending on the asyncio service ✅
+
+- **Model**: sonnet (plan tier 3).
+- **Branch**: `plan/background-send-queue-service/phase-3`, stacked on phase-2.
+- **PR**: https://github.com/vintasoftware/vintasend/pull/12 (base = phase-2 branch).
+- **Review**: reviewer opus (tier 4), fixer sonnet — **zero findings**. The reviewer walked every
+  `await` by hand (the failure class unique to an async mirror) and confirmed the async `send` /
+  `delayed_send` are faithful line-for-line mirrors of the reviewed sync oracles, with no dropped
+  awaits and identical `raise_on_failed_send` gating, redelivery guard, and control flow.
+- **Final gate**: ruff clean, `mypy` clean on 50 source files, `pytest` 277 passed, `tox` green on
+  py310–py314.
+
+Summary of what landed:
+
+- `AsyncIONotificationService.__init__` gained `notification_queue_service`
+  (`AsyncIOBaseNotificationQueueService | str | None`) and `raise_on_failed_send`; async
+  `register_queue_service`; the enqueue branch in `send` (awaiting `enqueue_notification`); and a
+  new async `delayed_send(notification_id)` mirroring the sync worker entrypoint.
+- New `AsyncIOBackgroundNotificationAdapter` in
+  `vintasend/services/notification_adapters/asyncio_background_base.py`.
+- Sync `AsyncBaseNotificationAdapter` **renamed** to `BackgroundNotificationAdapter`, with
+  `AsyncBaseNotificationAdapter` kept as a **silent alias** (`AsyncBaseNotificationAdapter =
+  BackgroundNotificationAdapter`, no DeprecationWarning) so downstream imports keep working.
+- `background_tasks.py` gained `async_send_notification(notification_id)`; `get_notification_service`
+  caches either service kind, and each entrypoint raises-and-logs (never silently drops a coroutine)
+  if handed the wrong kind.
+- `SERVICE_METHOD_PARITY_ALLOWLIST` no longer lists `delayed_send` / `register_queue_service`; it now
+  holds only the legitimate async-only `_send_notification_with_error_logging` concurrency helper.
+
+## Carried into Phase 4 (documentation) — the exact shipped API to document
+
+Phase 4 is documentation only. Every code sample in the migration guide must run against **this**
+surface, not the plan's prose from memory. The public shape as shipped:
+
+- **New public names**: `BackgroundNotificationAdapter` (was `AsyncBaseNotificationAdapter`, alias
+  kept), `AsyncIOBackgroundNotificationAdapter`, `BaseNotificationQueueService`,
+  `AsyncIOBaseNotificationQueueService`, `FakeQueueService`, `FakeAsyncIOQueueService`.
+- **Deleted**: `AsyncNotificationProtocol`, `NotificationDict`, `OneOffNotificationDict`, and the
+  eight `serialize_*` / `restore_*` hooks.
+- **Seam signature change**: adapter `delayed_send(notification_dict, context_dict)` →
+  service-level `delayed_send(notification_id)`. Downstream adapters move their 1.x `delayed_send`
+  body into `send()`.
+- **New settings**: `NOTIFICATION_QUEUE_SERVICE`, `NOTIFICATION_SERVICE_FACTORY` (both dotted import
+  strings).
+- **New constructor args** on both services: `notification_queue_service`, `raise_on_failed_send`
+  (default `False` — the behavioural break; document how to restore 1.x by passing `True`).
+- **Worker entrypoints**: `vintasend.tasks.background_tasks.send_notification(notification_id)` and
+  `async_send_notification(notification_id)`; both take an optional explicit-service override.
+- **Factory contract**: `NOTIFICATION_SERVICE_FACTORY` is a dotted path to a callable returning a
+  ready `NotificationService` / `AsyncIONotificationService`; called once per worker process and
+  cached; worker and web must share `NOTIFICATION_*` settings.
+- **New exceptions**: `NotificationQueueServiceMissingError`, `NotificationQueueServiceResolutionError`,
+  `NotificationServiceFactoryError`.
+
+The plan's Phase 4 body lists the six breaking changes the migration guide must cover and the deploy
+step (drain the queue / dual-task-name) from **Risk & Rollout Notes**. `MIGRATION_TO_1.0.0.md` is the
+model to follow. The plan file (untracked) is copied into the worktree for the implementer to read.
+
 ## Current phase
 
-Phase 3 — Background sending on the asyncio service.
+Phase 4 — Documentation and 2.0 migration guide.
 
 ## Remaining phases
 - Phase 4 — Documentation and 2.0 migration guide.
