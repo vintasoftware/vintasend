@@ -60,3 +60,11 @@ class DuplicateNotificationAdapterError(NotificationError):
 
 class InvalidOneOffNotificationRecipientError(NotificationError):
     """Raised when a one-off notification's email_or_phone is empty or malformed."""
+
+
+class NotificationQueueServiceMissingError(NotificationError):
+    """Raised when a queue service is required but cannot be found, resolved, or instantiated."""
+
+
+class NotificationServiceFactoryError(NotificationError):
+    """Raised when a worker's ``NOTIFICATION_SERVICE_FACTORY`` cannot be imported or called."""

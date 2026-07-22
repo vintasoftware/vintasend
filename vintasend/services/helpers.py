@@ -2,10 +2,15 @@ from collections.abc import Iterable
 from typing import Any, cast
 
 from vintasend.app_settings import NotificationSettings
+from vintasend.exceptions import NotificationQueueServiceMissingError
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_queue_services.asyncio_base import (
+    AsyncIOBaseNotificationQueueService,
+)
+from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
 from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
@@ -202,6 +207,92 @@ def get_asyncio_notification_backend(
             f"Notifications Backend Error: {backend_import_str_with_fallback} is not a valid AsyncIO notification backend"
         )
     return cast(AsyncIOBaseNotificationBackend, backend)
+
+
+def get_notification_queue_service(
+    queue_service_import_str: str | None,
+    queue_service_kwargs: dict | None = None,
+    config: Any = None,
+) -> BaseNotificationQueueService:
+    app_settings = NotificationSettings(config)
+    queue_service_import_str_with_fallback = (
+        queue_service_import_str
+        if queue_service_import_str is not None
+        else app_settings.NOTIFICATION_QUEUE_SERVICE
+    )
+
+    if queue_service_import_str_with_fallback is None:
+        raise NotificationQueueServiceMissingError(
+            "Notifications Queue Service Error: no queue service import string was provided and "
+            "NOTIFICATION_QUEUE_SERVICE is not set"
+        )
+
+    try:
+        queue_service_cls = _import_class(queue_service_import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise NotificationQueueServiceMissingError(
+            f"Notifications Queue Service Error: Could not import {queue_service_import_str_with_fallback}"
+        ) from e
+
+    try:
+        queue_service = (
+            queue_service_cls(**queue_service_kwargs)
+            if queue_service_kwargs
+            else queue_service_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise NotificationQueueServiceMissingError(
+            f"Notifications Queue Service Error: Could not instantiate {queue_service_import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(queue_service, BaseNotificationQueueService):
+        raise NotificationQueueServiceMissingError(
+            f"Notifications Queue Service Error: {queue_service_import_str_with_fallback} is not a valid notification queue service"
+        )
+    return cast(BaseNotificationQueueService, queue_service)
+
+
+def get_asyncio_notification_queue_service(
+    queue_service_import_str: str | None,
+    queue_service_kwargs: dict | None = None,
+    config: Any = None,
+) -> AsyncIOBaseNotificationQueueService:
+    app_settings = NotificationSettings(config)
+    queue_service_import_str_with_fallback = (
+        queue_service_import_str
+        if queue_service_import_str is not None
+        else app_settings.NOTIFICATION_QUEUE_SERVICE
+    )
+
+    if queue_service_import_str_with_fallback is None:
+        raise NotificationQueueServiceMissingError(
+            "Notifications Queue Service Error: no queue service import string was provided and "
+            "NOTIFICATION_QUEUE_SERVICE is not set"
+        )
+
+    try:
+        queue_service_cls = _import_class(queue_service_import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise NotificationQueueServiceMissingError(
+            f"Notifications Queue Service Error: Could not import {queue_service_import_str_with_fallback}"
+        ) from e
+
+    try:
+        queue_service = (
+            queue_service_cls(**queue_service_kwargs)
+            if queue_service_kwargs
+            else queue_service_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise NotificationQueueServiceMissingError(
+            f"Notifications Queue Service Error: Could not instantiate {queue_service_import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(queue_service, AsyncIOBaseNotificationQueueService):
+        raise NotificationQueueServiceMissingError(
+            f"Notifications Queue Service Error: {queue_service_import_str_with_fallback} is not a valid AsyncIO notification queue service"
+        )
+    return cast(AsyncIOBaseNotificationQueueService, queue_service)
 
 
 def get_template_renderer(
