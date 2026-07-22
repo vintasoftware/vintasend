@@ -1096,19 +1096,29 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
     async def _send_notification_with_error_logging(
         self, notification: "Notification | OneOffNotification", lock: asyncio.Lock | None = None
-    ) -> None:
+    ) -> bool:
+        """
+        Send a notification, logging success or failure, and report whether it counts as sent.
+
+        Returns:
+            bool - True if the notification counts as sent, False if it counts as failed.
+        """
         try:
             await self.send(notification, lock)
         except NotificationSendError:
             logger.exception("Failed to send notification %s", notification.id)
+            return False
         except NotificationMarkFailedError:
             logger.exception("Failed to send notification %s", notification.id)
             logger.exception("Failed to mark notification %s as failed", notification.id)
+            return False
         except NotificationMarkSentError:
             logger.info("Notification %s sent", notification.id)
             logger.exception("Failed to mark notification %s as sent", notification.id)
+            return True
         else:
             logger.info("Notification %s sent", notification.id)
+            return True
 
     async def send_pending_notifications(self) -> None:
         """
@@ -1121,13 +1131,17 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         pending_notifications = await self.notification_backend.get_all_pending_notifications()
         lock = asyncio.Lock()
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self._send_notification_with_error_logging(notification, lock)
                 for notification in pending_notifications
             ]
         )
-        return None
+        notifications_sent = sum(1 for result in results if result)
+        notifications_failed = len(results) - notifications_sent
+
+        logger.info("Sent %s notifications", notifications_sent)
+        logger.info("Failed to send %s notifications", notifications_failed)
 
     async def get_pending_notifications(
         self, page: int, page_size: int
