@@ -49,15 +49,72 @@
 
 ## Completed phases
 
-_None yet._
+### Phase 1 — Add the queue-service seam ✅
+
+- **Model**: sonnet (plan tier 2, stepped up per the tier-2 note because the phase touches >3 files).
+- **Branch**: `plan/background-send-queue-service/phase-1`, based on `main`.
+- **PR**: https://github.com/vintasoftware/vintasend/pull/7
+- **Review**: reviewer opus (tier 4), fixer sonnet (tier 3) ×2 rounds. No BLOCKERs from the
+  independent reviewer; one blocker found by the conductor's own plan-compliance walkthrough.
+- **Final gate**: ruff clean, `mypy` clean on 48 source files, `pytest` 223 passed.
+
+Summary of what landed:
+
+- `BaseNotificationQueueService` / `AsyncIOBaseNotificationQueueService` in
+  `vintasend/services/notification_queue_services/`, importing only `abc` and `uuid` so the
+  `tasks/__init__.py` import cycle stays unreachable.
+- `FakeQueueService` / `FakeAsyncIOQueueService` stubs recording ids in
+  `enqueued_notification_ids`.
+- `get_notification_queue_service` / `get_asyncio_notification_queue_service` in `helpers.py`.
+- `NOTIFICATION_QUEUE_SERVICE` and `NOTIFICATION_SERVICE_FACTORY` settings, typed `str | None`,
+  reaching the three framework dicts through the existing `{**DEFAULT_SETTINGS}` spread.
+- Three exceptions: `NotificationQueueServiceMissingError`, `NotificationServiceFactoryError`,
+  `NotificationQueueServiceResolutionError`.
+- New shared test helper `vintasend/tests/utils.py` holding
+  `_reset_notification_settings_singleton`, de-duplicated out of three test modules.
+
+Two corrections made during review that later phases depend on:
+
+1. The resolvers' unset-config guard used `is None`, but `get_config()` returns `{}` — not `None` —
+   when `detect_framework()` is `"Unknown"`, which is the ordinary result for a plain Python worker.
+   The guard now requires a non-empty `str`, so the typed error is raised instead of an
+   `AttributeError` from `_import_class({})`.
+2. The error contract was split. `NotificationQueueServiceMissingError` now means "nothing
+   configured"; the new `NotificationQueueServiceResolutionError` means "configured but could not be
+   imported, instantiated, or is the wrong type".
+
+## Carried into Phase 2 — read before implementing
+
+- **Catch the narrow error.** Phase 2's `NotificationService.__init__` must treat a missing queue
+  service as benign, so it catches `NotificationQueueServiceMissingError` only. Letting
+  `NotificationQueueServiceResolutionError` propagate is the point of the split: a typo'd
+  `NOTIFICATION_QUEUE_SERVICE` must surface loudly instead of being read as "no queue configured",
+  which would silently never deliver background notifications.
+- **`NotificationServiceFactoryError`'s docstring already promises** it covers a factory that
+  "cannot be imported **or called**". Phase 2 must raise it for invocation failure too, or amend the
+  docstring.
+- **`queue_service_kwargs` on both resolvers is currently unreachable** — no setting supplies it and
+  the planned `__init__` signature has no matching parameter. Phase 2 decides whether to thread it
+  through or drop it. It is spec'd by the plan, so it was left in place.
+- **The seam's docstrings are a published 2.0 contract** for `vintasend-celery`: broker failures must
+  be wrapped in a `NotificationError` subclass, returning means the broker accepted the id, and
+  delivery is at-least-once. The Phase 2 worker must tolerate redelivery of the same id.
+
+## Tracked follow-ups (not blocking any phase)
+
+- `helpers.py` now holds six near-identical resolvers (~330 lines) of shape
+  *import → instantiate → isinstance-check → cast*, differing only in expected base class, error
+  class and a noun. A private `_resolve_instance(...)` with thin public wrappers would remove roughly
+  200 lines. Deliberately deferred: the phase body said to follow the existing
+  `get_notification_backend` pattern, and doing the refactor mid-plan would widen every phase diff.
+  Worth its own small plan after the 2.0 lands.
 
 ## Current phase
 
-Phase 1 — Add the queue-service seam.
+Phase 2 — Rewire the sync send path to id-only.
 
 ## Remaining phases
 
-- Phase 2 — Rewire the sync send path to id-only.
 - Phase 3 — Background sending on the asyncio service.
 - Phase 4 — Documentation and 2.0 migration guide.
 
