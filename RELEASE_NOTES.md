@@ -20,7 +20,7 @@ None — this is a new feature set.
 
 2. **Background adapter `delayed_send` signature changed:** The adapter marker method now takes only `notification_id`, not `(notification_dict, context_dict)`. Core never calls this method; delivery happens via the adapter's `send()` method after the worker loads the notification. Adapter authors must move background delivery logic from `delayed_send` to `send()`.
 
-3. **Deleted serialization hooks and types:** The eight abstract methods `serialize_backend_config`, `restore_backend_config`, and six others on `AsyncNotificationProtocol`, plus the types `NotificationDict` and `OneOffNotificationDict`, are deleted. No serialization is needed with id-only payloads.
+3. **Deleted serialization hooks and types:** The eight abstract methods `serialize_config`, `restore_config`, and six others on `AsyncNotificationProtocol`, plus the types `NotificationDict` and `OneOffNotificationDict`, are deleted. No serialization is needed with id-only payloads.
 
 4. **`NOTIFICATION_SERVICE_FACTORY` is required for background sending:** The worker needs a factory callable to rebuild the service in its own process. Without it, background-capable adapters work in the web process but enqueue with no queue service, which logs an error or raises (depending on `raise_on_failed_send`).
 

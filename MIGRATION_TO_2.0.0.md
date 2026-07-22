@@ -92,7 +92,7 @@ class MyAsyncIOBackgroundAdapter(AsyncIOBackgroundNotificationAdapter):
 
 ## 3. Deleted Serialization Hooks and Types
 
-In 1.x, the queue payload carried the entire serialized notification so the worker could rebuild it without accessing the database. This required eight abstract methods on `AsyncNotificationProtocol`: `serialize_backend_config`, `restore_backend_config`, `serialize_backend_kwargs`, `restore_backend_kwargs`, `serialize_adapter_kwargs`, `restore_adapter_kwargs`, `serialize_adapter_extra_parameters`, `restore_adapter_extra_parameters`. These and the types they used — `NotificationDict` and `OneOffNotificationDict` — are deleted in 2.0.
+In 1.x, the queue payload carried the entire serialized notification so the worker could rebuild it without accessing the database. This required eight abstract methods on `AsyncNotificationProtocol`: `serialize_config`, `restore_config`, `serialize_backend_kwargs`, `restore_backend_kwargs`, `serialize_adapter_kwargs`, `restore_adapter_kwargs`, `serialize_template_renderer_kwargs`, `restore_template_renderer_kwargs`. These and the types they used — `NotificationDict` and `OneOffNotificationDict` — are deleted in 2.0.
 
 With the id-only payload, the queue carries nothing but a number; the worker reloads the notification from the backend. No serialization is needed.
 
@@ -101,10 +101,10 @@ With the id-only payload, the queue carries nothing but a number; the worker rel
 ```python
 # 1.x: these methods existed
 class MyAdapter(AsyncBaseNotificationAdapter):
-    def serialize_backend_config(self, config):
+    def serialize_config(self, config):
         return json.dumps(config)
     
-    def restore_backend_config(self, serialized):
+    def restore_config(self, serialized):
         return json.loads(serialized)
     
     # ... six more serialize/restore methods ...
