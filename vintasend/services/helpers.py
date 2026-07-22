@@ -221,7 +221,10 @@ def get_notification_queue_service(
         else app_settings.NOTIFICATION_QUEUE_SERVICE
     )
 
-    if queue_service_import_str_with_fallback is None:
+    if (
+        not isinstance(queue_service_import_str_with_fallback, str)
+        or not queue_service_import_str_with_fallback
+    ):
         raise NotificationQueueServiceMissingError(
             "Notifications Queue Service Error: no queue service import string was provided and "
             "NOTIFICATION_QUEUE_SERVICE is not set"
@@ -264,7 +267,10 @@ def get_asyncio_notification_queue_service(
         else app_settings.NOTIFICATION_QUEUE_SERVICE
     )
 
-    if queue_service_import_str_with_fallback is None:
+    if (
+        not isinstance(queue_service_import_str_with_fallback, str)
+        or not queue_service_import_str_with_fallback
+    ):
         raise NotificationQueueServiceMissingError(
             "Notifications Queue Service Error: no queue service import string was provided and "
             "NOTIFICATION_QUEUE_SERVICE is not set"
