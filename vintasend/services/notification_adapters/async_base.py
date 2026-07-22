@@ -1,108 +1,44 @@
+import uuid
 from abc import abstractmethod
-from typing import Any, Generic, Protocol, TypedDict, TypeVar, runtime_checkable
+from typing import Generic, TypeVar
 
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
-class NotificationDict(TypedDict):
-    id: int | str  # noqa: A003
-    user_id: int | str
-    notification_type: str
-    title: str
-    body_template: str
-    context_name: str
-    context_kwargs: dict[str, int | str]
-    send_after: str | None
-    subject_template: str
-    preheader_template: str
-    status: str
-    context_used: dict | None
-    adapter_extra_parameters: dict | None
-
-
-class OneOffNotificationDict(TypedDict):
-    id: int | str  # noqa: A003
-    email_or_phone: str
-    first_name: str
-    last_name: str
-    notification_type: str
-    title: str
-    body_template: str
-    context_name: str
-    context_kwargs: dict[str, int | str]
-    send_after: str | None
-    subject_template: str
-    preheader_template: str
-    status: str
-    context_used: dict | None
-    adapter_extra_parameters: dict | None
-
-
-@runtime_checkable
-class AsyncNotificationProtocol(Protocol):
-    def serialize_backend_kwargs(self) -> dict: ...
-
-    @staticmethod
-    def restore_backend_kwargs(backend_kwargs: dict) -> dict: ...
-
-    def serialize_config(self) -> dict: ...
-
-    @staticmethod
-    def restore_config(config: dict) -> Any: ...
-
-    def serialize_adapter_kwargs(self) -> dict: ...
-
-    @staticmethod
-    def restore_adapter_kwargs(adapter_kwargs: dict) -> dict: ...
-
-    def serialize_template_renderer_kwargs(self) -> dict: ...
-
-    @staticmethod
-    def restore_template_renderer_kwargs(template_renderer_kwargs: dict) -> dict: ...
-
-    def delayed_send(self, notification_dict: NotificationDict, context_dict: dict) -> None: ...
-
-
 B = TypeVar("B", bound=BaseNotificationBackend)
 T = TypeVar("T", bound=BaseNotificationTemplateRenderer)
 
 
-class AsyncBaseNotificationAdapter(
-    Generic[B, T], AsyncNotificationProtocol, BaseNotificationAdapter[B, T]
-):
-    def serialize_backend_kwargs(self) -> dict:
-        return self.backend.backend_kwargs
+class AsyncBaseNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
+    """
+    Marker base class for adapters whose delivery happens in a background worker.
 
-    @staticmethod
-    def restore_backend_kwargs(backend_kwargs: dict[str, Any]) -> dict[str, Any]:
-        return backend_kwargs
+    Despite the name this is not an `async`/`await` adapter -- see
+    `asyncio_base.AsyncIOBaseNotificationAdapter` for that one. Subclassing this class is
+    how an adapter declares "do not deliver me in the web process; hand my notification id
+    to the queue service and let a worker deliver it".
 
-    def serialize_config(self) -> dict[str, Any]:
-        return self.config
-
-    @staticmethod
-    def restore_config(config: dict[str, Any]) -> Any:
-        return config
-
-    def serialize_adapter_kwargs(self) -> dict:
-        return self.adapter_kwargs
-
-    @staticmethod
-    def restore_adapter_kwargs(adapter_kwargs: dict[str, Any]) -> dict[str, Any]:
-        return adapter_kwargs
-
-    def serialize_template_renderer_kwargs(self) -> dict[str, Any]:
-        return self.template_renderer.template_renderer_kwargs
-
-    @staticmethod
-    def restore_template_renderer_kwargs(
-        template_renderer_kwargs: dict[str, Any],
-    ) -> dict[str, Any]:
-        return template_renderer_kwargs
+    `NotificationService.send()` never calls `send()` on one of these adapters. It enqueues
+    the notification id through its configured queue service instead. The worker then calls
+    `NotificationService.delayed_send(notification_id)`, which reloads the notification,
+    generates the context at delivery time and calls `send()` -- so `send()` is where a
+    background adapter's real delivery work belongs.
+    """
 
     @abstractmethod
-    def delayed_send(
-        self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict
-    ) -> None: ...
+    def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
+        """
+        Deliver the notification identified by `notification_id` from a background worker.
+
+        Only the id crosses the queue: nothing about the notification is serialized into the
+        task payload, so an implementation reads whatever it needs -- including attachment
+        file handles -- from the backend.
+
+        Delivery is at-least-once, so an implementation may be handed the same id twice and
+        must tolerate that.
+
+        :param notification_id: The id of the notification to deliver.
+        """
+        ...
