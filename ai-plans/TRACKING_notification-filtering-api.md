@@ -99,13 +99,59 @@ Consciously deferred (recorded so later phases pick them up):
 Gates: `ruff check` clean, `ruff format --check` clean, `mypy` clean (40 source files),
 `pytest` **211 passed** (191 baseline + 20 new).
 
+### Phase 2 — Filter types and the backend seam ✅
+
+- **Status**: complete
+- **Model**: claude-opus-4-8 (plan suggested Tier 4)
+- **Branch**: `plan/notification-filtering-api/phase-2` (stacked on phase-1)
+- **Base**: `plan/notification-filtering-api/phase-1`
+- **Commits**:
+  - `29c6c9c Add composable filter vocabulary and backend seam`
+  - `bbb8805 Implement filter_notifications in fakes and services with tests`
+- **Review**: reviewer claude-opus-4-8 (phase override Tier 4). **Clean** — no BLOCKER/SHOULD-FIX;
+  one NIT deferred (see below). Verified by execution: every binding semantic (empty-filter-matches-all,
+  scalar/list membership, all four string lookups in both case modes, inclusive range boundaries,
+  None-under-negation, tiebreaker direction on descending sorts, capabilities merge direction) probed
+  directly; the pagination-tiebreaker test proven to fail without the `id` tiebreaker; TypedDicts
+  constructed on Python 3.10.13.
+
+Summary:
+
+- New `filters.py`: the full JSON-round-trippable `TypedDict` vocabulary (`DateRange` in functional
+  syntax with wire key `from`, `StringFilterLookup`, `StringFieldFilter`, `NotificationOrderBy`,
+  `NotificationFilterFields` including `read_at_range`, single-key `AndFilter`/`OrFilter`/`NotFilter`,
+  the `NotificationFilter` union), `DEFAULT_BACKEND_FILTER_CAPABILITIES` (22 camelCase dotted keys all
+  `True`), the `is_field_filter` / `is_string_filter_lookup` discriminators, and a **shared** recursive
+  `matches_filter` + `sort_notifications` both fakes call so the two halves cannot drift.
+- `filter_notifications` is `@abstractmethod` on both backend ABCs (the plan-sanctioned break);
+  `get_filter_capabilities` (`{}`) and `count_notifications` are concrete. The base
+  `count_notifications` deviates from the plan's literal `sum(1 for _ in ...)` — since the only
+  primitive is the paginated `filter_notifications`, it pages through to a correct total (verified
+  terminating at 0 / <100 / exactly 100 / multiples). Backends override for a SQL `COUNT`.
+- Both services expose `filter_notifications`, `count_notifications`, and
+  `get_backend_supported_filter_capabilities` (merges the backend report OVER the all-`True` default).
+- **Binding semantic decisions** documented at module level: filter fields snake_case / capability
+  keys camelCase; `case_sensitive` defaults to `True` and a bare `str` means case-sensitive `exact`;
+  ranges inclusive on both ends; a positive filter on `None` never matches, so `None` rows are
+  included under `not` (matching the Phase 3b Django `~Q(...) | Q(field__isnull=True)` intent);
+  `updated_at`→`modified`, `created_at`→`created`; default order is `created` desc; `id` always
+  appended in the primary sort direction.
+
+**NIT deferred to Phase 3b awareness**: the fake compares `str(first.id)` vs `str(second.id)` for the
+tiebreaker, so integer ids order lexicographically (`"10"` before `"2"`). Pagination stays correct (a
+consistent total order drops/duplicates nothing) and it matches the fake's existing `str()`-based
+identity convention, but a SQL backend appending `id` will order numerically. Invisible for the
+string ids the tests use; worth knowing when Phase 3b writes the Django translator.
+
+Gates: `ruff check` clean, `ruff format --check` clean, `mypy` clean (42 source files),
+`pytest` **260 passed** (211 baseline + 49 new), `tox` **green on py310-py314** (260 each).
+
 ## Current phase
 
-Phase 2 — Filter types and the backend seam (not started).
+Phase 3 — Counts, retry, and stable ordering (not started).
 
 ## Remaining phases
 
-- **Phase 2** — Filter types and the backend seam (Tier 4; reviewer Tier 4).
 - **Phase 3** — Counts, retry, and stable ordering (Tier 3).
 - **Phase 4** — Documentation (Tier 2).
 
