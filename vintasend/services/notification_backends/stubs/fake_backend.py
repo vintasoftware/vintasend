@@ -21,6 +21,12 @@ from vintasend.services.dataclasses import (
 )
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_backends.filters import (
+    NotificationFilter,
+    NotificationOrderBy,
+    matches_filter,
+    sort_notifications,
+)
 
 
 class FakeFileAttachmentFile(AttachmentFile):
@@ -520,6 +526,32 @@ class FakeFileBackend(BaseNotificationBackend):
 
     def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
         return len(self.filter_all_in_app_unread_notifications(user_id))
+
+    def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> list[Notification | OneOffNotification]:
+        # Reference implementation: match every notification against the recursive predicate,
+        # order it stably (id tiebreaker in the primary direction), then paginate. Downstream
+        # backends translate ``matches_filter`` / ``sort_notifications`` into their own query
+        # language; the semantics here are the contract they mirror.
+        matched = [n for n in self.notifications if matches_filter(n, filter)]
+        ordered = sort_notifications(matched, order_by)
+        return cast(
+            list[Notification | OneOffNotification],
+            self.__paginate_notifications(ordered, page, page_size),
+        )
+
+    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        return sum(1 for n in self.notifications if matches_filter(n, filter))
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        # This fake supports the full vocabulary, so it declines nothing: an empty report means
+        # every capability is supported once merged over the all-``True`` default.
+        return {}
 
     def mark_sent_as_read_bulk(
         self,
@@ -1054,6 +1086,32 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
         return len(await self.filter_all_in_app_unread_notifications(user_id))
+
+    async def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> list[Notification | OneOffNotification]:
+        # Reference implementation: match every notification against the recursive predicate,
+        # order it stably (id tiebreaker in the primary direction), then paginate. Downstream
+        # backends translate ``matches_filter`` / ``sort_notifications`` into their own query
+        # language; the semantics here are the contract they mirror.
+        matched = [n for n in self.notifications if matches_filter(n, filter)]
+        ordered = sort_notifications(matched, order_by)
+        return cast(
+            list[Notification | OneOffNotification],
+            self.__paginate_notifications(ordered, page, page_size),
+        )
+
+    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        return sum(1 for n in self.notifications if matches_filter(n, filter))
+
+    async def get_filter_capabilities(self) -> dict[str, bool]:
+        # This fake supports the full vocabulary, so it declines nothing: an empty report means
+        # every capability is supported once merged over the all-``True`` default.
+        return {}
 
     async def mark_sent_as_read_bulk(
         self,
