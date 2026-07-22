@@ -206,6 +206,237 @@ The `AsyncIONotificationService` exposes the same methods as coroutines (`await 
 > `count_*` methods. The backend's unpaginated `filter_all_*` variants exist mainly for internal
 > and count use.
 
+### Filtering and Ordering Notifications
+
+`NotificationService` and `AsyncIONotificationService` also expose a general-purpose query --
+`filter_notifications`, `count_notifications`, `get_backend_supported_filter_capabilities` and
+`resend_notification` -- built for a monitoring dashboard that needs to search, page through, and
+retry notifications across every user and notification type, not just one user's in-app list.
+
+#### The filter grammar
+
+A filter is a plain `dict` built from the `TypedDict`s in
+`vintasend.services.notification_backends.filters` (`NotificationFilter` and friends), so it
+round-trips through JSON with no adapter layer -- a dashboard backend can accept a filter straight
+from a request body and hand it to `filter_notifications` unchanged.
+
+**Field filters.** Multiple keys inside one filter dict are an implicit AND. A scalar value means
+equality; a list means membership:
+
+```python
+from vintasend.constants import NotificationStatus
+
+# tenant == "acme" AND status == SENT
+notification_service.filter_notifications(
+    {"tenant": "acme", "status": NotificationStatus.SENT.value},
+    page=1,
+    page_size=10,
+)
+
+# tenant in ("acme", "beta")
+notification_service.filter_notifications({"tenant": ["acme", "beta"]}, page=1, page_size=10)
+```
+
+**String lookups** apply to `body_template`, `subject_template` and `context_name`. A bare `str`
+is a case-sensitive `exact` match. For anything else, pass a `StringFilterLookup` dict with
+`lookup` (`"exact"`, `"starts_with"`, `"ends_with"` or `"includes"`), `value`, and an optional
+`case_sensitive` (defaults to `True`):
+
+```python
+notification_service.filter_notifications(
+    {
+        "body_template": {
+            "lookup": "starts_with",
+            "value": "WELCOME",
+            "case_sensitive": False,
+        }
+    },
+    page=1,
+    page_size=10,
+)
+```
+
+**Date ranges** apply to `send_after_range`, `created_at_range`, `sent_at_range` and
+`read_at_range`. Both bounds are **inclusive** (`from` maps to `>=`, `to` maps to `<=`); a client
+computing "today" as midnight-to-midnight will double-count boundary rows if it assumes an
+exclusive upper bound instead. Either bound can be left out for an open-ended range:
+
+```python
+import datetime
+
+now = datetime.datetime.now(tz=datetime.timezone.utc)
+
+# sent in the last 24 hours
+notification_service.filter_notifications(
+    {"sent_at_range": {"from": now - datetime.timedelta(days=1), "to": now}},
+    page=1,
+    page_size=10,
+)
+```
+
+**`and` / `or` / `not`** compose and nest arbitrarily -- each takes the same `NotificationFilter`
+shape, so a group can hold field filters or further groups:
+
+```python
+# Everything except acme's notifications and every reminder email
+notification_service.filter_notifications(
+    {
+        "not": {
+            "or": [
+                {"tenant": "acme"},
+                {"body_template": "reminder_email"},
+            ]
+        }
+    },
+    page=1,
+    page_size=10,
+)
+
+# acme's sent welcome emails specifically
+notification_service.filter_notifications(
+    {
+        "and": [
+            {"tenant": "acme"},
+            {"status": NotificationStatus.SENT.value},
+            {"body_template": {"lookup": "includes", "value": "welcome"}},
+        ]
+    },
+    page=1,
+    page_size=10,
+)
+```
+
+A positive filter on a field whose stored value is `None` never matches, so a `None` row is
+*included* under negation: `{"not": {"tenant": "acme"}}` returns rows whose tenant is anything but
+`acme`, plus rows whose tenant is `None`.
+
+**`filter_notifications({}, page, page_size)` -- an empty filter -- is the unrestricted listing.**
+There is no separate "get everything" method; the empty dict matches every notification, not none
+of them.
+
+#### Ordering
+
+`order_by` selects one primary field and a direction:
+
+```python
+notification_service.filter_notifications(
+    {}, page=1, page_size=10, order_by={"field": "sent_at", "direction": "desc"}
+)
+```
+
+The available fields are `send_after`, `sent_at`, `read_at`, `created_at` and `updated_at`.
+`created_at` maps to the notification's `created` column and `updated_at` maps to `modified` --
+the filter API's field names don't have to match the underlying column names one-to-one. Leaving
+`order_by` out defaults to `created_at` descending. Every backend appends `id` as a tiebreaker in
+the same direction as the primary field, so paging through rows that share a timestamp still
+returns each row exactly once: without a stable tiebreaker, offset pagination over a repeated
+`created` value would silently drop or duplicate rows across pages.
+
+#### Pagination
+
+`page` and `page_size` behave like every other paginated method in this library. The result is an
+`Iterable`, so you can't call `len()` on it -- use `count_notifications` for the total a dashboard
+needs to render `count` / `next` / `previous`:
+
+```python
+page_1 = notification_service.filter_notifications({}, page=1, page_size=20)
+total = notification_service.count_notifications({})
+```
+
+There's no enforced maximum `page_size`; the library leaves that decision to the host
+application. A caller that passes an unreasonably large `page_size` loads that many rows into
+memory in one call, so an endpoint that exposes this to a client should apply its own cap.
+
+#### Capability introspection
+
+A backend doesn't have to support every filter field, string lookup and sort field.
+`get_backend_supported_filter_capabilities()` returns a `dict[str, bool]` a dashboard can use to
+grey out controls the configured backend can't handle:
+
+```python
+capabilities = notification_service.get_backend_supported_filter_capabilities()
+capabilities["fields.tenant"]          # True unless the backend declines it
+capabilities["stringLookups.startsWith"]
+capabilities["orderBy.sentAt"]
+```
+
+A backend declares only what it *cannot* do. Its report is merged over an all-`True` default, so a
+missing key means supported:
+
+```python
+class TenantUnsupportedBackend(FakeFileBackend):
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"fields.tenant": False}
+
+
+limited_service = NotificationService(
+    notification_adapters=[my_adapter],
+    notification_backend=TenantUnsupportedBackend(),
+)
+caps = limited_service.get_backend_supported_filter_capabilities()
+caps["fields.tenant"]  # False
+caps["fields.status"]  # still True -- everything not declared stays supported
+```
+
+This means a filter field added in a later `vintasend` release doesn't force every existing
+backend to re-declare support for everything else.
+
+Notice that capability keys are camelCase and dotted (`'fields.notificationType'`,
+`'orderBy.sentAt'`) while filter field names are snake_case (`notification_type`,
+`send_after_range`). This is deliberate, not an inconsistency: filter fields are an in-process
+Python API that `mypy` checks and that you type by hand, so snake_case is correct there.
+Capability keys are data a client reads over the wire, and they're kept byte-identical to the
+`vintasend-ts` sibling library's keys, so one dashboard can consume a capability report from a
+Python backend or a TypeScript one without a translation table in between.
+
+#### Resending a notification
+
+`resend_notification` is the retry action a dashboard drives when a notification failed or a user
+asks for it again:
+
+```python
+clone = notification_service.resend_notification(notification_id)
+
+# Reuse the exact context the original notification rendered with, instead of
+# regenerating it through the context registry
+clone = notification_service.resend_notification(
+    notification_id, use_stored_context_if_available=True
+)
+```
+
+The source notification is left completely untouched -- its id, status and timestamps never
+change. The clone is a brand-new row: same user, template, context configuration and attachments,
+sent immediately (`send_after` is not carried over, since resending means "send now").
+`resend_notification` raises `NotificationResendError` for a one-off notification, and for one
+still scheduled in the future -- these are refusals, not silent no-ops.
+
+The object `resend_notification` returns reflects the clone's state right after `send()` is
+called on it, the same convention `create_notification` already follows -- treat it the same way.
+A backend that returns a detached object from `persist_notification` may hand back something that
+still looks `PENDING_SEND` even though the clone was, in fact, sent; re-fetch through
+`get_notification` or `filter_notifications` if you need the backend's own freshest copy.
+
+#### `tenant` is a filter field, not an access control
+
+`tenant` behaves like `user_id` elsewhere in this library: it's an opaque string this package
+doesn't interpret. The host application decides what a tenant is and who may see it.
+**Filtering by `tenant` is not authorization.** Nothing stops a caller from omitting the `tenant`
+filter and reading across every tenant, and nothing in this library checks whether the caller is
+allowed to see the tenant it asked for. `update_notification` refuses to change a notification's
+`tenant` after creation, raising `TenantReassignmentError` -- that closes off one accidental way to
+move a notification between tenants, but it's defence in depth, not a security boundary. The host
+application must still enforce who is allowed to query which tenant.
+
+#### Query governance is the host application's job
+
+Because the filter is composable, a caller can build an arbitrarily deep `and` / `or` / `not`
+tree. A deeply nested `or` over an unindexed column will produce a slow scan, and this library has
+no query planner to stop it. There's no built-in depth limit or leaf-filter cap -- an arbitrary
+number here would be arbitrary for every host, not a real safeguard. If a filter comes from
+untrusted input, the host application should validate or bound it (a maximum nesting depth, a
+maximum number of leaf filters, indexes on the columns it lets clients filter by) before handing
+it to `filter_notifications`.
+
 
 ## Glossary
 
