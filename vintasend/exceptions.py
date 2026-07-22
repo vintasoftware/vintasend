@@ -63,7 +63,14 @@ class InvalidOneOffNotificationRecipientError(NotificationError):
 
 
 class NotificationQueueServiceMissingError(NotificationError):
-    """Raised when a queue service is required but cannot be found, resolved, or instantiated."""
+    """Raised when no queue service import string is configured, and no default is set either."""
+
+
+class NotificationQueueServiceResolutionError(NotificationError):
+    """Raised when a configured queue service import string cannot be turned into a working
+    queue service: the import fails, the class cannot be instantiated, or the resolved object
+    is not a queue service.
+    """
 
 
 class NotificationServiceFactoryError(NotificationError):

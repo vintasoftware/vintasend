@@ -1,13 +1,14 @@
 """Unit tests for the queue-service seam: the ABCs, their fakes, and the resolver helpers."""
 
 from abc import ABC
-from types import MappingProxyType
 from unittest import IsolatedAsyncioTestCase, TestCase
 
 import pytest
 
-from vintasend.app_settings import NotificationSettings
-from vintasend.exceptions import NotificationQueueServiceMissingError
+from vintasend.exceptions import (
+    NotificationQueueServiceMissingError,
+    NotificationQueueServiceResolutionError,
+)
 from vintasend.services.helpers import (
     get_asyncio_notification_queue_service,
     get_notification_queue_service,
@@ -20,27 +21,7 @@ from vintasend.services.notification_queue_services.stubs.fake_queue_service imp
     FakeAsyncIOQueueService,
     FakeQueueService,
 )
-
-
-def _reset_notification_settings_singleton(test_case: TestCase) -> None:
-    """Clear the NotificationSettings singleton for one test, then restore it.
-
-    See test_notification_service.py's identical helper for the full explanation: the
-    singleton stores its built instance on a per-class `_instances` attribute, so it must be
-    cleared and restored around the test rather than relying on SingletonMeta's own default.
-    """
-    sentinel = object()
-    original = vars(NotificationSettings).get("_instances", sentinel)
-
-    def _restore() -> None:
-        if original is sentinel:
-            if "_instances" in vars(NotificationSettings):
-                delattr(NotificationSettings, "_instances")
-        else:
-            NotificationSettings._instances = original
-
-    test_case.addCleanup(_restore)
-    NotificationSettings._instances = MappingProxyType({})
+from vintasend.tests.utils import _reset_notification_settings_singleton
 
 
 class BaseNotificationQueueServiceTestCase(TestCase):
@@ -134,12 +115,23 @@ class GetNotificationQueueServiceTestCase(TestCase):
         assert isinstance(queue_service, FakeQueueService)
 
     def test_raises_typed_error_on_a_bad_import_string(self):
-        with pytest.raises(NotificationQueueServiceMissingError):
+        with pytest.raises(NotificationQueueServiceResolutionError):
             get_notification_queue_service("vintasend.does.not.exist.NotARealQueueService")
 
     def test_raises_typed_error_when_resolved_class_is_not_a_queue_service(self):
-        with pytest.raises(NotificationQueueServiceMissingError):
+        with pytest.raises(NotificationQueueServiceResolutionError):
             get_notification_queue_service("builtins.object")
+
+    def test_raises_typed_error_when_resolved_class_is_the_asyncio_queue_service(self):
+        """A host wiring the AsyncIO queue service into the sync resolver is a real
+        misconfiguration. This is the only assertion that pins which ABC this resolver
+        checks against, since `builtins.object` alone would pass even if the resolver
+        checked the wrong ABC.
+        """
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_notification_queue_service(
+                "vintasend.services.notification_queue_services.stubs.fake_queue_service.FakeAsyncIOQueueService"
+            )
 
     def test_raises_typed_error_when_no_import_string_and_no_framework_detected(self):
         """Regression test: get_config() returns {} (not None) when no framework is detected.
@@ -164,12 +156,23 @@ class GetAsyncioNotificationQueueServiceTestCase(TestCase):
         assert isinstance(queue_service, FakeAsyncIOQueueService)
 
     def test_raises_typed_error_on_a_bad_import_string(self):
-        with pytest.raises(NotificationQueueServiceMissingError):
+        with pytest.raises(NotificationQueueServiceResolutionError):
             get_asyncio_notification_queue_service("vintasend.does.not.exist.NotARealQueueService")
 
     def test_raises_typed_error_when_resolved_class_is_not_a_queue_service(self):
-        with pytest.raises(NotificationQueueServiceMissingError):
+        with pytest.raises(NotificationQueueServiceResolutionError):
             get_asyncio_notification_queue_service("builtins.object")
+
+    def test_raises_typed_error_when_resolved_class_is_the_sync_queue_service(self):
+        """A host wiring the sync queue service into the AsyncIO resolver is a real
+        misconfiguration. This is the only assertion that pins which ABC this resolver
+        checks against, since `builtins.object` alone would pass even if the resolver
+        checked the wrong ABC.
+        """
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_asyncio_notification_queue_service(
+                "vintasend.services.notification_queue_services.stubs.fake_queue_service.FakeQueueService"
+            )
 
     def test_raises_typed_error_when_no_import_string_and_no_framework_detected(self):
         """Regression test: get_config() returns {} (not None) when no framework is detected.
