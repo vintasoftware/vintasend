@@ -4,6 +4,22 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+from vintasend.services.notification_backends.filters import (
+    DEFAULT_BACKEND_FILTER_CAPABILITIES,
+    AndFilter,
+    DateRange,
+    NotFilter,
+    NotificationFilter,
+    NotificationFilterFields,
+    NotificationOrderBy,
+    NotificationOrderByField,
+    NotificationOrderDirection,
+    OrFilter,
+    StringFieldFilter,
+    StringFilterLookup,
+    is_field_filter,
+    is_string_filter_lookup,
+)
 from vintasend.services.utils import get_class_path
 
 
@@ -14,6 +30,28 @@ if TYPE_CHECKING:
         OneOffNotification,
         UpdateNotificationKwargs,
     )
+
+
+# ``BaseNotificationBackend`` plus every filter name re-exported from ``filters`` for import
+# convenience. All are listed here so ``no_implicit_reexport`` accepts
+# ``from ...base import NotificationFilter`` downstream.
+__all__ = [
+    "DEFAULT_BACKEND_FILTER_CAPABILITIES",
+    "AndFilter",
+    "BaseNotificationBackend",
+    "DateRange",
+    "NotFilter",
+    "NotificationFilter",
+    "NotificationFilterFields",
+    "NotificationOrderBy",
+    "NotificationOrderByField",
+    "NotificationOrderDirection",
+    "OrFilter",
+    "StringFieldFilter",
+    "StringFilterLookup",
+    "is_field_filter",
+    "is_string_filter_lookup",
+]
 
 
 class BaseNotificationBackend(ABC):
@@ -217,6 +255,77 @@ class BaseNotificationBackend(ABC):
         for efficiency (e.g. a database ``COUNT``).
         """
         return sum(1 for _ in self.filter_all_in_app_unread_notifications(user_id))
+
+    @abstractmethod
+    def filter_notifications(
+        self,
+        filter: "NotificationFilter",  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: "NotificationOrderBy | None" = None,
+    ) -> Iterable["Notification | OneOffNotification"]:
+        """
+        Return one page of notifications matching a composable filter.
+
+        This is the general-purpose query a monitoring dashboard consumes. It covers BOTH
+        ``Notification`` and ``OneOffNotification`` -- a dashboard wants one list -- so a caller
+        that must separate them does so on the returned objects, not via the filter.
+
+        Filter semantics:
+            * An **empty filter (``{}``) matches every notification** -- it is the unrestricted
+              listing. "Empty filter returns nothing" is an equally plausible but WRONG reading;
+              a backend that gets this backwards silently hides every row.
+            * Multiple keys inside one field filter are an implicit ``AND``. A scalar means
+              equality; a list means membership. ``and`` / ``or`` / ``not`` compose and nest
+              arbitrarily.
+            * **Date-range bounds are inclusive on both ends** (``from`` -> ``>=``, ``to`` ->
+              ``<=``). A client computing "today" from midnight to midnight double-counts
+              boundary rows if an implementation makes them exclusive.
+            * A positive filter on a field whose value is ``None`` does not match; consequently a
+              ``None`` row IS included under negation (``not``). Nullable columns must include
+              their ``None`` rows under negation.
+
+        Ordering:
+            * ``order_by`` selects a single primary sort field and direction; ``None`` is the
+              backend's documented default.
+            * Ordering MUST be **stable**: implementations append ``id`` as a tiebreaker in the
+              SAME direction as the primary sort key. ``created`` and ``modified`` are not
+              unique, and offset pagination over a non-unique key silently drops and duplicates
+              rows across pages without this.
+
+        The return type stays ``Iterable`` for consistency with the other reads and to let ORM
+        backends return generators; use ``count_notifications`` when a total is needed.
+        """
+        ...
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter fields, string lookups and sort fields this backend supports.
+
+        Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``) and a
+        backend declares ONLY what it *cannot* do -- the service merges this report OVER an
+        all-``True`` default, so a missing key means supported. The concrete default returns
+        ``{}`` (everything supported); backends override to decline specific capabilities.
+        """
+        return {}
+
+    def count_notifications(self, filter: "NotificationFilter") -> int:  # noqa: A002
+        """
+        Total number of notifications matching ``filter``, ignoring pagination.
+
+        Concrete default derived from ``filter_notifications`` by exhausting every page, so a
+        backend that only implements the abstract ``filter_notifications`` keeps working.
+        Backends SHOULD override this for efficiency (e.g. a database ``COUNT``).
+        """
+        total = 0
+        page = 1
+        page_size = 100
+        while True:
+            batch = list(self.filter_notifications(filter, page=page, page_size=page_size))
+            total += len(batch)
+            if len(batch) < page_size:
+                return total
+            page += 1
 
     @abstractmethod
     def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str: ...
