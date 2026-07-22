@@ -64,3 +64,8 @@ class InvalidOneOffNotificationRecipientError(NotificationError):
 
 class TenantReassignmentError(NotificationError):
     """Raised when an update attempts to change a notification's tenant after creation."""
+
+
+class NotificationResendError(NotificationError):
+    """Raised when a notification cannot be resent -- it is a one-off, or it is scheduled
+    in the future (``send_after`` set and not yet due)."""

@@ -27,6 +27,7 @@ from vintasend.exceptions import (
     NotificationError,
     NotificationMarkFailedError,
     NotificationMarkSentError,
+    NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
     TenantReassignmentError,
@@ -238,7 +239,11 @@ class NotificationService(Generic[A, B]):
         """Download file content from a URL."""
         return download_from_url(url)
 
-    def send(self, notification: Notification | OneOffNotification) -> None:
+    def send(
+        self,
+        notification: Notification | OneOffNotification,
+        context: NotificationContextDict | None = None,
+    ) -> None:
         """
         Send a notification using the appropriate adapter
 
@@ -251,16 +256,23 @@ class NotificationService(Generic[A, B]):
 
         Parameters:
             notification: Notification | OneOffNotification - the notification to be sent
+            context: NotificationContextDict | None - a pre-computed context to send with,
+                bypassing context generation entirely. Used by ``resend_notification`` to reuse
+                a stored ``context_used`` verbatim; regular callers leave this ``None`` so
+                context is generated as usual.
         """
-        try:
-            context = self.get_notification_context(notification)
-        except NotificationContextGenerationError:
-            logger.exception("Failed to generate context for notification %s", notification.id)
+        if context is None:
             try:
-                self.notification_backend.mark_pending_as_failed(notification.id)
-            except NotificationUpdateError as e:
-                raise NotificationMarkFailedError("Failed to mark notification as failed") from e
-            return
+                context = self.get_notification_context(notification)
+            except NotificationContextGenerationError:
+                logger.exception("Failed to generate context for notification %s", notification.id)
+                try:
+                    self.notification_backend.mark_pending_as_failed(notification.id)
+                except NotificationUpdateError as e:
+                    raise NotificationMarkFailedError(
+                        "Failed to mark notification as failed"
+                    ) from e
+                return
 
         for adapter in self.notification_adapters:
             if adapter.notification_type.value != notification.notification_type:
@@ -788,6 +800,83 @@ class NotificationService(Generic[A, B]):
             **self.notification_backend.get_filter_capabilities(),
         }
 
+    def resend_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        use_stored_context_if_available: bool = False,
+    ) -> Notification:
+        """
+        Resend a notification by cloning it into a brand-new PENDING row and sending that
+        clone immediately. This is the operation a dashboard "retry" action drives.
+
+        The source notification is re-read from the backend and left completely untouched --
+        its id, status and timestamps never change. The clone is a new row with its own id,
+        carrying over the source's user, template, context and attachment configuration.
+
+        This method may raise the following exceptions:
+            * NotificationResendError if the notification is a one-off, or is still scheduled
+              in the future (``send_after`` set and not yet due).
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if the adapter fails to send the notification.
+            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the notification to resend
+            use_stored_context_if_available: bool - when True and the source notification has
+                a stored ``context_used``, the clone reuses it verbatim instead of regenerating
+                context at send time. Defaults to False.
+
+        Returns:
+            Notification - the newly created clone
+        """
+        source = self.notification_backend.get_notification(notification_id)
+        if isinstance(source, OneOffNotification):
+            raise NotificationResendError("One-off notifications cannot be resent")
+        if source.send_after is not None and source.send_after > datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            raise NotificationResendError(
+                "Cannot resend a notification that is still scheduled in the future"
+            )
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if source.tenant is not None:
+            extra_persist_kwargs["tenant"] = source.tenant
+
+        clone = self.notification_backend.persist_notification(
+            user_id=source.user_id,
+            notification_type=source.notification_type,
+            title=source.title,
+            body_template=source.body_template,
+            context_name=source.context_name,
+            context_kwargs=source.context_kwargs,
+            send_after=None,
+            subject_template=source.subject_template,
+            preheader_template=source.preheader_template,
+            adapter_extra_parameters=source.adapter_extra_parameters,
+            **extra_persist_kwargs,
+        )
+
+        if source.attachments:
+            clone = cast(
+                Notification,
+                self.notification_backend.persist_notification_update(
+                    notification_id=clone.id,
+                    update_data={"attachments": list(source.attachments)},
+                ),
+            )
+
+        reused_context: NotificationContextDict | None = None
+        if use_stored_context_if_available and source.context_used is not None:
+            reused_context = cast(NotificationContextDict, source.context_used)
+
+        if clone.send_after is None or clone.send_after <= datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            self.send(clone, context=reused_context)
+        return clone
+
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
         Cancel a notification.
@@ -959,7 +1048,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         return download_from_url(url)
 
     async def send(
-        self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None
+        self,
+        notification: Notification | OneOffNotification,
+        lock: asyncio.Lock | None = None,
+        context: NotificationContextDict | None = None,
     ) -> None:
         """
         Send a notification using the appropriate adapter
@@ -973,16 +1065,23 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         Parameters:
             notification: Notification | OneOffNotification - the notification to be sent
+            context: NotificationContextDict | None - a pre-computed context to send with,
+                bypassing context generation entirely. Used by ``resend_notification`` to reuse
+                a stored ``context_used`` verbatim; regular callers leave this ``None`` so
+                context is generated as usual.
         """
-        try:
-            context = await self.get_notification_context(notification)
-        except NotificationContextGenerationError:
-            logger.exception("Failed to generate context for notification %s", notification.id)
+        if context is None:
             try:
-                await self.notification_backend.mark_pending_as_failed(notification.id, lock)
-            except NotificationUpdateError as e:
-                raise NotificationMarkFailedError("Failed to mark notification as failed") from e
-            return None
+                context = await self.get_notification_context(notification)
+            except NotificationContextGenerationError:
+                logger.exception("Failed to generate context for notification %s", notification.id)
+                try:
+                    await self.notification_backend.mark_pending_as_failed(notification.id, lock)
+                except NotificationUpdateError as e:
+                    raise NotificationMarkFailedError(
+                        "Failed to mark notification as failed"
+                    ) from e
+                return None
 
         for adapter in self.notification_adapters:
             if adapter.notification_type.value != notification.notification_type:
@@ -1528,6 +1627,83 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             **DEFAULT_BACKEND_FILTER_CAPABILITIES,
             **await self.notification_backend.get_filter_capabilities(),
         }
+
+    async def resend_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        use_stored_context_if_available: bool = False,
+    ) -> Notification:
+        """
+        Resend a notification by cloning it into a brand-new PENDING row and sending that
+        clone immediately. This is the operation a dashboard "retry" action drives.
+
+        The source notification is re-read from the backend and left completely untouched --
+        its id, status and timestamps never change. The clone is a new row with its own id,
+        carrying over the source's user, template, context and attachment configuration.
+
+        This method may raise the following exceptions:
+            * NotificationResendError if the notification is a one-off, or is still scheduled
+              in the future (``send_after`` set and not yet due).
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if the adapter fails to send the notification.
+            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the notification to resend
+            use_stored_context_if_available: bool - when True and the source notification has
+                a stored ``context_used``, the clone reuses it verbatim instead of regenerating
+                context at send time. Defaults to False.
+
+        Returns:
+            Notification - the newly created clone
+        """
+        source = await self.notification_backend.get_notification(notification_id)
+        if isinstance(source, OneOffNotification):
+            raise NotificationResendError("One-off notifications cannot be resent")
+        if source.send_after is not None and source.send_after > datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            raise NotificationResendError(
+                "Cannot resend a notification that is still scheduled in the future"
+            )
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if source.tenant is not None:
+            extra_persist_kwargs["tenant"] = source.tenant
+
+        clone = await self.notification_backend.persist_notification(
+            user_id=source.user_id,
+            notification_type=source.notification_type,
+            title=source.title,
+            body_template=source.body_template,
+            context_name=source.context_name,
+            context_kwargs=source.context_kwargs,
+            send_after=None,
+            subject_template=source.subject_template,
+            preheader_template=source.preheader_template,
+            adapter_extra_parameters=source.adapter_extra_parameters,
+            **extra_persist_kwargs,
+        )
+
+        if source.attachments:
+            clone = cast(
+                Notification,
+                await self.notification_backend.persist_notification_update(
+                    notification_id=clone.id,
+                    update_data={"attachments": list(source.attachments)},
+                ),
+            )
+
+        reused_context: NotificationContextDict | None = None
+        if use_stored_context_if_available and source.context_used is not None:
+            reused_context = cast(NotificationContextDict, source.context_used)
+
+        if clone.send_after is None or clone.send_after <= datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            await self.send(clone, context=reused_context)
+        return clone
 
     async def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
