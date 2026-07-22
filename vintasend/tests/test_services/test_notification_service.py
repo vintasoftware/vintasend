@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import subprocess
 import sys
 import uuid
@@ -2635,3 +2636,92 @@ class NotificationServiceImportTestCase(TestCase):
             text=True,
         )
         assert result.returncode == 0, result.stderr
+
+
+# Methods that intentionally exist on only one of NotificationService / AsyncIONotificationService.
+# Per AGENTS.md's sync/AsyncIO parity rule, any other one-sided method is a drift bug, not a
+# design choice, and should fail the test below instead of growing this list. Each entry names
+# the one class that carries the method and why the asymmetry is deliberate, so a method that
+# moves to the other class -- rather than simply appearing on a second class -- still fails.
+SERVICE_METHOD_PARITY_ALLOWLIST: dict[str, tuple[str, str]] = {
+    "delayed_send": (
+        "NotificationService",
+        "Sends through an AsyncBaseNotificationAdapter, a sync adapter that hands delivery to "
+        "a task queue (see AGENTS.md's note on notification_adapters/async_base.py) rather than "
+        "genuine async/await. AsyncIONotificationService has no such adapter kind to send "
+        "through today; the background-send-queue plan adds one.",
+    ),
+    "_send_notification_with_error_logging": (
+        "AsyncIONotificationService",
+        "Its send_pending_notifications sends notifications concurrently with asyncio.gather, "
+        "which needs a per-notification coroutine to carry the try/except/logging for each one. "
+        "The sync twin runs the same branches inline in a plain for loop and never needed a "
+        "separate helper for it.",
+    ),
+}
+
+
+class ServiceMethodParityTestCase(TestCase):
+    """
+    Guards the sync/AsyncIO parity rule from AGENTS.md: NotificationService and
+    AsyncIONotificationService must expose the same set of methods, except for the
+    differences named in SERVICE_METHOD_PARITY_ALLOWLIST above.
+
+    "Method set" here covers every function, staticmethod, classmethod, and property defined
+    directly on the class body, including `_`-prefixed helpers and dunders such as __init__,
+    not just the public, non-underscore API. Most of the drift this plan exists to close lives
+    in the `_`-prefixed helpers, so a check limited to public names would miss it.
+    """
+
+    def _method_names(self, cls: type) -> set[str]:
+        return {
+            name
+            for name, value in vars(cls).items()
+            if inspect.isfunction(value) or isinstance(value, (staticmethod, classmethod, property))
+        }
+
+    def test_method_sets_match_except_for_allowlisted_differences(self):
+        sync_names = self._method_names(NotificationService)
+        async_names = self._method_names(AsyncIONotificationService)
+
+        sync_only = sync_names - async_names
+        async_only = async_names - sync_names
+
+        unexplained_sync_only = sync_only - SERVICE_METHOD_PARITY_ALLOWLIST.keys()
+        unexplained_async_only = async_only - SERVICE_METHOD_PARITY_ALLOWLIST.keys()
+
+        assert not unexplained_sync_only, (
+            "NotificationService defines methods AsyncIONotificationService lacks, with no "
+            f"allowlist entry explaining why: {sorted(unexplained_sync_only)}. Add a matching "
+            "method to AsyncIONotificationService, or a reasoned entry to "
+            "SERVICE_METHOD_PARITY_ALLOWLIST."
+        )
+        assert not unexplained_async_only, (
+            "AsyncIONotificationService defines methods NotificationService lacks, with no "
+            f"allowlist entry explaining why: {sorted(unexplained_async_only)}. Add a matching "
+            "method to NotificationService, or a reasoned entry to "
+            "SERVICE_METHOD_PARITY_ALLOWLIST."
+        )
+
+        # sync_only and async_only are disjoint by construction (each is one side minus the
+        # other), so checking membership in the named owner's set alone catches a method that
+        # moved to the other class, not just one that vanished from both.
+        owner_by_class_name = {
+            "NotificationService": sync_only,
+            "AsyncIONotificationService": async_only,
+        }
+        for method_name, (owner_class_name, _reason) in SERVICE_METHOD_PARITY_ALLOWLIST.items():
+            assert method_name in owner_by_class_name[owner_class_name], (
+                f"SERVICE_METHOD_PARITY_ALLOWLIST says {method_name!r} belongs only to "
+                f"{owner_class_name}, but it is not one-sided in {owner_class_name}'s favor "
+                "any more -- it may have moved to the other class, or stopped being one-sided "
+                "at all. Update the allowlist entry to match reality."
+            )
+
+        # An allowlist entry that no longer names a real asymmetry means the drift it
+        # described has already been fixed elsewhere, so flag it rather than let it go stale.
+        stale_entries = set(SERVICE_METHOD_PARITY_ALLOWLIST.keys()) - (sync_only | async_only)
+        assert not stale_entries, (
+            f"SERVICE_METHOD_PARITY_ALLOWLIST names methods that are no longer asymmetric: "
+            f"{sorted(stale_entries)}. Remove the stale entries."
+        )
