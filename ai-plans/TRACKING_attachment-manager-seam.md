@@ -85,13 +85,31 @@ commit was carried into the worktree; Phases 2–4 run there. The main checkout 
 - Note that `UpdateNotificationKwargs.attachments` intentionally stays `StoredAttachment` (diverges
   from the Open Questions default) because `persist_notification_update` has no upload path.
 
+### Phase 3 — File records, checksum dedup, and references ✅
+
+- **Status**: DONE — reviewed (3 layers, zero findings) + integrated.
+- **Implementer model**: claude-sonnet-5 (Tier 3). **Reviewer**: claude-opus-4-8 (Tier 4).
+  **Fixer**: none needed.
+- **Branch**: `plan/attachment-manager-seam/phase-3` (remote) at `cc57a65`.
+  **Base**: `plan/attachment-manager-seam/phase-2`.
+- **PR**: https://github.com/vintasoftware/vintasend/pull/16
+- **Summary**: Checksum+size dedup in `_store_attachments` (sync + async) — identical bytes reuse one
+  `AttachmentFileRecord`, skipping the upload; a dedup miss hands the already-read bytes to
+  `upload_file` so a URL is fetched once. Reference-by-id resolution (raises
+  `AttachmentFileNotFoundError` on a missing `file_id`, else writes only a join row, taking
+  `is_inline`/`description` from the reference). Two new `NotificationError` subclasses
+  (`AttachmentFileNotFoundError`, `AttachmentUploadError`). Orphans + two-step caller-driven deletion
+  confirmed; cancel/delete keep no attachment hook (documented as deliberate). No ABC changes — this
+  commit affects no downstream package.
+- **Gate**: ruff clean, mypy clean, pytest 222 passed / 2 skipped. New tests fail against Phase 2's
+  non-deduping code (reviewer verified).
+
 ## Current phase
 
-Phase 3 — File records, checksum dedup, and references (starting).
+Phase 4 — Documentation (starting).
 
 ## Remaining phases
 
-- Phase 3 — File records, checksum dedup, and references.
 - Phase 4 — Documentation.
 
 ## Deferred phases
