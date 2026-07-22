@@ -57,6 +57,7 @@ from vintasend.services.service_utils import (
     is_url,
     read_file_data,
     validate_attachments,
+    validate_email_or_phone,
 )
 from vintasend.services.utils import get_class_path
 from vintasend.utils.singleton_utils import SingletonMeta
@@ -362,12 +363,14 @@ class NotificationService(Generic[A, B]):
         Create a one-off notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * InvalidOneOffNotificationRecipientError if email_or_phone is invalid;
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         """
+        validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
 
         notification = self.notification_backend.persist_one_off_notification(
@@ -1002,12 +1005,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Create a one-off notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * InvalidOneOffNotificationRecipientError if email_or_phone is invalid;
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         """
+        validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
 
         notification = await self.notification_backend.persist_one_off_notification(

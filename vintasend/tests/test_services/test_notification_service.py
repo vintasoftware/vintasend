@@ -14,6 +14,7 @@ from vintasend.app_settings import NotificationSettings
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     DuplicateNotificationAdapterError,
+    InvalidOneOffNotificationRecipientError,
     NotificationError,
     NotificationMarkFailedError,
     NotificationMarkSentError,
@@ -293,6 +294,48 @@ class NotificationServiceTestCase(TestCase):
         assert one_off_notification.first_name == "John"
         assert one_off_notification.last_name == "Doe"
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+
+    def test_create_one_off_notification_with_empty_email_or_phone_raises_and_persists_nothing(
+        self,
+    ):
+        assert len(self.notification_service.notification_backend.notifications) == 0
+
+        with pytest.raises(InvalidOneOffNotificationRecipientError):
+            self.notification_service.create_one_off_notification(
+                email_or_phone="",
+                first_name="John",
+                last_name="Doe",
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Test One-Off Notification",
+                body_template="vintasend_django/emails/test/test_templated_email_body.html",
+                context_name="test_context",
+                context_kwargs=NotificationContextDict({"test": "test"}),
+                send_after=None,
+                subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+                preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            )
+
+        assert len(self.notification_service.notification_backend.notifications) == 0
+
+    def test_create_one_off_notification_with_valid_phone_succeeds(self):
+        assert len(self.notification_service.notification_backend.notifications) == 0
+
+        one_off_notification = self.notification_service.create_one_off_notification(
+            email_or_phone="+1234567890",
+            first_name="Jane",
+            last_name="Smith",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-Off Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert len(self.notification_service.notification_backend.notifications) == 1
+        assert one_off_notification.email_or_phone == "+1234567890"
 
     @patch(
         "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_sent"
@@ -1732,6 +1775,50 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         assert one_off_notification.first_name == "John"
         assert one_off_notification.last_name == "Doe"
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+
+    @pytest.mark.asyncio
+    async def test_create_one_off_notification_with_empty_email_or_phone_raises_and_persists_nothing(
+        self,
+    ):
+        assert len(self.notification_service.notification_backend.notifications) == 0
+
+        with pytest.raises(InvalidOneOffNotificationRecipientError):
+            await self.notification_service.create_one_off_notification(
+                email_or_phone="",
+                first_name="John",
+                last_name="Doe",
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Test One-Off Notification",
+                body_template="vintasend_django/emails/test/test_templated_email_body.html",
+                context_name="test_context",
+                context_kwargs=NotificationContextDict({"test": "test"}),
+                send_after=None,
+                subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+                preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            )
+
+        assert len(self.notification_service.notification_backend.notifications) == 0
+
+    @pytest.mark.asyncio
+    async def test_create_one_off_notification_with_valid_phone_succeeds(self):
+        assert len(self.notification_service.notification_backend.notifications) == 0
+
+        one_off_notification = await self.notification_service.create_one_off_notification(
+            email_or_phone="+1234567890",
+            first_name="Jane",
+            last_name="Smith",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-Off Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert len(self.notification_service.notification_backend.notifications) == 1
+        assert one_off_notification.email_or_phone == "+1234567890"
 
     @pytest.mark.asyncio
     @patch(
