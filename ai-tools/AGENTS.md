@@ -293,19 +293,32 @@ skill for the full table and the release checklist.
 
 ## Downstream implementations
 
-These live in separate repositories under the same organization and implement the seams:
+These live in separate repositories under the same organization and implement the seams. Each is
+linked here as a git submodule so one checkout holds every package that has to stay compatible:
 
-| Package | Provides |
-|---|---|
-| `vintasend-django` | backend (Django ORM), email adapter, template renderer |
-| `vintasend-sqlalchemy` | backend (SQLAlchemy, sync and async) |
-| `vintasend-celery` | adapter factory for deferred sending on sync backends |
-| `vintasend-fastapi-mail` | AsyncIO email adapter |
-| `vintasend-flask-mail` | sync email adapter |
-| `vintasend-jinja` | Jinja2 template renderer |
+| Package | Path | Provides |
+|---|---|---|
+| `vintasend-django` | `implementations/vintasend-django` | backend (Django ORM), email adapter, template renderer |
+| `vintasend-sqlalchemy` | `implementations/vintasend-sqlalchemy` | backend (SQLAlchemy, sync and async) |
+| `vintasend-celery` | `implementations/vintasend-celery` | adapter factory for deferred sending on sync backends |
+| `vintasend-fastapi-mail` | `implementations/vintasend-fastapi-mail` | AsyncIO email adapter |
+| `vintasend-flask-mail` | `implementations/vintasend-flask-mail` | sync email adapter |
+| `vintasend-jinja` | `implementations/vintasend-jinja` | Jinja2 template renderer |
 
-**Never edit them from this repo** — they are separate checkouts with their own release cycles. When
-a change affects them:
+Run `git submodule update --init` if `implementations/` is empty.
+
+You may edit these packages from this checkout, but **each one is its own git repository with its
+own release cycle**. Rules that follow from that:
+
+- Branch, commit, and push inside the submodule directory. A commit in the root repo only records
+  which submodule commit it points at — it does not carry the submodule's own changes.
+- One PR per repository. A change spanning core and an implementation is two PRs, and this repo's
+  release lands first (see below).
+- This repo's lint, type-check, and test commands are scoped to `vintasend/` and skip
+  `implementations/` entirely. To verify a change to an implementation, run that package's own
+  commands from inside its directory, against its own environment.
+
+When a change to this repo affects them:
 
 1. Work out which packages are affected. Backend seam changes hit `vintasend-django` and
    `vintasend-sqlalchemy`; adapter changes hit the four adapter packages; renderer changes hit

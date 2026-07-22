@@ -236,6 +236,29 @@ VintaSend has many backend, adapter, and template renderer implementations. If y
 * **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)**: Renders emails using Django's templating system.
 * **[vintasend-jinja](https://github.com/vintasoftware/vintasend-jinja/)**: Renders emails using Jinja2.
 
+#### Working on them from this repo
+
+Each officially supported package lives in its own repository and is linked here as a git
+submodule under `implementations/`, so a single checkout gives you the core package plus
+every implementation that has to stay compatible with it.
+
+```bash
+# Fresh clone, with the implementations
+git clone --recurse-submodules git@github.com:vintasoftware/vintasend.git
+
+# Existing clone
+git submodule update --init --recursive
+
+# Pull the latest commit of every implementation
+git submodule update --remote
+```
+
+Each submodule is an ordinary checkout of its own repo: `cd` into it, branch, commit, and
+push there as usual. This repo's lint, type-check, and test commands deliberately skip
+`implementations/` — each package has its own dependencies, its own tooling config, and
+its own CI. Committing here only records which commit of each implementation this repo
+points at.
+
 
 ## Advanced Usage
 

@@ -1,0 +1,18 @@
+[submodule "implementations/vintasend-django"]
+	path = implementations/vintasend-django
+	url = git@github.com:vintasoftware/vintasend-django.git
+[submodule "implementations/vintasend-sqlalchemy"]
+	path = implementations/vintasend-sqlalchemy
+	url = git@github.com:vintasoftware/vintasend-sqlalchemy.git
+[submodule "implementations/vintasend-celery"]
+	path = implementations/vintasend-celery
+	url = git@github.com:vintasoftware/vintasend-celery.git
+[submodule "implementations/vintasend-fastapi-mail"]
+	path = implementations/vintasend-fastapi-mail
+	url = git@github.com:vintasoftware/vintasend-fastapi-mail.git
+[submodule "implementations/vintasend-flask-mail"]
+	path = implementations/vintasend-flask-mail
+	url = git@github.com:vintasoftware/vintasend-flask-mail.git
+[submodule "implementations/vintasend-jinja"]
+	path = implementations/vintasend-jinja
+	url = git@github.com:vintasoftware/vintasend-jinja.git

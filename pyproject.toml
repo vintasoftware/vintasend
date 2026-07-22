@@ -40,7 +40,10 @@ build-backend = "poetry.core.masonry.api"
 # `ai-tools/skills/*/scripts/` holds helper scripts vendored verbatim from the
 # vinta-ai-workflows foundation skills. They are upstream code, not ours -
 # reformatting them would make every future `vinta-update-project-skills` diff noisy.
-extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts"]
+# `implementations/` holds the officially supported companion packages as git
+# submodules. Each has its own ruff config and its own CI - linting them from here
+# would apply this repo's rules to code this repo does not release.
+extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts", "implementations"]
 line-length = 100
 indent-width = 4
 # Must track the MINIMUM Python in [tool.poetry.dependencies]. Setting this higher
@@ -151,6 +154,10 @@ omit = [
 [tool.pytest.ini_options]
 python_files = ["test_*.py"]
 addopts = "--dist=loadscope"
+# Without this, a bare `pytest` from the repo root also collects the submodules under
+# `implementations/`, which fail to import because their dependencies (django, celery,
+# flask-mail, ...) are not in this repo's env. Each submodule runs its own suite.
+testpaths = ["vintasend"]
 
 [tool.mypy]
 files = ["vintasend"]
