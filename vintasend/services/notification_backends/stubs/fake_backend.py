@@ -302,7 +302,7 @@ class FakeFileBackend(BaseNotificationBackend):
                 file=attachment_file,
                 description=attachment.description,
                 is_inline=attachment.is_inline,
-                storage_metadata={"storage_type": "in_memory"},
+                storage_identifiers={"storage_type": "in_memory"},
             )
 
             stored_attachments.append(stored_attachment)
@@ -612,7 +612,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 file=attachment_file,
                 description=attachment.description,
                 is_inline=attachment.is_inline,
-                storage_metadata={"storage_type": "in_memory"},
+                storage_identifiers={"storage_type": "in_memory"},
             )
 
             stored_attachments.append(stored_attachment)

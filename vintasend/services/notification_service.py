@@ -30,6 +30,11 @@ from vintasend.exceptions import (
     NotificationSendError,
     NotificationUpdateError,
 )
+from vintasend.services.attachment_managers.base import (
+    download_from_url,
+    is_url,
+    read_file_data,
+)
 from vintasend.services.dataclasses import (
     Notification,
     NotificationAttachment,
@@ -51,11 +56,8 @@ from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNot
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.service_utils import (
-    download_from_url,
     is_asyncio_context_function,
     is_sync_context_function,
-    is_url,
-    read_file_data,
     validate_attachments,
     validate_email_or_phone,
 )

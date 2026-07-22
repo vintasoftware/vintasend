@@ -5,7 +5,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, TypedDict
+from typing import Any, BinaryIO, TypedDict, TypeGuard
 
 
 # Type alias for supported file inputs (for creating notifications)
@@ -17,6 +17,11 @@ FileAttachment = (
     | str  # File path string OR URL
     | bytes  # Raw bytes data
 )
+
+# Opaque, manager-defined identifiers that let a backend hand a stored file back to
+# whichever attachment manager was injected, without ever parsing the contents itself.
+# Must carry a non-empty "id"; every other key is manager-defined.
+StorageIdentifiers = dict[str, Any]
 
 
 class AttachmentFile(ABC):
@@ -73,6 +78,46 @@ class NotificationAttachment:
 
 
 @dataclass
+class NotificationAttachmentReference:
+    """Attach an already-uploaded file by id instead of re-uploading it.
+
+    ``file_id`` points at an existing `AttachmentFileRecord`. `is_inline` lives here
+    rather than on the record because inline-ness is a property of how *this*
+    notification uses the file, not of the file itself.
+    """
+
+    file_id: str
+    description: str | None = None
+    is_inline: bool = False
+
+
+# Union of every input shape a caller may pass when attaching a file to a notification:
+# an upload (`NotificationAttachment`) or a reference to an already-stored file by id.
+AnyNotificationAttachment = NotificationAttachment | NotificationAttachmentReference
+
+
+def is_attachment_reference(
+    attachment: AnyNotificationAttachment,
+) -> TypeGuard[NotificationAttachmentReference]:
+    """Type guard distinguishing a by-id reference from an upload."""
+    return isinstance(attachment, NotificationAttachmentReference)
+
+
+@dataclass
+class AttachmentFileRecord:
+    """A checksum-indexed, stored blob. One record can back many notifications."""
+
+    id: str
+    filename: str
+    content_type: str
+    size: int
+    checksum: str  # sha256 hex
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+    storage_identifiers: StorageIdentifiers
+
+
+@dataclass
 class StoredAttachment:
     """Represents an attachment stored by the backend"""
 
@@ -85,8 +130,22 @@ class StoredAttachment:
     file: AttachmentFile  # File access - abstracted through AttachmentFile interface
     description: str | None = None
     is_inline: bool = False
-    # Backend-specific storage metadata
-    storage_metadata: dict[str, Any] = field(default_factory=dict)
+    # The `AttachmentFileRecord` this join row points at; `id` above remains the
+    # join row's own id.
+    file_id: str = ""
+    # Opaque identifiers handed back to the injected attachment manager to reconstruct
+    # or delete the underlying file.
+    storage_identifiers: StorageIdentifiers = field(default_factory=dict)
+    # Deprecated alias for storage_identifiers, kept for backwards compatibility.
+    # Accepting it as a real field keeps StoredAttachment(storage_metadata=...) working.
+    storage_metadata: StorageIdentifiers = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Reconcile the deprecated alias with the canonical field: a caller may pass
+        # either one. storage_identifiers wins when both are given.
+        if not self.storage_identifiers and self.storage_metadata:
+            self.storage_identifiers = self.storage_metadata
+        self.storage_metadata = self.storage_identifiers
 
     def get_file_data(self) -> bytes:
         """Get the raw file data"""

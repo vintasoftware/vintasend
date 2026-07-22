@@ -60,3 +60,7 @@ class DuplicateNotificationAdapterError(NotificationError):
 
 class InvalidOneOffNotificationRecipientError(NotificationError):
     """Raised when a one-off notification's email_or_phone is empty or malformed."""
+
+
+class UnsupportedAttachmentFileTypeError(NotificationError):
+    """Raised when an attachment manager is given a file input it cannot read."""

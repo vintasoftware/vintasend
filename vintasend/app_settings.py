@@ -12,6 +12,7 @@ class NotificationSettingsDict(TypedDict):
     NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL: str
     NOTIFICATION_DEFAULT_BASE_URL_DOMAIN: str
     NOTIFICATION_DEFAULT_FROM_EMAIL: str
+    NOTIFICATION_ATTACHMENT_MANAGER: str | None
 
 
 DEFAULT_SETTINGS: NotificationSettingsDict = {
@@ -22,6 +23,9 @@ DEFAULT_SETTINGS: NotificationSettingsDict = {
     "NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL": "http",
     "NOTIFICATION_DEFAULT_BASE_URL_DOMAIN": "example.com",
     "NOTIFICATION_DEFAULT_FROM_EMAIL": "foo@examplo.com",
+    # No default attachment manager ships in core -- host applications supply their own,
+    # exactly like NOTIFICATION_BACKEND. Unset means attachments are unsupported.
+    "NOTIFICATION_ATTACHMENT_MANAGER": None,
 }
 
 
@@ -152,6 +156,7 @@ class NotificationSettings(metaclass=SingletonMeta):
     NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL: str
     NOTIFICATION_DEFAULT_BASE_URL_DOMAIN: str
     NOTIFICATION_DEFAULT_FROM_EMAIL: str
+    NOTIFICATION_ATTACHMENT_MANAGER: str | None
 
     def __init__(self, config: Any = None):
         self.NOTIFICATION_ADAPTERS = cast(
@@ -170,6 +175,9 @@ class NotificationSettings(metaclass=SingletonMeta):
         )
         self.NOTIFICATION_DEFAULT_FROM_EMAIL = cast(
             str, get_config("NOTIFICATION_DEFAULT_FROM_EMAIL", config)
+        )
+        self.NOTIFICATION_ATTACHMENT_MANAGER = cast(
+            str | None, get_config("NOTIFICATION_ATTACHMENT_MANAGER", config)
         )
 
     def get_notification_model_cls(self):
