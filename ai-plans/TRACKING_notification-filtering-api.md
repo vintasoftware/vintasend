@@ -194,13 +194,44 @@ Gates: `ruff check` clean, `ruff format --check` clean, `mypy` clean (42 source 
 `pytest` **281 passed** (260 baseline + 21 new). tox not run — no version-sensitive typing
 constructs introduced.
 
-## Current phase
+### Phase 4 — Documentation ✅
 
-Phase 4 — Documentation (not started).
+- **Status**: complete
+- **Model**: claude-sonnet-5 (plan suggested Tier 2)
+- **Branch**: `plan/notification-filtering-api/phase-4` (stacked on phase-3)
+- **Base**: `plan/notification-filtering-api/phase-3`
+- **Commits**:
+  - `0721021 Document filtering API and bump version to 1.5.0`
+  - `d4a4d81 Stamp created and modified in fake backends` (correctness fix found while verifying the
+    README examples, plus its RELEASE_NOTES Bug Fixes note)
+- **Review**: reviewer claude-opus-4-8 (project default Tier 4). One borderline SHOULD-FIX (add a
+  RELEASE_NOTES Bug Fixes note for the fake stamping) — applied. Everything else verified clean by
+  execution: every doc claim checked against the code, the fake-fix invariants probed, JSON
+  round-trip (including legacy files missing the keys) confirmed.
 
-## Remaining phases
+Summary:
 
-- **Phase 4** — Documentation (Tier 2).
+- README "Filtering and Ordering Notifications" section (after in-app notifications, before the
+  Glossary): the filter grammar with worked nested examples including `not` wrapping `or`; ordering
+  and the `created_at`→`created` / `updated_at`→`modified` mapping; pagination and why the result is
+  an `Iterable`; the capability mechanism and the snake_case-fields / camelCase-keys asymmetry with
+  its rationale; the empty-filter-matches-all rule; `resend_notification` with an honest freshness
+  caveat; `tenant` is-not-authorization; and a query-governance note. **Every code example was
+  executed against `FakeFileBackend` and runs** (independently re-verified by the conductor,
+  including resend with byte-for-byte stored-context reuse).
+- RELEASE_NOTES 1.5.0 entry with Features, New exceptions, a **Bug Fixes** note for the fake
+  stamping, and a mandatory `### Backwards compatibility` section naming `filter_notifications` as
+  newly abstract on both backend ABCs. Version bumped 1.4.0 → 1.5.0 — per the plan's Risk & Rollout
+  Notes, a new abstract seam method is a minor-with-mandatory-note under AGENTS.md.
+- **Correctness fix**: `FakeFileBackend` / `FakeAsyncIOFileBackend` never stamped `created` /
+  `modified`, so `created_at_range` matched nothing and the default `created`-desc "newest first"
+  ordering degenerated to id-order for service-created notifications. Both fakes now stamp them at
+  creation (one shared timestamp), advance `modified` on updates and status transitions (reusing the
+  Phase-1 single-`now` bulk timestamp), and round-trip both through JSON (a gap that was also
+  silently dropping them). 10 regression tests added.
+
+Gates: `ruff check` clean, `ruff format --check` clean, `mypy` clean (42 source files),
+`pytest` **291 passed** (281 baseline + 10 new).
 
 ## Deferred phases
 
