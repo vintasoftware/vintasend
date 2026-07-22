@@ -8,10 +8,13 @@ from vintasend.services.utils import get_class_path
 
 
 if TYPE_CHECKING:
+    from vintasend.services.attachment_managers.base import BaseAttachmentManager
     from vintasend.services.dataclasses import (
+        AnyNotificationAttachment,
+        AttachmentFileRecord,
         Notification,
-        NotificationAttachment,
         OneOffNotification,
+        StoredAttachment,
         UpdateNotificationKwargs,
     )
 
@@ -28,6 +31,10 @@ class BaseNotificationBackend(ABC):
         self.backend_import_str = get_class_path(self)
         self.config = kwargs.pop("config", None)
         self.backend_kwargs = kwargs
+        # A backend never reads or writes a byte itself. When the service is configured
+        # with an attachment manager it injects it here; otherwise this stays None and the
+        # backend simply persists notifications without attachments.
+        self._attachment_manager: "BaseAttachmentManager | None" = None
 
     @abstractmethod
     def get_all_pending_notifications(self) -> Iterable["Notification | OneOffNotification"]: ...
@@ -68,7 +75,7 @@ class BaseNotificationBackend(ABC):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
-        attachments: list["NotificationAttachment"] | None = None,
+        attachments: list["AnyNotificationAttachment"] | None = None,
     ) -> "Notification": ...
 
     @abstractmethod
@@ -86,7 +93,7 @@ class BaseNotificationBackend(ABC):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
-        attachments: list["NotificationAttachment"] | None = None,
+        attachments: list["AnyNotificationAttachment"] | None = None,
     ) -> "OneOffNotification": ...
 
     @abstractmethod
@@ -214,3 +221,81 @@ class BaseNotificationBackend(ABC):
         context: dict,
         adapter_import_str: str,
     ) -> None: ...
+
+    def inject_attachment_manager(self, manager: "BaseAttachmentManager") -> None:
+        """Store the attachment manager the service resolved for this backend.
+
+        Concrete (not abstract) on purpose: a backend that does not do attachments needs
+        no changes and simply never has a manager injected. ``supports_attachments`` uses
+        the presence of this method to decide whether to inject at all, so a backend that
+        predates the attachment seam -- and therefore lacks this method -- is skipped
+        rather than erroring.
+        """
+        self._attachment_manager = manager
+
+    @abstractmethod
+    def store_attachment_file_record(
+        self, record: "AttachmentFileRecord"
+    ) -> "AttachmentFileRecord":
+        """Persist a checksum-indexed file record and return it.
+
+        The backend owns only the row; the bytes it describes were written by the
+        injected attachment manager.
+        """
+        ...
+
+    @abstractmethod
+    def get_attachment_file_record(self, file_id: str) -> "AttachmentFileRecord | None":
+        """Return the file record with ``file_id``, or None if there is none."""
+        ...
+
+    @abstractmethod
+    def find_attachment_file_by_checksum(
+        self, checksum: str, size: int
+    ) -> "AttachmentFileRecord | None":
+        """Return an existing file record matching both ``checksum`` and ``size``.
+
+        Size is compared alongside the sha256 digest so that a digest collision degrades
+        to a miss (a fresh upload) rather than silently serving the wrong file.
+        """
+        ...
+
+    @abstractmethod
+    def delete_attachment_file(self, file_id: str) -> None:
+        """Delete the file record with ``file_id``.
+
+        Deleting the underlying bytes is a separate, manager-driven step; this only drops
+        the row.
+        """
+        ...
+
+    @abstractmethod
+    def get_orphaned_attachment_files(self) -> "Iterable[AttachmentFileRecord]":
+        """Return file records no longer referenced by any notification join row."""
+        ...
+
+    @abstractmethod
+    def get_attachments(
+        self, notification_id: int | str | uuid.UUID
+    ) -> "Iterable[StoredAttachment]":
+        """Return the stored attachments for a notification.
+
+        Each file handle is rebuilt by handing the record's ``storage_identifiers`` back
+        to the injected attachment manager.
+        """
+        ...
+
+    @abstractmethod
+    def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
+        """Delete a single notification attachment join row by its own id."""
+        ...
+
+
+def supports_attachments(backend: "BaseNotificationBackend") -> bool:
+    """Whether ``backend`` accepts an injected attachment manager.
+
+    Duck-typed rather than an ``isinstance`` check so a backend that predates the
+    attachment seam -- and therefore does not expose ``inject_attachment_manager`` -- is
+    transparently treated as attachment-unaware instead of breaking.
+    """
+    return hasattr(backend, "inject_attachment_manager")

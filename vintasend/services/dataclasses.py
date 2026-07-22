@@ -267,4 +267,9 @@ class UpdateNotificationKwargs(TypedDict, total=False):
     subject_template: str | None
     preheader_template: str | None
     adapter_extra_parameters: dict | None
+    # This stays `StoredAttachment`, not `AnyNotificationAttachment`. The plan's Open Questions
+    # table suggested widening it. We did not do that. `persist_notification_update` has no upload
+    # path. It just does `setattr` for every field. A raw attachment passed here would be saved as
+    # if it were already stored, which is wrong. Revisit this if an update-side upload flow is
+    # ever added.
     attachments: list[StoredAttachment]

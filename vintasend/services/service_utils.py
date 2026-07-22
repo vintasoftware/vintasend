@@ -3,11 +3,12 @@ import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Coroutine, TypeGuard
 
-from vintasend.exceptions import InvalidOneOffNotificationRecipientError
+from vintasend.exceptions import InvalidOneOffNotificationRecipientError, NotificationError
+from vintasend.services.dataclasses import NotificationAttachment, is_attachment_reference
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import NotificationAttachment, NotificationContextDict
+    from vintasend.services.dataclasses import AnyNotificationAttachment, NotificationContextDict
 
 
 # These mirror the TS patterns `^.+@.+\..+$` and `^\+?[0-9]{10,15}$`, but unanchored: matching
@@ -32,14 +33,21 @@ def validate_email_or_phone(email_or_phone: str) -> None:
 
 
 def validate_attachments(
-    attachments: list["NotificationAttachment"],
-) -> list["NotificationAttachment"]:
-    """Validate attachments and return the validated list."""
-    # Attachments pass through unchanged for now; no validation is applied yet.
+    attachments: list["AnyNotificationAttachment"],
+) -> list["AnyNotificationAttachment"]:
+    """Validate attachment inputs and return the validated list unchanged.
+
+    Each entry must be either a ``NotificationAttachment`` upload or a
+    ``NotificationAttachmentReference`` by-id reference; a reference must carry a
+    non-empty ``file_id``. Anything else raises ``NotificationError`` rather than failing
+    obscurely deeper in the persist flow.
+    """
     for attachment in attachments:
-        if attachment.is_url():
-            # Nothing is validated yet.
-            pass
+        if is_attachment_reference(attachment):
+            if not attachment.file_id:
+                raise NotificationError("Attachment reference must carry a non-empty file_id")
+        elif not isinstance(attachment, NotificationAttachment):
+            raise NotificationError(f"Unsupported attachment type: {type(attachment).__name__}")
 
     return attachments
 

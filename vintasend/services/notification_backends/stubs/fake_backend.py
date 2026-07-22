@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import hashlib
 import io
 import json
 import os
@@ -11,13 +10,20 @@ from typing import BinaryIO, cast
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import NotificationNotFoundError
+from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
+    FakeAsyncIOAttachmentManager,
+    FakeAttachmentManager,
+)
 from vintasend.services.dataclasses import (
+    AnyNotificationAttachment,
     AttachmentFile,
+    AttachmentFileRecord,
     Notification,
     NotificationAttachment,
     OneOffNotification,
     StoredAttachment,
     UpdateNotificationKwargs,
+    is_attachment_reference,
 )
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
@@ -58,6 +64,13 @@ class FakeFileBackend(BaseNotificationBackend):
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
         super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
+        # In-memory file records (keyed by id) and notification->file join rows. The bytes
+        # they describe live in the attachment manager, not here.
+        self._attachment_file_records: dict[str, AttachmentFileRecord] = {}
+        self._attachment_join_rows: list[dict] = []
+        # Default to the in-memory fake manager so the backend is usable standalone; the
+        # service replaces this via inject_attachment_manager when one is configured.
+        self._attachment_manager = FakeAttachmentManager()
         try:
             notifications_file = open(self.database_file_name, encoding="utf-8")
         except FileNotFoundError:
@@ -74,6 +87,8 @@ class FakeFileBackend(BaseNotificationBackend):
 
     def clear(self):
         self.notifications = []
+        self._attachment_file_records = {}
+        self._attachment_join_rows = []
         try:
             os.remove(self.database_file_name)
         except FileNotFoundError:
@@ -255,12 +270,13 @@ class FakeFileBackend(BaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
     ) -> Notification:
-        stored_attachments = self._store_attachments(attachments or [])
+        notification_id = str(uuid.uuid4())
+        stored_attachments = self._store_attachments(attachments or [], notification_id)
 
         notification = Notification(
-            id=str(uuid.uuid4()),
+            id=notification_id,
             user_id=user_id,
             notification_type=notification_type,
             title=title,
@@ -279,74 +295,121 @@ class FakeFileBackend(BaseNotificationBackend):
         return notification
 
     def _store_attachments(
-        self, attachments: list[NotificationAttachment]
+        self,
+        attachments: list[AnyNotificationAttachment],
+        notification_id: int | str | uuid.UUID,
     ) -> list[StoredAttachment]:
-        """Store attachments in memory and return StoredAttachment instances"""
+        """Persist attachments by delegating every byte operation to the injected manager.
+
+        The backend never reads a file itself: it hands the upload to the manager, stores
+        the returned file record, writes a join row, and rebuilds the handle through the
+        manager. The checksum-dedup shortcut and reference-by-id resolution land in Phase
+        3; here only uploads are handled.
+        """
+        manager = self._attachment_manager
+        assert manager is not None  # noqa: S101 - the fake always has a default manager
         stored_attachments = []
 
         for attachment in attachments:
-            # Read file data from various sources
-            file_data = self._read_attachment_data(attachment.file)
-            attachment_id = str(uuid.uuid4())
+            if is_attachment_reference(attachment):
+                # Phase 3: resolve file_id -> existing record and write only a join row.
+                continue
+            # TypeGuard narrows only the positive branch, so restate the upload type.
+            assert isinstance(attachment, NotificationAttachment)  # noqa: S101
 
-            # Create fake attachment file
-            attachment_file = FakeFileAttachmentFile(file_data, attachment.filename)
+            record = manager.upload_file(
+                attachment.file, attachment.filename, attachment.content_type
+            )
+            self.store_attachment_file_record(record)
 
-            stored_attachment = StoredAttachment(
-                id=attachment_id,
-                filename=attachment.filename,
-                content_type=attachment.content_type or "application/octet-stream",
-                size=len(file_data),
-                checksum=hashlib.sha256(file_data).hexdigest(),
-                created_at=datetime.datetime.now(tz=datetime.timezone.utc),
-                file=attachment_file,
-                description=attachment.description,
-                is_inline=attachment.is_inline,
-                storage_identifiers={"storage_type": "in_memory"},
+            join_id = str(uuid.uuid4())
+            self._attachment_join_rows.append(
+                {
+                    "id": join_id,
+                    "notification_id": notification_id,
+                    "file_id": record.id,
+                    "description": attachment.description,
+                    "is_inline": attachment.is_inline,
+                }
             )
 
-            stored_attachments.append(stored_attachment)
+            attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers)
+            stored_attachments.append(
+                StoredAttachment(
+                    id=join_id,
+                    filename=record.filename,
+                    content_type=record.content_type,
+                    size=record.size,
+                    checksum=record.checksum,
+                    created_at=record.created_at,
+                    file=attachment_file,
+                    description=attachment.description,
+                    is_inline=attachment.is_inline,
+                    file_id=record.id,
+                    storage_identifiers=record.storage_identifiers,
+                )
+            )
 
         return stored_attachments
 
-    def _read_attachment_data(self, file) -> bytes:
-        """Read file data from various file-like object types"""
-        from pathlib import Path
+    def store_attachment_file_record(self, record: AttachmentFileRecord) -> AttachmentFileRecord:
+        self._attachment_file_records[record.id] = record
+        return record
 
-        if isinstance(file, bytes):
-            return file
-        if isinstance(file, str):
-            if self._is_url(file):
-                return self._download_from_url(file)
-            else:
-                # Read from file path
-                with open(file, "rb") as f:
-                    return f.read()
-        if isinstance(file, Path):
-            with open(file, "rb") as f:
-                return f.read()
-        if hasattr(file, "read"):
-            current_pos = file.tell() if hasattr(file, "tell") else 0
-            if hasattr(file, "seek"):
-                file.seek(0)
-            data = file.read()
-            if hasattr(file, "seek"):
-                file.seek(current_pos)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            return data
+    def get_attachment_file_record(self, file_id: str) -> AttachmentFileRecord | None:
+        return self._attachment_file_records.get(file_id)
 
-        raise ValueError(f"Unsupported file type: {type(file)}")
+    def find_attachment_file_by_checksum(
+        self, checksum: str, size: int
+    ) -> AttachmentFileRecord | None:
+        for record in self._attachment_file_records.values():
+            if record.checksum == checksum and record.size == size:
+                return record
+        return None
 
-    def _is_url(self, file_str: str) -> bool:
-        """Check if a string is a URL"""
-        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
+    def delete_attachment_file(self, file_id: str) -> None:
+        self._attachment_file_records.pop(file_id, None)
 
-    def _download_from_url(self, url: str) -> bytes:
-        """Download file content from URL (simplified for testing)"""
-        # For testing purposes, return dummy data
-        # In a real implementation, this would use requests or similar
-        return f"Downloaded content from {url}".encode()
+    def get_orphaned_attachment_files(self) -> list[AttachmentFileRecord]:
+        referenced = {row["file_id"] for row in self._attachment_join_rows}
+        return [
+            record
+            for file_id, record in self._attachment_file_records.items()
+            if file_id not in referenced
+        ]
+
+    def get_attachments(self, notification_id: int | str | uuid.UUID) -> list[StoredAttachment]:
+        manager = self._attachment_manager
+        assert manager is not None  # noqa: S101 - the fake always has a default manager
+        stored_attachments = []
+        for row in self._attachment_join_rows:
+            if str(row["notification_id"]) != str(notification_id):
+                continue
+            record = self._attachment_file_records.get(row["file_id"])
+            if record is None:
+                continue
+            attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers)
+            stored_attachments.append(
+                StoredAttachment(
+                    id=row["id"],
+                    filename=record.filename,
+                    content_type=record.content_type,
+                    size=record.size,
+                    checksum=record.checksum,
+                    created_at=record.created_at,
+                    file=attachment_file,
+                    description=row["description"],
+                    is_inline=row["is_inline"],
+                    file_id=record.id,
+                    storage_identifiers=record.storage_identifiers,
+                )
+            )
+        return stored_attachments
+
+    def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
+        self._attachment_join_rows = [
+            row for row in self._attachment_join_rows if str(row["id"]) != str(attachment_id)
+        ]
 
     def persist_one_off_notification(
         self,
@@ -362,12 +425,13 @@ class FakeFileBackend(BaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
     ) -> OneOffNotification:
-        stored_attachments = self._store_attachments(attachments or [])
+        notification_id = uuid.uuid4()
+        stored_attachments = self._store_attachments(attachments or [], notification_id)
 
         notification = OneOffNotification(
-            id=uuid.uuid4(),
+            id=notification_id,
             email_or_phone=email_or_phone,
             first_name=first_name,
             last_name=last_name,
@@ -567,6 +631,13 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
         super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
+        # In-memory file records (keyed by id) and notification->file join rows. The bytes
+        # they describe live in the attachment manager, not here.
+        self._attachment_file_records: dict[str, AttachmentFileRecord] = {}
+        self._attachment_join_rows: list[dict] = []
+        # Default to the in-memory fake manager so the backend is usable standalone; the
+        # service replaces this via inject_attachment_manager when one is configured.
+        self._attachment_manager = FakeAsyncIOAttachmentManager()
         try:
             notifications_file = open(self.database_file_name, encoding="utf-8")
         except FileNotFoundError:
@@ -583,80 +654,136 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
     async def clear(self):
         self.notifications = []
+        self._attachment_file_records = {}
+        self._attachment_join_rows = []
         try:
             os.remove(self.database_file_name)
         except FileNotFoundError:
             pass
 
-    def _store_attachments(
-        self, attachments: list[NotificationAttachment]
+    async def _store_attachments(
+        self,
+        attachments: list[AnyNotificationAttachment],
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
     ) -> list[StoredAttachment]:
-        """Store attachments in memory and return StoredAttachment instances"""
+        """Persist attachments by delegating every byte operation to the injected manager.
+
+        The backend never reads a file itself: it hands the upload to the (async) manager,
+        stores the returned file record, writes a join row, and rebuilds the handle through
+        the manager. The checksum-dedup shortcut and reference-by-id resolution land in
+        Phase 3; here only uploads are handled.
+        """
+        manager = self._attachment_manager
+        assert manager is not None  # noqa: S101 - the fake always has a default manager
         stored_attachments = []
 
         for attachment in attachments:
-            # Read file data from various sources
-            file_data = self._read_attachment_data(attachment.file)
-            attachment_id = str(uuid.uuid4())
+            if is_attachment_reference(attachment):
+                # Phase 3: resolve file_id -> existing record and write only a join row.
+                continue
+            # TypeGuard narrows only the positive branch, so restate the upload type.
+            assert isinstance(attachment, NotificationAttachment)  # noqa: S101
 
-            # Create fake attachment file
-            attachment_file = FakeFileAttachmentFile(file_data, attachment.filename)
+            record = await manager.upload_file(
+                attachment.file, attachment.filename, attachment.content_type
+            )
+            await self.store_attachment_file_record(record, lock)
 
-            stored_attachment = StoredAttachment(
-                id=attachment_id,
-                filename=attachment.filename,
-                content_type=attachment.content_type or "application/octet-stream",
-                size=len(file_data),
-                checksum=hashlib.sha256(file_data).hexdigest(),
-                created_at=datetime.datetime.now(tz=datetime.timezone.utc),
-                file=attachment_file,
-                description=attachment.description,
-                is_inline=attachment.is_inline,
-                storage_identifiers={"storage_type": "in_memory"},
+            join_id = str(uuid.uuid4())
+            self._attachment_join_rows.append(
+                {
+                    "id": join_id,
+                    "notification_id": notification_id,
+                    "file_id": record.id,
+                    "description": attachment.description,
+                    "is_inline": attachment.is_inline,
+                }
             )
 
-            stored_attachments.append(stored_attachment)
+            attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers)
+            stored_attachments.append(
+                StoredAttachment(
+                    id=join_id,
+                    filename=record.filename,
+                    content_type=record.content_type,
+                    size=record.size,
+                    checksum=record.checksum,
+                    created_at=record.created_at,
+                    file=attachment_file,
+                    description=attachment.description,
+                    is_inline=attachment.is_inline,
+                    file_id=record.id,
+                    storage_identifiers=record.storage_identifiers,
+                )
+            )
 
         return stored_attachments
 
-    def _read_attachment_data(self, file) -> bytes:
-        """Read file data from various file-like object types"""
-        from pathlib import Path
+    async def store_attachment_file_record(
+        self, record: AttachmentFileRecord, lock: asyncio.Lock | None = None
+    ) -> AttachmentFileRecord:
+        self._attachment_file_records[record.id] = record
+        return record
 
-        if isinstance(file, bytes):
-            return file
-        if isinstance(file, str):
-            if self._is_url(file):
-                return self._download_from_url(file)
-            else:
-                # Read from file path
-                with open(file, "rb") as f:
-                    return f.read()
-        if isinstance(file, Path):
-            with open(file, "rb") as f:
-                return f.read()
-        if hasattr(file, "read"):
-            current_pos = file.tell() if hasattr(file, "tell") else 0
-            if hasattr(file, "seek"):
-                file.seek(0)
-            data = file.read()
-            if hasattr(file, "seek"):
-                file.seek(current_pos)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            return data
+    async def get_attachment_file_record(self, file_id: str) -> AttachmentFileRecord | None:
+        return self._attachment_file_records.get(file_id)
 
-        raise ValueError(f"Unsupported file type: {type(file)}")
+    async def find_attachment_file_by_checksum(
+        self, checksum: str, size: int
+    ) -> AttachmentFileRecord | None:
+        for record in self._attachment_file_records.values():
+            if record.checksum == checksum and record.size == size:
+                return record
+        return None
 
-    def _is_url(self, file_str: str) -> bool:
-        """Check if a string is a URL"""
-        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
+    async def delete_attachment_file(self, file_id: str, lock: asyncio.Lock | None = None) -> None:
+        self._attachment_file_records.pop(file_id, None)
 
-    def _download_from_url(self, url: str) -> bytes:
-        """Download file content from URL (simplified for testing)"""
-        # For testing purposes, return dummy data
-        # In a real implementation, this would use requests or similar
-        return f"Downloaded content from {url}".encode()
+    async def get_orphaned_attachment_files(self) -> list[AttachmentFileRecord]:
+        referenced = {row["file_id"] for row in self._attachment_join_rows}
+        return [
+            record
+            for file_id, record in self._attachment_file_records.items()
+            if file_id not in referenced
+        ]
+
+    async def get_attachments(
+        self, notification_id: int | str | uuid.UUID
+    ) -> list[StoredAttachment]:
+        manager = self._attachment_manager
+        assert manager is not None  # noqa: S101 - the fake always has a default manager
+        stored_attachments = []
+        for row in self._attachment_join_rows:
+            if str(row["notification_id"]) != str(notification_id):
+                continue
+            record = self._attachment_file_records.get(row["file_id"])
+            if record is None:
+                continue
+            attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers)
+            stored_attachments.append(
+                StoredAttachment(
+                    id=row["id"],
+                    filename=record.filename,
+                    content_type=record.content_type,
+                    size=record.size,
+                    checksum=record.checksum,
+                    created_at=record.created_at,
+                    file=attachment_file,
+                    description=row["description"],
+                    is_inline=row["is_inline"],
+                    file_id=record.id,
+                    storage_identifiers=record.storage_identifiers,
+                )
+            )
+        return stored_attachments
+
+    async def delete_notification_attachment(
+        self, attachment_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+    ) -> None:
+        self._attachment_join_rows = [
+            row for row in self._attachment_join_rows if str(row["id"]) != str(attachment_id)
+        ]
 
     async def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
         return cast(
@@ -822,13 +949,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
         lock: asyncio.Lock | None = None,
     ) -> Notification:
-        stored_attachments = self._store_attachments(attachments or [])
+        notification_id = str(uuid.uuid4())
+        stored_attachments = await self._store_attachments(attachments or [], notification_id, lock)
 
         notification = Notification(
-            id=str(uuid.uuid4()),
+            id=notification_id,
             user_id=user_id,
             notification_type=notification_type,
             title=title,
@@ -860,13 +988,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         subject_template: str,
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
         lock: asyncio.Lock | None = None,
     ) -> OneOffNotification:
-        stored_attachments = self._store_attachments(attachments or [])
+        notification_id = uuid.uuid4()
+        stored_attachments = await self._store_attachments(attachments or [], notification_id, lock)
 
         notification = OneOffNotification(
-            id=uuid.uuid4(),
+            id=notification_id,
             email_or_phone=email_or_phone,
             first_name=first_name,
             last_name=last_name,
