@@ -2626,6 +2626,29 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             == "async-singleton-test@example.com"
         )
 
+    async def test_instanciate_with_adapter_kwargs_tuple_form(self):
+        """The sync service accepts an (import_str, kwargs) tuple as an adapter's first
+        element, and get_asyncio_notification_adapters already handles that shape too. The
+        async service's own construction guard must accept it as well.
+        """
+        service = AsyncIONotificationService(
+            notification_adapters=[
+                (
+                    (
+                        "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter",
+                        {"extra_config": "value"},
+                    ),
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend",
+            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
+        )
+
+        adapters = list(service.notification_adapters)
+        assert len(adapters) == 1
+        assert adapters[0].adapter_kwargs == {"extra_config": "value"}
+
 
 class NotificationServiceImportTestCase(TestCase):
     def test_importing_module_does_not_import_requests(self):

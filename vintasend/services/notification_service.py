@@ -735,7 +735,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
     def __init__(
         self,
-        notification_adapters: Iterable[AAIO] | Iterable[tuple[str, str]] | None = None,
+        notification_adapters: Iterable[AAIO]
+        | Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]
+        | None = None,
         notification_backend: BAIO | str | None = None,
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
@@ -777,20 +779,40 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ]
 
     def _check_is_base_notification_adapter_iterable(
-        self, notification_adapters: Iterable[AAIO] | Iterable[tuple[str, str]] | None
+        self,
+        notification_adapters: Iterable[AAIO]
+        | Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]
+        | None,
     ) -> TypeGuard[Iterable[AAIO]]:
         return notification_adapters is not None and all(
             isinstance(adapter, AsyncIOBaseNotificationAdapter) for adapter in notification_adapters
         )
 
     def _check_is_adapters_tuple_iterable(
-        self, notification_adapters: Iterable[AAIO] | Iterable[tuple[str, str]] | None
-    ) -> TypeGuard[Iterable[tuple[str, str]]]:
+        self,
+        notification_adapters: Iterable[AAIO]
+        | Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]
+        | None,
+    ) -> TypeGuard[Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]]:
         return notification_adapters is not None and all(
             (isinstance(adapter, tuple) or isinstance(adapter, list))
             and len(adapter) == 2
-            and isinstance(adapter[0], str)
-            and isinstance(adapter[1], str)
+            and (
+                isinstance(adapter[0], str)
+                or (
+                    isinstance(adapter[0], tuple)
+                    and isinstance(adapter[0][0], str)
+                    and isinstance(adapter[0][1], dict)
+                )
+            )
+            and (
+                isinstance(adapter[1], str)
+                or (
+                    isinstance(adapter[1], tuple)
+                    and isinstance(adapter[1][0], str)
+                    and isinstance(adapter[1][1], dict)
+                )
+            )
             for adapter in notification_adapters
         )
 
