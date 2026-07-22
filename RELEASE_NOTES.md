@@ -6,7 +6,7 @@
 
 * **Background notification sending via queue service:** Adapters now opt in to background delivery by subclassing `BackgroundNotificationAdapter` (sync) or `AsyncIOBackgroundNotificationAdapter` (AsyncIO). When a background-capable adapter is used, `send()` enqueues the notification id to the configured queue service and returns immediately; a worker calls the service's `delayed_send(notification_id)` to actually deliver it. This decouples web request latency from notification delivery.
 * **ID-only queue payloads:** The queue now carries only the notification id, not serialized notification data. The worker reloads the notification from the backend, which means context is generated at delivery time (not at enqueue time) and attachments work on the background path for the first time.
-* **Context generation in the worker:** Scheduled notifications render against current data when delivered, not against data from the enqueueing process, which is strictly more accurate.
+* **Context generation in the worker:** Scheduled notifications render against current data when delivered, not against data from the enqueueing process, which is more accurate.
 * **Service factory for worker processes:** `NOTIFICATION_SERVICE_FACTORY` points to a callable that returns a ready `NotificationService` or `AsyncIONotificationService` for the worker. The factory runs once per process and the result is cached, enabling ORM sessions scoped to the worker rather than rebuilt per task.
 * **AsyncIO background sending:** `AsyncIONotificationService` now supports background sending via `AsyncIOBackgroundNotificationAdapter` and `AsyncIOBaseNotificationQueueService`.
 

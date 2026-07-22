@@ -242,7 +242,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from vintasend.services.notification_service import NotificationService
 from vintasend_sqlalchemy.backends import SQLAlchemyNotificationBackend
-from myapp.queue_services import MyQueueService
 
 _engine = create_engine("postgresql://...")
 _SessionLocal = sessionmaker(bind=_engine)
@@ -254,7 +253,6 @@ def notification_service_factory():
     return NotificationService(
         notification_backend=backend,
         notification_adapters=[...],
-        notification_queue_service=MyQueueService(),
     )
 ```
 
@@ -299,6 +297,10 @@ class CeleryEmailAdapter(BackgroundNotificationAdapter):
         email_content = self.template_renderer.render(notification, context)
         # Send email (attachments are loaded from backend)
         self._send_email(notification.email_or_phone, email_content, notification.attachments)
+
+    def delayed_send(self, notification_id):
+        # Marker only -- core never calls this. Delivery happens in send() above.
+        pass
 ```
 
 ### Attachments in Background Sends
@@ -422,6 +424,10 @@ class MyAsyncIOBackgroundAdapter(AsyncIOBackgroundNotificationAdapter):
         # Worker calls this to deliver
         email_content = self.template_renderer.render(notification, context)
         await self._send_email(notification, email_content)
+
+    async def delayed_send(self, notification_id):
+        # Marker only -- core never calls this. Delivery happens in send() above.
+        pass
 
 notifications_service = AsyncIONotificationService(
     notification_adapters=[MyAsyncIOBackgroundAdapter(...)],

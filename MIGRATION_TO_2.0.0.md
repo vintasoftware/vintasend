@@ -31,9 +31,9 @@ If you do not catch these exceptions, no code change is needed — the notificat
 
 ## 2. Service-Level `delayed_send()` Signature Change
 
-In 1.x, adapters declared background support by subclassing `AsyncBaseNotificationAdapter` and implementing `delayed_send(notification_dict, context_dict)`. That method was never called by core — it existed only as a marker — and serializing the notification and context into the payload meant attachments could not work in background sends.
+In 1.x, adapters declared background support by subclassing `AsyncBaseNotificationAdapter` and implementing `delayed_send(notification_dict, context_dict)`. This method WAS the background delivery method: the worker called `NotificationService.delayed_send(notification_dict, context_dict)`, which called the adapter's `delayed_send(notification_dict, context_dict)` to do the actual send. Serializing the notification and context into the queue payload meant attachments could not work in background sends.
 
-In 2.0, the adapter's marker method is still there (now `delayed_send(notification_id)`, taking only an id) but core never calls it. Instead, the service-level `delayed_send(notification_id)` loads the notification, generates context in the worker, and calls the adapter's `send()` — the same method the foreground path uses.
+In 2.0, delivery moves to the adapter's `send()`. The service-level `delayed_send(notification_id)` loads the notification, generates context in the worker, and calls the adapter's `send()` — the same method the foreground path uses. The adapter's own `delayed_send(notification_id)` becomes a pure marker method that core never calls; only its presence matters, to declare the adapter as background-capable.
 
 **If you maintain an adapter** that subclasses `AsyncBaseNotificationAdapter` (now `BackgroundNotificationAdapter`):
 
@@ -45,8 +45,8 @@ class MyBackgroundAdapter(AsyncBaseNotificationAdapter):
         pass
     
     def delayed_send(self, notification_dict, context_dict):
-        # 1.x: background delivery code lived here
-        # This was never called by core; it was only a marker
+        # 1.x: this was the actual background delivery method
+        # The worker called service.delayed_send(...), which called this
         self._send_email(notification_dict, context_dict)
 ```
 
@@ -239,7 +239,7 @@ If you use a different queue system (SQS, Redis, Kafka, etc.), follow the same p
 
 In 1.x, context was generated when the notification was enqueued, and a serialized copy was sent to the worker. Scheduled notifications rendered against data from the enqueueing process.
 
-In 2.0, context is generated in the worker at delivery time, so scheduled notifications render against current data. The `store_context_used` field now records what the worker actually rendered, which is strictly more accurate.
+In 2.0, context is generated in the worker at delivery time, so scheduled notifications render against current data. The `store_context_used` field now records what the worker actually rendered, which is more accurate.
 
 For most applications this is invisible and beneficial. If your code relies on the stored context reflecting the enqueueing time (rare), you may need to capture that timestamp separately before enqueueing.
 
