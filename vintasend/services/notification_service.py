@@ -1,13 +1,10 @@
 import asyncio
 import datetime
-import inspect
 import logging
 import sys
 import uuid
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
-
-import requests
 
 from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -51,6 +48,14 @@ from vintasend.services.notification_adapters.async_base import (
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.service_utils import (
+    download_from_url,
+    is_asyncio_context_function,
+    is_sync_context_function,
+    is_url,
+    read_file_data,
+    validate_attachments,
+)
 from vintasend.services.utils import get_class_path
 from vintasend.utils.singleton_utils import SingletonMeta
 
@@ -180,56 +185,20 @@ class NotificationService(Generic[A, B]):
     def _validate_attachments(
         self, attachments: list[NotificationAttachment]
     ) -> list[NotificationAttachment]:
-        """Validate attachments and return the validated list"""
-        # For now, just pass through the attachments
-        # In the future, this can include validation logic like:
-        # - File size limits
-        # - Content type validation
-        # - URL validation
-        # - Security checks
-        for attachment in attachments:
-            if attachment.is_url():
-                # URL validation is already handled in the is_url() method
-                pass
-
-        return attachments
+        """Validate attachments and return the validated list."""
+        return validate_attachments(attachments)
 
     def _read_file_data(self, file) -> bytes:
-        """Read file data from various file-like object types"""
-        from pathlib import Path
-
-        if isinstance(file, str):
-            if self._is_url(file):
-                return self._download_from_url(file)
-            else:
-                # Read from file path
-                with open(file, "rb") as f:
-                    return f.read()
-        elif isinstance(file, Path):
-            with open(file, "rb") as f:
-                return f.read()
-        elif hasattr(file, "read"):
-            current_pos = file.tell() if hasattr(file, "tell") else 0
-            if hasattr(file, "seek"):
-                file.seek(0)
-            data = file.read()
-            if hasattr(file, "seek"):
-                file.seek(current_pos)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            return data
-        else:
-            raise ValueError(f"Unsupported file type: {type(file)}")
+        """Read file data from a path, URL, `Path` object, or file-like object."""
+        return read_file_data(file)
 
     def _is_url(self, file_str: str) -> bool:
-        """Check if a string is a URL"""
-        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
+        """Check whether a string is a URL rather than a local file path."""
+        return is_url(file_str)
 
     def _download_from_url(self, url: str) -> bytes:
-        """Download file content from URL"""
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.content
+        """Download file content from a URL."""
+        return download_from_url(url)
 
     def send(self, notification: Notification | OneOffNotification) -> None:
         """
@@ -481,14 +450,14 @@ class NotificationService(Generic[A, B]):
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], Coroutine[Any, Any, NotificationContextDict]]]:
-        return inspect.iscoroutinefunction(context_function)
+        return is_asyncio_context_function(context_function)
 
     def _is_sync_context_function(
         self,
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
-        return not inspect.iscoroutinefunction(context_function)
+        return is_sync_context_function(context_function)
 
     def get_notification_context(
         self, notification: Notification | OneOffNotification
@@ -824,61 +793,20 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     def _validate_attachments(
         self, attachments: list[NotificationAttachment]
     ) -> list[NotificationAttachment]:
-        """Validate attachments and return the validated list"""
-        # For now, just pass through the attachments
-        # In the future, this can include validation logic like:
-        # - File size limits
-        # - Content type validation
-        # - URL validation
-        # - Security checks
-        for attachment in attachments:
-            if attachment.is_url():
-                # URL validation is already handled in the is_url() method
-                pass
-
-        return attachments
+        """Validate attachments and return the validated list."""
+        return validate_attachments(attachments)
 
     def _read_file_data(self, file) -> bytes:
-        """Read file data from various file-like object types"""
-        from pathlib import Path
-
-        if isinstance(file, str):
-            if self._is_url(file):
-                return self._download_from_url(file)
-            else:
-                # Read from file path
-                with open(file, "rb") as f:
-                    return f.read()
-        elif isinstance(file, Path):
-            with open(file, "rb") as f:
-                return f.read()
-        elif hasattr(file, "read"):
-            current_pos = file.tell() if hasattr(file, "tell") else 0
-            if hasattr(file, "seek"):
-                file.seek(0)
-            data = file.read()
-            if hasattr(file, "seek"):
-                file.seek(current_pos)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            return data
-        else:
-            raise ValueError(f"Unsupported file type: {type(file)}")
+        """Read file data from a path, URL, `Path` object, or file-like object."""
+        return read_file_data(file)
 
     def _is_url(self, file_str: str) -> bool:
-        """Check if a string is a URL"""
-        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
+        """Check whether a string is a URL rather than a local file path."""
+        return is_url(file_str)
 
     def _download_from_url(self, url: str) -> bytes:
-        """Download file content from URL"""
-        try:
-            import requests
-        except ImportError as e:
-            raise ImportError("requests library is required to download files from URLs") from e
-
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.content
+        """Download file content from a URL."""
+        return download_from_url(url)
 
     async def send(
         self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None
@@ -1157,14 +1085,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], Coroutine[Any, Any, NotificationContextDict]]]:
-        return inspect.iscoroutinefunction(context_function)
+        return is_asyncio_context_function(context_function)
 
     def _is_sync_context_function(
         self,
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
-        return not inspect.iscoroutinefunction(context_function)
+        return is_sync_context_function(context_function)
 
     async def _send_notification_with_error_logging(
         self, notification: "Notification | OneOffNotification", lock: asyncio.Lock | None = None

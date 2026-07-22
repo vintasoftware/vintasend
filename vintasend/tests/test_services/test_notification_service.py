@@ -1,4 +1,6 @@
 import datetime
+import subprocess
+import sys
 import uuid
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
@@ -2490,3 +2492,23 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert service.notification_backend == notification_backend
         assert service.notification_adapters == notification_adapters
+
+
+class NotificationServiceImportTestCase(TestCase):
+    def test_importing_module_does_not_import_requests(self):
+        """Importing notification_service must not pull in requests as a side effect.
+
+        requests is only needed by service_utils.download_from_url, which imports it lazily
+        at call time, so a bare import of the service module must not add it to sys.modules.
+        """
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import vintasend.services.notification_service, sys; "
+                "assert 'requests' not in sys.modules",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr

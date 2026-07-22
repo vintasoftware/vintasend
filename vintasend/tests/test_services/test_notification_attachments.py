@@ -955,7 +955,7 @@ class TestNotificationServiceFileHandling(TestCase):
         finally:
             os.unlink(temp_file_path)
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_read_file_data_with_url(self, mock_get):
         """Test _read_file_data with URL (should call _download_from_url)"""
         # Mock the requests.get response
@@ -1058,7 +1058,7 @@ class TestNotificationServiceUrlHandling(TestCase):
             result = self.service._is_url(url)
             assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_download_from_url_success(self, mock_get):
         """Test _download_from_url with successful download"""
         # Mock the requests.get response
@@ -1074,7 +1074,7 @@ class TestNotificationServiceUrlHandling(TestCase):
         assert result == b"Mocked document content"
         mock_get.assert_called_once_with(url, timeout=30)
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_download_from_url_different_schemes(self, mock_get):
         """Test _download_from_url with different URL schemes"""
         # Mock the requests.get response
@@ -1098,16 +1098,31 @@ class TestNotificationServiceUrlHandling(TestCase):
         for url in urls:
             mock_get.assert_any_call(url, timeout=30)
 
-    @patch("vintasend.services.notification_service.requests")
-    def test_download_from_url_import_error(self, mock_requests):
-        """Test _download_from_url handles missing requests library"""
-        # This test is for the sync version which doesn't have try/except for imports
-        # But we can test the scenario where requests module fails to import
-        mock_requests.get.side_effect = ImportError("No module named 'requests'")
+    @patch("requests.get")
+    def test_download_from_url_import_error(self, mock_get):
+        """Test _download_from_url propagates an ImportError raised while downloading"""
+        mock_get.side_effect = ImportError("No module named 'requests'")
 
         url = "https://example.com/test-import.pdf"
 
         with pytest.raises(ImportError):
+            self.service._download_from_url(url)
+
+    @patch("builtins.__import__")
+    def test_download_from_url_requests_import_error(self, mock_import):
+        """Test _download_from_url handles missing requests library"""
+
+        # Mock __import__ to raise ImportError for 'requests' module
+        def side_effect(name, *args, **kwargs):
+            if name == "requests":
+                raise ImportError("No module named 'requests'")
+            return __import__(name, *args, **kwargs)
+
+        mock_import.side_effect = side_effect
+
+        url = "https://example.com/test-import.pdf"
+
+        with pytest.raises(ImportError, match="requests library is required"):
             self.service._download_from_url(url)
 
 
@@ -1182,7 +1197,7 @@ class TestAsyncNotificationServiceFileHandling(IsolatedAsyncioTestCase):
         finally:
             os.unlink(temp_file_path)
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_async_read_file_data_with_url(self, mock_get):
         """Test async _read_file_data with URL"""
         # Mock the requests.get response
@@ -1235,7 +1250,7 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
             result = self.service._is_url(url)
             assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_async_download_from_url_success(self, mock_get):
         """Test async _download_from_url with successful download"""
         # Mock the requests.get response
@@ -1267,7 +1282,7 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
         with pytest.raises(ImportError, match="requests library is required"):
             self.service._download_from_url(url)
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_async_download_from_url_different_schemes(self, mock_get):
         """Test async _download_from_url with different URL schemes"""
         # Mock the requests.get response
@@ -1332,7 +1347,7 @@ class TestFileHandlingEdgeCases(TestCase):
         assert result == large_data
         assert len(result) == 10000
 
-    @patch("vintasend.services.notification_service.requests.get")
+    @patch("requests.get")
     def test_url_handling_with_query_parameters(self, mock_get):
         """Test URL handling with query parameters and fragments"""
         # Mock the requests.get response
