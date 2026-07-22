@@ -7,7 +7,7 @@ A flexible package for implementing transactional notifications in Python projec
 * **Scheduling notifications**: Storing notifications to be send in the future. The notification's context for rendering the template is only evaluated at the moment the notification is sent due to the lib's context generation registry.
 * **Notification context fetched at send time**: On scheduled notifications, we only get the notification context at the send time, so we always get the most up-to-date information.
 * **AsyncIO Support**: We have two different versions of our service, one that only supports sync backends/adapters, and the other that only supports AsyncIO backends/adapters. 
-* **File Attachments**: Support for adding file attachments to notifications with various input types including file paths, URLs, bytes data, and file-like objects.
+* **File Attachments**: Support for adding file attachments to notifications with various input types including file paths, URLs, bytes data, and file-like objects. File storage is a pluggable seam of its own — see [Attachment storage](#attachment-storage) below and [ATTACHMENTS.md](ATTACHMENTS.md) for the full picture.
 * **One-off Notifications**: Send notifications directly to email addresses or phone numbers without requiring user IDs from your database.
 * **Flexible backend**: Your projects database is getting slow after you created the first milion notifications? You can migrate to a faster no-sql database with a blink of an eye without affecting how you send the notifications.
 * **Flexible adapters**: Your project probably will need to change how it sends notifications overtime. This package allows to change the adapter without having to change how notifications templates are rendered or how the notification themselves are stored.
@@ -118,6 +118,41 @@ notifications_service.create_notification(
 )
 ```
 
+### Attachment storage
+
+The bytes behind an attachment are stored by an **attachment manager**, a fourth pluggable seam
+alongside the backend, adapter, and template renderer. A notification backend never opens a file,
+calls S3, or downloads a URL itself — it only persists a checksum-indexed file record and a join
+row, and hands an opaque `storage_identifiers` value back to whichever manager is configured.
+
+Pass a manager to the service the same way you pass a backend or an adapter, either as an instance
+or a dotted import string, or configure it once through the `NOTIFICATION_ATTACHMENT_MANAGER`
+setting:
+
+```python
+notifications_service = NotificationService(
+    notification_adapters=[MyAdapter(MyTemplateRenderer(), notification_backend)],
+    notification_backend=notification_backend,
+    attachment_manager=MyAttachmentManager(),  # or a dotted import string
+)
+```
+
+A backend written before this seam existed needs no changes: injection is duck-typed, so a
+backend without an `inject_attachment_manager` method simply never receives one and keeps working
+without attachment support.
+
+Identical uploads are deduplicated by checksum, so attaching the same bytes twice stores one file
+record and two lightweight join rows rather than two copies. You can also skip uploading entirely
+and attach an already-stored file by id, with `NotificationAttachmentReference(file_id=...)`
+instead of `NotificationAttachment(file=...)`.
+
+`AsyncIONotificationService` takes the same `attachment_manager` argument and works against an
+`AsyncIOBaseAttachmentManager`.
+
+See [ATTACHMENTS.md](ATTACHMENTS.md) for the manager's ABC, the full data model
+(`AttachmentFileRecord`, `StoredAttachment`, `StorageIdentifiers`), the seven methods a
+notification backend implements, and the orphaned-file reclamation pattern.
+
 ### One-off Notifications
 
 VintaSend also supports one-off notifications for sending notifications directly to email addresses or phone numbers without requiring a user ID from your database:
@@ -217,6 +252,7 @@ The `AsyncIONotificationService` exposes the same methods as coroutines (`await 
 * **Context name**: The registered name of a context generator. It's stored in the notification so the context generator is called at the moment the notification will be sent.
 * **Context registry**: We store all registered context generators on a Singleton class, we call it context registry.
 * **Notification Attachment**: Files that can be attached to notifications, supporting various input types including file paths, URLs, bytes data, and file-like objects.
+* **Attachment Manager**: It is a class that implements the methods necessary to store, read, and delete the bytes behind a notification attachment, so the notification backend only ever handles rows, never files.
 * **One-off Notification**: A notification sent directly to an email address or phone number without requiring a user ID from your database. 
 
 
