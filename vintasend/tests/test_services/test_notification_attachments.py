@@ -20,6 +20,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from vintasend.exceptions import (
+    AttachmentFileNotFoundError,
+    AttachmentUploadError,
+    NotificationError,
+)
 from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
     FakeAsyncIOAttachmentManager,
     FakeAttachmentManager,
@@ -27,6 +32,7 @@ from vintasend.services.attachment_managers.stubs.fake_attachment_manager import
 from vintasend.services.dataclasses import (
     Notification,
     NotificationAttachment,
+    NotificationAttachmentReference,
     NotificationContextDict,
     StoredAttachment,
 )
@@ -1099,3 +1105,252 @@ class TestAsyncIODuckTypedInjectionIsOptional(IsolatedAsyncioTestCase):
 
         assert notification.attachments == []
         assert len(self.backend.notifications) == 1
+
+
+class TestFakeFileBackendAttachmentDedup(TestCase):
+    """Checksum + size dedup and reference-by-id resolution in `_store_attachments`."""
+
+    def setUp(self):
+        self.backend = FakeFileBackend(storage_dir="/tmp/test_attachment_dedup")
+        self.manager = FakeAttachmentManager()
+        self.backend.inject_attachment_manager(self.manager)
+
+    def test_identical_bytes_dedup_one_record_two_join_rows(self):
+        data = b"same bytes"
+        attachment_a = NotificationAttachment(filename="a.txt", file=data)
+        attachment_b = NotificationAttachment(filename="b.txt", file=data)
+
+        stored_a = self.backend._store_attachments([attachment_a], "notif-a")
+        stored_b = self.backend._store_attachments([attachment_b], "notif-b")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 2
+        assert stored_a[0].file_id == stored_b[0].file_id
+        # The second upload dedups onto the first-stored `AttachmentFileRecord`, so both
+        # handles report the filename that record was created with.
+        assert stored_a[0].filename == "a.txt"
+        assert stored_b[0].filename == "a.txt"
+
+    def test_differing_bytes_create_two_records(self):
+        attachment_a = NotificationAttachment(filename="a.txt", file=b"content one")
+        attachment_b = NotificationAttachment(filename="b.txt", file=b"content two")
+
+        self.backend._store_attachments([attachment_a], "notif-a")
+        self.backend._store_attachments([attachment_b], "notif-b")
+
+        assert len(self.backend._attachment_file_records) == 2
+
+    def test_reference_to_missing_file_id_raises(self):
+        reference = NotificationAttachmentReference(file_id="does-not-exist")
+        with pytest.raises(AttachmentFileNotFoundError):
+            self.backend._store_attachments([reference], "notif-missing")
+
+    def test_reference_resolves_existing_record_with_only_a_join_row(self):
+        data = b"referenced bytes"
+        upload = NotificationAttachment(filename="orig.txt", file=data)
+        stored_upload = self.backend._store_attachments([upload], "notif-orig")[0]
+
+        reference = NotificationAttachmentReference(
+            file_id=stored_upload.file_id, description="ref copy", is_inline=True
+        )
+        stored_ref = self.backend._store_attachments([reference], "notif-ref")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 2
+        assert stored_ref[0].file_id == stored_upload.file_id
+        assert stored_ref[0].description == "ref copy"
+        assert stored_ref[0].is_inline is True
+        assert stored_ref[0].get_file_data() == data
+
+    def test_empty_file_dedups(self):
+        attachment_a = NotificationAttachment(filename="empty1.txt", file=b"")
+        attachment_b = NotificationAttachment(filename="empty2.txt", file=b"")
+
+        stored_a = self.backend._store_attachments([attachment_a], "notif-empty-a")
+        stored_b = self.backend._store_attachments([attachment_b], "notif-empty-b")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 2
+        assert stored_a[0].file_id == stored_b[0].file_id
+        assert stored_a[0].size == 0
+
+    def test_reference_and_upload_of_same_bytes_on_one_notification(self):
+        data = b"shared on one notification"
+        upload = NotificationAttachment(filename="upload.txt", file=data)
+        stored_upload = self.backend._store_attachments([upload], "notif-combo")[0]
+
+        reference = NotificationAttachmentReference(file_id=stored_upload.file_id)
+        second_upload = NotificationAttachment(filename="second.txt", file=data)
+
+        stored = self.backend._store_attachments([reference, second_upload], "notif-combo")
+
+        assert len(self.backend._attachment_file_records) == 1
+        # 1 join row from the first upload + 1 reference + 1 dedup'd upload = 3.
+        assert len(self.backend._attachment_join_rows) == 3
+        assert stored[0].file_id == stored_upload.file_id
+        assert stored[1].file_id == stored_upload.file_id
+
+
+class TestFakeFileBackendAttachmentOrphans(TestCase):
+    """Orphan detection and the two-step, caller-driven reclamation."""
+
+    def setUp(self):
+        self.backend = FakeFileBackend(storage_dir="/tmp/test_attachment_orphans")
+        self.manager = FakeAttachmentManager()
+        self.backend.inject_attachment_manager(self.manager)
+
+    def test_shared_file_survives_until_both_notifications_release_it(self):
+        data = b"shared file across notifications"
+        attachment_1 = NotificationAttachment(filename="one.txt", file=data)
+        attachment_2 = NotificationAttachment(filename="two.txt", file=data)
+
+        stored_1 = self.backend._store_attachments([attachment_1], "notif-1")[0]
+        stored_2 = self.backend._store_attachments([attachment_2], "notif-2")[0]
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert self.backend.get_orphaned_attachment_files() == []
+
+        # Deleting notification 1's join row (what a real backend's cascade would do).
+        self.backend.delete_notification_attachment(stored_1.id)
+        assert self.backend.get_orphaned_attachment_files() == []
+
+        # Deleting notification 2's join row leaves the file record unreferenced.
+        self.backend.delete_notification_attachment(stored_2.id)
+        orphaned = self.backend.get_orphaned_attachment_files()
+        assert len(orphaned) == 1
+        assert orphaned[0].id == stored_1.file_id
+
+        # The two-step reclamation itself: manager deletes bytes, backend drops the row.
+        self.manager.delete_file_by_identifiers(orphaned[0].storage_identifiers)
+        self.backend.delete_attachment_file(orphaned[0].id)
+        assert self.backend.get_attachment_file_record(orphaned[0].id) is None
+
+
+class TestAttachmentUploadErrorExists(TestCase):
+    """`AttachmentUploadError` exists and derives from `NotificationError`/`ValueError`."""
+
+    def test_is_a_notification_error_and_value_error(self):
+        error = AttachmentUploadError("upload failed")
+        assert isinstance(error, NotificationError)
+        assert isinstance(error, ValueError)
+
+
+class TestAsyncIOFakeFileBackendAttachmentDedup(IsolatedAsyncioTestCase):
+    """Async mirror of `TestFakeFileBackendAttachmentDedup`."""
+
+    async def asyncSetUp(self):
+        self.backend = FakeAsyncIOFileBackend(
+            database_file_name="async_attachment_dedup_notifications.json"
+        )
+        self.manager = FakeAsyncIOAttachmentManager()
+        self.backend.inject_attachment_manager(self.manager)
+
+    async def asyncTearDown(self):
+        await self.backend.clear()
+
+    async def test_identical_bytes_dedup_one_record_two_join_rows(self):
+        data = b"same async bytes"
+        attachment_a = NotificationAttachment(filename="a.txt", file=data)
+        attachment_b = NotificationAttachment(filename="b.txt", file=data)
+
+        stored_a = await self.backend._store_attachments([attachment_a], "notif-a")
+        stored_b = await self.backend._store_attachments([attachment_b], "notif-b")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 2
+        assert stored_a[0].file_id == stored_b[0].file_id
+
+    async def test_differing_bytes_create_two_records(self):
+        attachment_a = NotificationAttachment(filename="a.txt", file=b"async content one")
+        attachment_b = NotificationAttachment(filename="b.txt", file=b"async content two")
+
+        await self.backend._store_attachments([attachment_a], "notif-a")
+        await self.backend._store_attachments([attachment_b], "notif-b")
+
+        assert len(self.backend._attachment_file_records) == 2
+
+    async def test_reference_to_missing_file_id_raises(self):
+        reference = NotificationAttachmentReference(file_id="does-not-exist")
+        with pytest.raises(AttachmentFileNotFoundError):
+            await self.backend._store_attachments([reference], "notif-missing")
+
+    async def test_reference_resolves_existing_record_with_only_a_join_row(self):
+        data = b"async referenced bytes"
+        upload = NotificationAttachment(filename="orig.txt", file=data)
+        stored_upload = (await self.backend._store_attachments([upload], "notif-orig"))[0]
+
+        reference = NotificationAttachmentReference(
+            file_id=stored_upload.file_id, description="ref copy", is_inline=True
+        )
+        stored_ref = await self.backend._store_attachments([reference], "notif-ref")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 2
+        assert stored_ref[0].file_id == stored_upload.file_id
+        assert stored_ref[0].description == "ref copy"
+        assert stored_ref[0].is_inline is True
+        assert stored_ref[0].get_file_data() == data
+
+    async def test_empty_file_dedups(self):
+        attachment_a = NotificationAttachment(filename="empty1.txt", file=b"")
+        attachment_b = NotificationAttachment(filename="empty2.txt", file=b"")
+
+        stored_a = await self.backend._store_attachments([attachment_a], "notif-empty-a")
+        stored_b = await self.backend._store_attachments([attachment_b], "notif-empty-b")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 2
+        assert stored_a[0].file_id == stored_b[0].file_id
+        assert stored_a[0].size == 0
+
+    async def test_reference_and_upload_of_same_bytes_on_one_notification(self):
+        data = b"async shared on one notification"
+        upload = NotificationAttachment(filename="upload.txt", file=data)
+        stored_upload = (await self.backend._store_attachments([upload], "notif-combo"))[0]
+
+        reference = NotificationAttachmentReference(file_id=stored_upload.file_id)
+        second_upload = NotificationAttachment(filename="second.txt", file=data)
+
+        stored = await self.backend._store_attachments([reference, second_upload], "notif-combo")
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert len(self.backend._attachment_join_rows) == 3
+        assert stored[0].file_id == stored_upload.file_id
+        assert stored[1].file_id == stored_upload.file_id
+
+
+class TestAsyncIOFakeFileBackendAttachmentOrphans(IsolatedAsyncioTestCase):
+    """Async mirror of `TestFakeFileBackendAttachmentOrphans`."""
+
+    async def asyncSetUp(self):
+        self.backend = FakeAsyncIOFileBackend(
+            database_file_name="async_attachment_orphans_notifications.json"
+        )
+        self.manager = FakeAsyncIOAttachmentManager()
+        self.backend.inject_attachment_manager(self.manager)
+
+    async def asyncTearDown(self):
+        await self.backend.clear()
+
+    async def test_shared_file_survives_until_both_notifications_release_it(self):
+        data = b"async shared file across notifications"
+        attachment_1 = NotificationAttachment(filename="one.txt", file=data)
+        attachment_2 = NotificationAttachment(filename="two.txt", file=data)
+
+        stored_1 = (await self.backend._store_attachments([attachment_1], "notif-1"))[0]
+        stored_2 = (await self.backend._store_attachments([attachment_2], "notif-2"))[0]
+
+        assert len(self.backend._attachment_file_records) == 1
+        assert await self.backend.get_orphaned_attachment_files() == []
+
+        await self.backend.delete_notification_attachment(stored_1.id)
+        assert await self.backend.get_orphaned_attachment_files() == []
+
+        await self.backend.delete_notification_attachment(stored_2.id)
+        orphaned = await self.backend.get_orphaned_attachment_files()
+        assert len(orphaned) == 1
+        assert orphaned[0].id == stored_1.file_id
+
+        await self.manager.delete_file_by_identifiers(orphaned[0].storage_identifiers)
+        await self.backend.delete_attachment_file(orphaned[0].id)
+        assert await self.backend.get_attachment_file_record(orphaned[0].id) is None

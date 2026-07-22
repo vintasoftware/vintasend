@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import BinaryIO, cast
 
 from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.exceptions import NotificationNotFoundError
+from vintasend.exceptions import AttachmentFileNotFoundError, NotificationNotFoundError
 from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
     FakeAsyncIOAttachmentManager,
     FakeAttachmentManager,
@@ -301,10 +301,14 @@ class FakeFileBackend(BaseNotificationBackend):
     ) -> list[StoredAttachment]:
         """Persist attachments by delegating every byte operation to the injected manager.
 
-        The backend never reads a file itself: it hands the upload to the manager, stores
-        the returned file record, writes a join row, and rebuilds the handle through the
-        manager. The checksum-dedup shortcut and reference-by-id resolution land in Phase
-        3; here only uploads are handled.
+        The backend never reads a file itself. For an upload, the checksum + size is
+        looked up against existing file records first: on a hit the existing
+        `AttachmentFileRecord` is reused and the manager upload is skipped entirely; on a
+        miss the manager stores the bytes and the resulting record is persisted. For a
+        reference, `file_id` is resolved against the existing records -- raising
+        `AttachmentFileNotFoundError` if absent -- and only a join row is written; there is
+        no upload and no new record. Either way, the returned handle is rebuilt through the
+        manager.
         """
         manager = self._attachment_manager
         assert manager is not None  # noqa: S101 - the fake always has a default manager
@@ -312,15 +316,52 @@ class FakeFileBackend(BaseNotificationBackend):
 
         for attachment in attachments:
             if is_attachment_reference(attachment):
-                # Phase 3: resolve file_id -> existing record and write only a join row.
+                record = self.get_attachment_file_record(attachment.file_id)
+                if record is None:
+                    raise AttachmentFileNotFoundError(
+                        f"No attachment file record found for file_id={attachment.file_id!r}"
+                    )
+                join_id = str(uuid.uuid4())
+                self._attachment_join_rows.append(
+                    {
+                        "id": join_id,
+                        "notification_id": notification_id,
+                        "file_id": record.id,
+                        "description": attachment.description,
+                        "is_inline": attachment.is_inline,
+                    }
+                )
+                attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers)
+                stored_attachments.append(
+                    StoredAttachment(
+                        id=join_id,
+                        filename=record.filename,
+                        content_type=record.content_type,
+                        size=record.size,
+                        checksum=record.checksum,
+                        created_at=record.created_at,
+                        file=attachment_file,
+                        description=attachment.description,
+                        is_inline=attachment.is_inline,
+                        file_id=record.id,
+                        storage_identifiers=record.storage_identifiers,
+                    )
+                )
                 continue
+
             # TypeGuard narrows only the positive branch, so restate the upload type.
             assert isinstance(attachment, NotificationAttachment)  # noqa: S101
 
-            record = manager.upload_file(
-                attachment.file, attachment.filename, attachment.content_type
-            )
-            self.store_attachment_file_record(record)
+            # Read the bytes once, up front, so the checksum lookup and (on a miss) the
+            # upload itself never re-read the same path/URL/stream twice.
+            data = manager.file_to_bytes(attachment.file)
+            checksum = manager.calculate_checksum(data)
+            existing_record = self.find_attachment_file_by_checksum(checksum, len(data))
+            if existing_record is not None:
+                record = existing_record
+            else:
+                record = manager.upload_file(data, attachment.filename, attachment.content_type)
+                self.store_attachment_file_record(record)
 
             join_id = str(uuid.uuid4())
             self._attachment_join_rows.append(
@@ -371,6 +412,14 @@ class FakeFileBackend(BaseNotificationBackend):
         self._attachment_file_records.pop(file_id, None)
 
     def get_orphaned_attachment_files(self) -> list[AttachmentFileRecord]:
+        """Return file records no longer referenced by any notification join row.
+
+        Reclaiming one is a caller-driven, two-step operation this method only surfaces
+        candidates for: `manager.delete_file_by_identifiers(record.storage_identifiers)`
+        to remove the bytes, then `backend.delete_attachment_file(record.id)` to drop the
+        row. Nothing here deletes anything automatically -- see the docstrings on
+        `cancel_notification` and `delete_notification_attachment` for why.
+        """
         referenced = {row["file_id"] for row in self._attachment_join_rows}
         return [
             record
@@ -407,6 +456,12 @@ class FakeFileBackend(BaseNotificationBackend):
         return stored_attachments
 
     def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
+        """Delete a single notification attachment join row by its own id.
+
+        This drops only the join row, never the underlying `AttachmentFileRecord` or its
+        bytes -- a file may still back other notifications. Reclaiming an orphaned file is
+        a separate, caller-driven step via `get_orphaned_attachment_files`.
+        """
         self._attachment_join_rows = [
             row for row in self._attachment_join_rows if str(row["id"]) != str(attachment_id)
         ]
@@ -487,6 +542,14 @@ class FakeFileBackend(BaseNotificationBackend):
         return notification
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
+        """Cancel a notification.
+
+        Deliberately no attachment hook: cancelling a notification does not delete its
+        attachment files or their join rows. Cascade, if any, is the schema's job (e.g. a
+        `CASCADE` foreign key in a real backend); reclaiming files that end up unreferenced
+        is `get_orphaned_attachment_files` plus the two-step deletion, not something this
+        method does implicitly.
+        """
         notification = self.get_notification(notification_id)
         self.notifications.remove(notification)
         self._store_notifications()
@@ -669,10 +732,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     ) -> list[StoredAttachment]:
         """Persist attachments by delegating every byte operation to the injected manager.
 
-        The backend never reads a file itself: it hands the upload to the (async) manager,
-        stores the returned file record, writes a join row, and rebuilds the handle through
-        the manager. The checksum-dedup shortcut and reference-by-id resolution land in
-        Phase 3; here only uploads are handled.
+        The backend never reads a file itself. For an upload, the checksum + size is
+        looked up against existing file records first: on a hit the existing
+        `AttachmentFileRecord` is reused and the (async) manager upload is skipped
+        entirely; on a miss the manager stores the bytes and the resulting record is
+        persisted. For a reference, `file_id` is resolved against the existing records --
+        raising `AttachmentFileNotFoundError` if absent -- and only a join row is written;
+        there is no upload and no new record. Either way, the returned handle is rebuilt
+        through the manager.
         """
         manager = self._attachment_manager
         assert manager is not None  # noqa: S101 - the fake always has a default manager
@@ -680,15 +747,55 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
         for attachment in attachments:
             if is_attachment_reference(attachment):
-                # Phase 3: resolve file_id -> existing record and write only a join row.
+                record = await self.get_attachment_file_record(attachment.file_id)
+                if record is None:
+                    raise AttachmentFileNotFoundError(
+                        f"No attachment file record found for file_id={attachment.file_id!r}"
+                    )
+                join_id = str(uuid.uuid4())
+                self._attachment_join_rows.append(
+                    {
+                        "id": join_id,
+                        "notification_id": notification_id,
+                        "file_id": record.id,
+                        "description": attachment.description,
+                        "is_inline": attachment.is_inline,
+                    }
+                )
+                attachment_file = manager.reconstruct_attachment_file(record.storage_identifiers)
+                stored_attachments.append(
+                    StoredAttachment(
+                        id=join_id,
+                        filename=record.filename,
+                        content_type=record.content_type,
+                        size=record.size,
+                        checksum=record.checksum,
+                        created_at=record.created_at,
+                        file=attachment_file,
+                        description=attachment.description,
+                        is_inline=attachment.is_inline,
+                        file_id=record.id,
+                        storage_identifiers=record.storage_identifiers,
+                    )
+                )
                 continue
+
             # TypeGuard narrows only the positive branch, so restate the upload type.
             assert isinstance(attachment, NotificationAttachment)  # noqa: S101
 
-            record = await manager.upload_file(
-                attachment.file, attachment.filename, attachment.content_type
-            )
-            await self.store_attachment_file_record(record, lock)
+            # Read the bytes once, up front -- file_to_bytes / calculate_checksum are
+            # sync on the manager even here, so the checksum lookup and (on a miss) the
+            # upload itself never re-read the same path/URL/stream twice.
+            data = manager.file_to_bytes(attachment.file)
+            checksum = manager.calculate_checksum(data)
+            existing_record = await self.find_attachment_file_by_checksum(checksum, len(data))
+            if existing_record is not None:
+                record = existing_record
+            else:
+                record = await manager.upload_file(
+                    data, attachment.filename, attachment.content_type
+                )
+                await self.store_attachment_file_record(record, lock)
 
             join_id = str(uuid.uuid4())
             self._attachment_join_rows.append(
@@ -741,6 +848,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         self._attachment_file_records.pop(file_id, None)
 
     async def get_orphaned_attachment_files(self) -> list[AttachmentFileRecord]:
+        """Return file records no longer referenced by any notification join row.
+
+        Reclaiming one is a caller-driven, two-step operation this method only surfaces
+        candidates for: `manager.delete_file_by_identifiers(record.storage_identifiers)`
+        to remove the bytes, then `backend.delete_attachment_file(record.id)` to drop the
+        row. Nothing here deletes anything automatically -- see the docstrings on
+        `cancel_notification` and `delete_notification_attachment` for why.
+        """
         referenced = {row["file_id"] for row in self._attachment_join_rows}
         return [
             record
@@ -781,6 +896,12 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     async def delete_notification_attachment(
         self, attachment_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
     ) -> None:
+        """Delete a single notification attachment join row by its own id.
+
+        This drops only the join row, never the underlying `AttachmentFileRecord` or its
+        bytes -- a file may still back other notifications. Reclaiming an orphaned file is
+        a separate, caller-driven step via `get_orphaned_attachment_files`.
+        """
         self._attachment_join_rows = [
             row for row in self._attachment_join_rows if str(row["id"]) != str(attachment_id)
         ]
@@ -1056,6 +1177,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     async def cancel_notification(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
     ) -> None:
+        """Cancel a notification.
+
+        Deliberately no attachment hook: cancelling a notification does not delete its
+        attachment files or their join rows. Cascade, if any, is the schema's job (e.g. a
+        `CASCADE` foreign key in a real backend); reclaiming files that end up unreferenced
+        is `get_orphaned_attachment_files` plus the two-step deletion, not something this
+        method does implicitly.
+        """
         notification = await self.get_notification(notification_id)
         self.notifications.remove(notification)
         await self._store_notifications(lock)

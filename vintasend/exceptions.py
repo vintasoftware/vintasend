@@ -64,3 +64,11 @@ class InvalidOneOffNotificationRecipientError(NotificationError):
 
 class UnsupportedAttachmentFileTypeError(NotificationError):
     """Raised when an attachment manager is given a file input it cannot read."""
+
+
+class AttachmentFileNotFoundError(NotificationError):
+    """Raised when a `NotificationAttachmentReference` points at an unknown `file_id`."""
+
+
+class AttachmentUploadError(NotificationError):
+    """Raised by an attachment manager when it fails to store a file's bytes."""
