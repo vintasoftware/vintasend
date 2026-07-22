@@ -33,6 +33,14 @@
 - Both derive from `NotificationError`, which derives from `ValueError`, so existing
   `except ValueError` handlers keep working.
 
+### Bug Fixes
+- `FakeFileBackend` and `FakeAsyncIOFileBackend` now stamp `created` and `modified` when a
+  notification is persisted, and advance `modified` on updates and status transitions -- matching a
+  real ORM's `auto_now_add` / `auto_now`. Previously both fields stayed `None` for any notification
+  created through the service, so `created_at_range` filters matched nothing and the default
+  `created`-descending ordering fell through to the `id` tiebreaker instead of ordering by creation
+  time. Applications that use the fakes in their own tests will now see these fields populated.
+
 ### Backwards compatibility
 - **`filter_notifications` is a newly added `@abstractmethod` on both `BaseNotificationBackend`
   and `AsyncIOBaseNotificationBackend`.** Every custom backend subclass MUST implement it before

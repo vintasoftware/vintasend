@@ -3,6 +3,8 @@ import tempfile
 import uuid
 from unittest import IsolatedAsyncioTestCase, TestCase
 
+from freezegun import freeze_time
+
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import NotificationResendError
 from vintasend.services.dataclasses import (
@@ -742,6 +744,212 @@ class FilterNotificationsAsyncServiceTestCase(IsolatedAsyncioTestCase):
             if key == "fields.tenant":
                 continue
             assert value is True, key
+
+
+class TimestampStampingServiceTestCase(TestCase):
+    """Regression coverage: fake backends must stamp ``created``/``modified`` like a real ORM's
+    ``auto_now_add``/``auto_now`` columns, so ``created_at_range`` and default ordering work.
+    """
+
+    def setUp(self):
+        self.database_file_name = tempfile.mktemp(suffix=".json")
+        self.backend = FakeFileBackend(database_file_name=self.database_file_name)
+        self.service: NotificationService = NotificationService(
+            notification_adapters=[],
+            notification_backend=self.backend,
+        )
+
+    def tearDown(self):
+        self.backend.clear()
+
+    def _create(self, **overrides) -> Notification:
+        # Keep send_after in the future relative to "now" so create_notification never attempts
+        # to send (and therefore never needs a registered context/adapter).
+        future = datetime.datetime.now(tz=UTC) + datetime.timedelta(days=1)
+        kwargs: dict = {
+            "user_id": 1,
+            "notification_type": NotificationTypes.EMAIL.value,
+            "title": "Title",
+            "body_template": "body",
+            "context_name": "welcome_context",
+            "context_kwargs": NotificationContextDict({}),
+            "send_after": future,
+            "subject_template": "subject",
+            "preheader_template": "preheader",
+        }
+        kwargs.update(overrides)
+        return self.service.create_notification(**kwargs)
+
+    def test_create_notification_stamps_created_and_modified(self):
+        notification = self._create()
+        assert notification.created is not None
+        assert notification.modified is not None
+        assert notification.modified == notification.created
+
+    def test_update_notification_advances_modified_leaves_created_unchanged(self):
+        with freeze_time(_dt(1)):
+            notification = self._create()
+        assert notification.created == _dt(1)
+
+        with freeze_time(_dt(2)):
+            updated = self.service.update_notification(notification.id, title="New Title")
+
+        assert updated.created == _dt(1)
+        assert updated.modified == _dt(2)
+
+    def test_mark_transition_advances_modified_leaves_created_unchanged(self):
+        # Go through the backend directly (bypassing service.send()) so this test doesn't need
+        # a registered context/adapter -- it is exercising the mark-transition timestamp bump,
+        # not the send pipeline.
+        with freeze_time(_dt(1)):
+            notification = self.backend.persist_notification(
+                user_id=1,
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Title",
+                body_template="body",
+                context_name="welcome_context",
+                context_kwargs={},
+                send_after=None,
+                subject_template="subject",
+                preheader_template="preheader",
+            )
+            self.backend.mark_pending_as_sent(notification.id)
+
+        original_created = self.backend.get_notification(notification.id).created
+        assert original_created == _dt(1)
+
+        with freeze_time(_dt(2)):
+            self.backend.mark_sent_as_read(notification.id)
+
+        reloaded = self.backend.get_notification(notification.id)
+        assert reloaded.created == original_created
+        assert reloaded.modified == _dt(2)
+
+    def test_created_at_range_matches_service_created_notification(self):
+        with freeze_time(_dt(5)):
+            notification = self._create()
+
+        in_range = self.backend.filter_notifications(
+            {"created_at_range": {"from": _dt(4), "to": _dt(6)}}, 1, 10
+        )
+        assert {n.id for n in in_range} == {notification.id}
+
+        out_of_range = self.backend.filter_notifications(
+            {"created_at_range": {"from": _dt(10), "to": _dt(20)}}, 1, 10
+        )
+        assert out_of_range == []
+
+    def test_default_ordering_is_newest_first_by_created(self):
+        with freeze_time(_dt(1)):
+            first = self._create()
+        with freeze_time(_dt(2)):
+            second = self._create()
+        with freeze_time(_dt(3)):
+            third = self._create()
+
+        result = self.backend.filter_notifications({}, 1, 10)
+        assert [n.id for n in result] == [third.id, second.id, first.id]
+
+
+class TimestampStampingAsyncServiceTestCase(IsolatedAsyncioTestCase):
+    """AsyncIO mirror of ``TimestampStampingServiceTestCase``."""
+
+    def setUp(self):
+        self.database_file_name = tempfile.mktemp(suffix=".json")
+        self.backend = FakeAsyncIOFileBackend(database_file_name=self.database_file_name)
+        self.service: AsyncIONotificationService = AsyncIONotificationService(
+            notification_adapters=[],
+            notification_backend=self.backend,
+        )
+
+    async def asyncTearDown(self):
+        await self.backend.clear()
+
+    async def _create(self, **overrides) -> Notification:
+        future = datetime.datetime.now(tz=UTC) + datetime.timedelta(days=1)
+        kwargs: dict = {
+            "user_id": 1,
+            "notification_type": NotificationTypes.EMAIL.value,
+            "title": "Title",
+            "body_template": "body",
+            "context_name": "welcome_context",
+            "context_kwargs": NotificationContextDict({}),
+            "send_after": future,
+            "subject_template": "subject",
+            "preheader_template": "preheader",
+        }
+        kwargs.update(overrides)
+        return await self.service.create_notification(**kwargs)
+
+    async def test_create_notification_stamps_created_and_modified(self):
+        notification = await self._create()
+        assert notification.created is not None
+        assert notification.modified is not None
+        assert notification.modified == notification.created
+
+    async def test_update_notification_advances_modified_leaves_created_unchanged(self):
+        with freeze_time(_dt(1)):
+            notification = await self._create()
+        assert notification.created == _dt(1)
+
+        with freeze_time(_dt(2)):
+            updated = await self.service.update_notification(notification.id, title="New Title")
+
+        assert updated.created == _dt(1)
+        assert updated.modified == _dt(2)
+
+    async def test_mark_transition_advances_modified_leaves_created_unchanged(self):
+        # Go through the backend directly (bypassing service.send()) so this test doesn't need
+        # a registered context/adapter -- it is exercising the mark-transition timestamp bump,
+        # not the send pipeline.
+        with freeze_time(_dt(1)):
+            notification = await self.backend.persist_notification(
+                user_id=1,
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Title",
+                body_template="body",
+                context_name="welcome_context",
+                context_kwargs={},
+                send_after=None,
+                subject_template="subject",
+                preheader_template="preheader",
+            )
+            await self.backend.mark_pending_as_sent(notification.id)
+
+        original_created = (await self.backend.get_notification(notification.id)).created
+        assert original_created == _dt(1)
+
+        with freeze_time(_dt(2)):
+            await self.backend.mark_sent_as_read(notification.id)
+
+        reloaded = await self.backend.get_notification(notification.id)
+        assert reloaded.created == original_created
+        assert reloaded.modified == _dt(2)
+
+    async def test_created_at_range_matches_service_created_notification(self):
+        with freeze_time(_dt(5)):
+            notification = await self._create()
+
+        in_range = await self.backend.filter_notifications(
+            {"created_at_range": {"from": _dt(4), "to": _dt(6)}}, 1, 10
+        )
+        assert {n.id for n in in_range} == {notification.id}
+
+        out_of_range = await self.backend.filter_notifications(
+            {"created_at_range": {"from": _dt(10), "to": _dt(20)}}, 1, 10
+        )
+        assert out_of_range == []
+
+    async def test_default_ordering_is_newest_first_by_created(self):
+        with freeze_time(_dt(1)):
+            first = await self._create()
+        with freeze_time(_dt(2)):
+            second = await self._create()
+        with freeze_time(_dt(3)):
+            third = await self._create()
+
+        result = await self.backend.filter_notifications({}, 1, 10)
+        assert [n.id for n in result] == [third.id, second.id, first.id]
 
 
 def _nonce_context(**_kwargs) -> NotificationContextDict:
