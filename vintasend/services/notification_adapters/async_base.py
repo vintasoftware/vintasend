@@ -30,15 +30,21 @@ class AsyncBaseNotificationAdapter(Generic[B, T], BaseNotificationAdapter[B, T])
     @abstractmethod
     def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """
-        Deliver the notification identified by `notification_id` from a background worker.
+        Mark this adapter for background delivery. Core never calls this method.
 
-        Only the id crosses the queue: nothing about the notification is serialized into the
-        task payload, so an implementation reads whatever it needs -- including attachment
-        file handles -- from the backend.
+        Having this abstract method is what makes an adapter subclass
+        `AsyncBaseNotificationAdapter` instead of `BaseNotificationAdapter`, and that is
+        the only role it plays. The real delivery work belongs in `send()`, inherited from
+        `BaseNotificationAdapter`. See the class docstring above for how the worker calls
+        `NotificationService.delayed_send(notification_id)`, which reloads the notification,
+        generates the context, and calls `send()`.
 
-        Delivery is at-least-once, so an implementation may be handed the same id twice and
-        must tolerate that.
+        Because of that path, `send()` on a background adapter only receives the notification
+        id from the queue; it reads everything else, including attachment file handles, from
+        the backend. Delivery is at-least-once, so `send()` may be handed the same notification
+        twice and must tolerate that.
 
-        :param notification_id: The id of the notification to deliver.
+        :param notification_id: The id of the notification. Present to satisfy the marker
+            role described above; core never passes a value here.
         """
         ...
