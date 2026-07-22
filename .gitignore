@@ -49,3 +49,6 @@ tmp_email/
 # built files
 dist/
 notifications.json
+
+# vinta-ai-workflows / implement-plan working notes
+.vinta-ai-workflows/

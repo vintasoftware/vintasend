@@ -37,7 +37,10 @@ build-backend = "poetry.core.masonry.api"
 [tool.ruff]
 # Ruff's default `exclude` already covers .git, .venv, .tox, dist, build,
 # node_modules, .mypy_cache, etc. Only list what it doesn't.
-extend-exclude = ["htmlcov"]
+# `ai-tools/skills/*/scripts/` holds helper scripts vendored verbatim from the
+# vinta-ai-workflows foundation skills. They are upstream code, not ours -
+# reformatting them would make every future `vinta-update-project-skills` diff noisy.
+extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts"]
 line-length = 100
 indent-width = 4
 # Must track the MINIMUM Python in [tool.poetry.dependencies]. Setting this higher

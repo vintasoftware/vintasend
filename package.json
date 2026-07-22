@@ -1,0 +1,12 @@
+{
+  "dependencies": {
+    "vinta-ai-workflows": "^0.3.0"
+  },
+  "private": true,
+  "scripts": {
+    "setup:ai-tools": "node ai-tools/scripts/setup-ai-tools.mjs && node ai-tools/scripts/link-claude-skills.mjs"
+  },
+  "devDependencies": {
+    "yaml": "^2.8.0"
+  }
+}

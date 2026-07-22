@@ -1,0 +1,127 @@
+# yaml-language-server: $schema=./node_modules/vinta-ai-workflows/schemas/vinta-ai-workflows-config.v1.schema.json
+
+schema_version: 1
+vinta_ai_workflows_version: 0.3.0
+last_synced_at: "2026-07-22T12:31:06Z"
+
+project:
+  name: vintasend
+  default_branch: main
+  code_host: github
+  stack_summary: >-
+    Poetry-managed Python library (3.10-3.14) for transactional notifications.
+    Pluggable architecture with three ABC seams - notification backends, adapters,
+    and template renderers - each shipping a stub/fake implementation. Sync and
+    AsyncIO service classes are maintained in parallel. No database, no frontend,
+    no web server; published to PyPI. Concrete integrations (Django, SQLAlchemy,
+    Celery, Jinja, FastAPI-Mail, Flask-Mail) live in separate vintasend-* repos.
+  ai_plans_dir: ai-plans
+  pr_template_paths: []
+
+commands:
+  lint: poetry run ruff check .
+  format: poetry run ruff format .
+  build: poetry build
+  test_unit: poetry run pytest
+  test_unit_scoped: poetry run pytest vintasend/tests/test_services/test_notification_service.py
+  test_unit_new_pattern: poetry run pytest vintasend/tests/test_<area>/test_<module>.py
+  typecheck: poetry run mypy
+  test_matrix: poetry run tox
+
+policies:
+  pr_creation: agents-create
+  commit_strategy: ask
+  ai_coauthor: forbidden
+  commit_style: imperative
+  stage_pattern: git add <explicit paths>
+  anti_git_add_all_reason: >-
+    `.claude/`, `package.json`, and `package-lock.json` are untracked and NOT
+    gitignored. `git add -A` would commit local AI tooling and an npm shim into a
+    pure-Python library. Always stage explicit paths.
+  dependency_licenses:
+    enforcement: block
+    forbidden_spdx:
+      - GPL-2.0-only
+      - GPL-3.0-only
+      - AGPL-3.0-only
+      - SSPL-1.0
+    allowed_overrides: []
+    notes: >-
+      vintasend is MIT and is consumed as a library by downstream applications, so a
+      viral-copyleft runtime dependency would propagate its terms to every consumer.
+      The runtime dependency set is deliberately tiny (typing-extensions, packaging,
+      requests) - prefer keeping it that way over adding a dependency at all.
+      Dev-only dependencies are not distributed, but still route additions past a
+      human rather than self-approving.
+
+vendors:
+  - claude
+  - cursor
+  - copilot
+  - codex
+
+foundation_skills:
+  plan-feature: enabled
+  create-spec: enabled
+  # Disabled: no e2e layer in this repo, so there are no browser-level use cases to
+  # capture. Also strips plan-feature's e2e regions.
+  create-qa-use-cases: disabled
+  implement-plan: enabled
+  amend-plan: enabled
+  open-pr-from-context: enabled
+  # Disabled: library with no browser surface - nothing for Playwright/Cypress to drive.
+  add-e2e-test: disabled
+  add-env-var: enabled
+  # Disabled: no database and no production data to backfill or clean up.
+  add-one-off-script: disabled
+  systematic-debugging: enabled
+  prepare-worktree: enabled
+  thermo-nuclear-code-quality-review: enabled
+  deslop-comments: enabled
+  handoff: enabled
+  # Disabled: not an API-only repo. Consumers integrate via pip, and the public
+  # contract is the ABC seams plus py.typed, not an HTTP surface.
+  handoff-to-client: disabled
+
+foundation_agents:
+  implementer: enabled
+  reviewer: enabled
+  fixer: enabled
+
+agent_models:
+  reviewer: 4
+  fixer: 3
+  worktree_prep: 1
+  integrate: 1
+
+stacks:
+  - python-package
+
+stack_specialist_agents: []
+
+run_options:
+  implement-plan:
+    pause_between_phases: false
+    generate_inline_comments: false
+    full_test_suite: false
+    use_worktree: false
+  amend-plan:
+    blast_radius_signal_threshold: 2
+
+skills:
+  systematic-debugging:
+    # No observability MCP servers are wired up. Phase 0 evidence gathering falls back
+    # to local pytest output, logging, and git history. Add server identifiers here
+    # (e.g. sentry, datadog) once any are configured, and the skill will introspect
+    # their tool lists at runtime.
+    observability_mcp_servers: []
+  prepare-worktree:
+    worktree_root: .claude/worktrees
+    # `reinstall` rather than symlink/copy: Poetry venvs hard-code absolute paths, so a
+    # shared or copied .venv breaks in a worktree. `poetry install --with dev` is fast
+    # here because the dependency set is small.
+    deps_strategy: reinstall
+    compose_network: per-worktree
+    test_db_strategy: fork-on-schema-change
+    summary_dir: .vinta-ai-workflows/worktrees
+    shared_volumes: []
