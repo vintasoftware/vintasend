@@ -52,3 +52,11 @@ class NotificationBodyTemplateRenderingError(NotificationTemplateRenderingError)
 
 class NotificationSendError(NotificationError):
     pass
+
+
+class DuplicateNotificationAdapterError(NotificationError):
+    """Raised when two or more adapters declare the same notification type."""
+
+
+class InvalidOneOffNotificationRecipientError(NotificationError):
+    """Raised when a one-off notification's email_or_phone is empty or malformed."""
