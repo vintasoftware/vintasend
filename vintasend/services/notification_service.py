@@ -41,14 +41,21 @@ from vintasend.services.dataclasses import (
 from vintasend.services.helpers import (
     get_asyncio_notification_adapters,
     get_asyncio_notification_backend,
+    get_asyncio_notification_queue_service,
     get_notification_adapters,
     get_notification_backend,
     get_notification_queue_service,
 )
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
+from vintasend.services.notification_adapters.async_base import BackgroundNotificationAdapter
+from vintasend.services.notification_adapters.asyncio_background_base import (
+    AsyncIOBackgroundNotificationAdapter,
+)
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_queue_services.asyncio_base import (
+    AsyncIOBaseNotificationQueueService,
+)
 from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
 from vintasend.services.service_utils import (
     download_from_url,
@@ -134,7 +141,7 @@ def register_context(key: str):
     return decorator
 
 
-A = TypeVar("A", BaseNotificationAdapter, AsyncBaseNotificationAdapter)
+A = TypeVar("A", BaseNotificationAdapter, BackgroundNotificationAdapter)
 B = TypeVar("B", bound=BaseNotificationBackend)
 
 
@@ -185,7 +192,7 @@ class NotificationService(Generic[A, B]):
                 )
             except NotificationQueueServiceMissingError:
                 # Nothing configured at all: background sending stays unavailable, which
-                # only matters once send() meets an AsyncBaseNotificationAdapter. A
+                # only matters once send() meets a BackgroundNotificationAdapter. A
                 # NotificationQueueServiceResolutionError -- configured but unusable, e.g. a
                 # typo'd import string -- deliberately propagates instead: swallowing it
                 # would read as "no queue configured" and silently never deliver.
@@ -297,7 +304,7 @@ class NotificationService(Generic[A, B]):
         """
         Send a notification using the appropriate adapter.
 
-        Adapters that subclass AsyncBaseNotificationAdapter are not delivered here. Their
+        Adapters that subclass BackgroundNotificationAdapter are not delivered here. Their
         notification id is handed to the configured queue service and a worker delivers it
         later through delayed_send, so no context is generated and the notification's status
         is left untouched on that path.
@@ -323,7 +330,7 @@ class NotificationService(Generic[A, B]):
             if adapter.notification_type.value != notification.notification_type:
                 continue
 
-            if isinstance(adapter, AsyncBaseNotificationAdapter):
+            if isinstance(adapter, BackgroundNotificationAdapter):
                 if self.notification_queue_service is None:
                     logger.error(
                         "Cannot send notification %s in the background: adapter %s requires a "
@@ -871,7 +878,7 @@ class NotificationService(Generic[A, B]):
             if adapter.notification_type.value != notification.notification_type:
                 continue
 
-            if not isinstance(adapter, AsyncBaseNotificationAdapter):
+            if not isinstance(adapter, BackgroundNotificationAdapter):
                 # A foreground adapter has nothing to do in a worker, but the ones after it
                 # in the list might, so keep going.
                 continue
@@ -949,6 +956,8 @@ BAIO = TypeVar("BAIO", bound=AsyncIOBaseNotificationBackend)
 class AsyncIONotificationService(Generic[AAIO, BAIO]):
     notification_adapters: Iterable[AAIO]
     notification_backend: BAIO
+    notification_queue_service: AsyncIOBaseNotificationQueueService | None
+    raise_on_failed_send: bool
 
     def __init__(
         self,
@@ -958,10 +967,44 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         notification_backend: BAIO | str | None = None,
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
+        notification_queue_service: AsyncIOBaseNotificationQueueService | str | None = None,
+        raise_on_failed_send: bool = False,
     ):
+        """
+        Build an AsyncIO notification service.
+
+        :param notification_adapters: adapter instances, or (adapter, renderer) import strings.
+        :param notification_backend: a backend instance or its import string.
+        :param notification_backend_kwargs: kwargs for the backend when it is an import string.
+        :param config: the host's config object, used by FastAPI-style apps.
+        :param notification_queue_service: the queue service used to hand background
+            notifications to a worker. Accepts an instance or an import string; when it is
+            None, `NOTIFICATION_QUEUE_SERVICE` is used, and background sending is simply
+            unavailable if that is unset too.
+        :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
+            record a notification's outcome is logged and the remaining adapters still run.
+            When True, those failures are raised, which is the 1.x behaviour.
+        """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
         NotificationSettings(config)
+
+        self.raise_on_failed_send = raise_on_failed_send
+
+        if isinstance(notification_queue_service, AsyncIOBaseNotificationQueueService):
+            self.notification_queue_service = notification_queue_service
+        else:
+            try:
+                self.notification_queue_service = get_asyncio_notification_queue_service(
+                    notification_queue_service, None, config
+                )
+            except NotificationQueueServiceMissingError:
+                # Nothing configured at all: background sending stays unavailable, which
+                # only matters once send() meets an AsyncIOBackgroundNotificationAdapter. A
+                # NotificationQueueServiceResolutionError -- configured but unusable, e.g. a
+                # typo'd import string -- deliberately propagates instead: swallowing it
+                # would read as "no queue configured" and silently never deliver.
+                self.notification_queue_service = None
 
         if isinstance(notification_backend, AsyncIOBaseNotificationBackend):
             self.notification_backend = cast(BAIO, notification_backend)
@@ -1054,63 +1097,138 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """Download file content from a URL."""
         return download_from_url(url)
 
+    async def register_queue_service(
+        self, queue_service: AsyncIOBaseNotificationQueueService
+    ) -> None:
+        """
+        Inject the queue service after construction.
+
+        Useful when the queue service cannot exist yet at construction time -- a broker
+        connection built during application startup, for example.
+
+        Parameters:
+            queue_service: AsyncIOBaseNotificationQueueService - the queue service to use for
+                background sends from now on
+        """
+        self.notification_queue_service = queue_service
+
     async def send(
         self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None
     ) -> None:
         """
-        Send a notification using the appropriate adapter
+        Send a notification using the appropriate adapter.
 
-        This method may raise the following exceptions:
-            * NotificationUserNotFoundError if the user for the notification can't be found;
+        Adapters that subclass AsyncIOBackgroundNotificationAdapter are not delivered here.
+        Their notification id is handed to the configured queue service and a worker
+        delivers it later through delayed_send, so no context is generated and the
+        notification's status is left untouched on that path.
+
+        With raise_on_failed_send=False (the default) every failure below is logged and the
+        remaining adapters still run. With raise_on_failed_send=True this method may raise:
             * NotificationContextGenerationError if the context generation fails;
-            * NotificationSendError if the adapter fails to send the notification.
-            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationQueueServiceMissingError if a background adapter has no queue
+              service to enqueue through;
+            * NotificationSendError if the adapter fails to send the notification, or the
+              queue service fails to accept it;
+            * NotificationMarkFailedError if the notification fails to be marked as failed;
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
             notification: Notification | OneOffNotification - the notification to be sent
+            lock: asyncio.Lock | None - serializes concurrent backend writes when this
+                notification is sent as part of a send_pending_notifications() batch
         """
-        try:
-            context = await self.get_notification_context(notification)
-        except NotificationContextGenerationError:
-            logger.exception("Failed to generate context for notification %s", notification.id)
-            try:
-                await self.notification_backend.mark_pending_as_failed(notification.id, lock)
-            except NotificationUpdateError as e:
-                raise NotificationMarkFailedError("Failed to mark notification as failed") from e
-            return None
+        # Generated lazily, and only for adapters that deliver in this process: the enqueue
+        # branch below must not pay for a context the worker will generate again anyway.
+        context: NotificationContextDict | None = None
 
         for adapter in self.notification_adapters:
             if adapter.notification_type.value != notification.notification_type:
                 continue
+
+            if isinstance(adapter, AsyncIOBackgroundNotificationAdapter):
+                if self.notification_queue_service is None:
+                    logger.error(
+                        "Cannot send notification %s in the background: adapter %s requires a "
+                        "queue service and none is configured",
+                        notification.id,
+                        adapter.adapter_import_str,
+                    )
+                    if self.raise_on_failed_send:
+                        raise NotificationQueueServiceMissingError(
+                            "No notification queue service is configured"
+                        )
+                    continue
+                try:
+                    await self.notification_queue_service.enqueue_notification(notification.id)
+                except NotificationError as e:
+                    # Queue services are contractually required to wrap broker failures in a
+                    # NotificationError subclass. Anything they leave unwrapped escapes here,
+                    # as their base class documents.
+                    logger.exception("Failed to enqueue notification %s", notification.id)
+                    if self.raise_on_failed_send:
+                        raise NotificationSendError("Failed to enqueue notification") from e
+                continue
+
             if not isinstance(adapter, AsyncIOBaseNotificationAdapter):
                 continue
+
+            if context is None:
+                try:
+                    context = await self.get_notification_context(notification)
+                except NotificationContextGenerationError as context_error:
+                    logger.exception(
+                        "Failed to generate context for notification %s", notification.id
+                    )
+                    try:
+                        await self.notification_backend.mark_pending_as_failed(
+                            notification.id, lock
+                        )
+                    except NotificationUpdateError as e:
+                        logger.exception(
+                            "Failed to mark notification %s as failed", notification.id
+                        )
+                        if self.raise_on_failed_send:
+                            raise NotificationMarkFailedError(
+                                "Failed to mark notification as failed"
+                            ) from e
+                        return
+                    if self.raise_on_failed_send:
+                        raise context_error
+                    # The context belongs to the notification, not to one adapter, so no
+                    # other adapter could send it either.
+                    return
+
             try:
                 await adapter.send(
                     notification=notification,
                     context=context,
                 )
-            except Exception as e:
+            except Exception as adapter_error:  # noqa: BLE001
+                send_error = NotificationSendError("Failed to send notification")
+                logger.exception("Failed to send notification %s", notification.id)
                 try:
-                    raise NotificationSendError("Failed to send notification") from e
-                except NotificationSendError as e:
-                    try:
-                        await self.notification_backend.mark_pending_as_failed(
-                            notification.id, lock
-                        )
-                    except NotificationUpdateError:
+                    await self.notification_backend.mark_pending_as_failed(notification.id, lock)
+                except NotificationUpdateError:
+                    logger.exception("Failed to mark notification %s as failed", notification.id)
+                    if self.raise_on_failed_send:
                         raise NotificationMarkFailedError(
                             "Failed to mark notification as failed"
-                        ) from e
-                    raise e
+                        ) from send_error
+                    continue
+                if self.raise_on_failed_send:
+                    raise send_error from adapter_error
+                continue
+
             try:
                 await self.notification_backend.mark_pending_as_sent(notification.id, lock)
                 await self.notification_backend.store_context_used(
                     notification.id, context, adapter.adapter_import_str, lock
                 )
             except NotificationUpdateError as e:
-                raise NotificationMarkSentError("Failed to mark notification as sent") from e
-        return None
+                logger.exception("Failed to mark notification %s as sent", notification.id)
+                if self.raise_on_failed_send:
+                    raise NotificationMarkSentError("Failed to mark notification as sent") from e
 
     async def create_notification(
         self,
@@ -1552,3 +1670,117 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
         return await self.notification_backend.cancel_notification(notification_id)
+
+    async def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
+        """
+        Deliver a notification from a background worker, given only its id.
+
+        This is the worker half of the background path: `send()` hands the notification id to
+        the queue service, and the worker calls this. The notification is reloaded from the
+        backend and its context is generated here, at delivery time, so a scheduled
+        notification renders against current data exactly as a foreground send does.
+
+        Delivery is at-least-once, so this may be called twice for the same id. A notification
+        that has already been delivered (or cancelled) is skipped rather than sent again.
+
+        With raise_on_failed_send=False (the default) failures are logged rather than raised.
+        With raise_on_failed_send=True this method may raise:
+            * NotificationNotFoundError if the id does not resolve to a notification;
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if no background adapter handles the notification's type,
+              or the adapter fails to send it;
+            * NotificationMarkFailedError if the notification fails to be marked as failed;
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        Note that NotificationNotFoundError propagates regardless of raise_on_failed_send:
+        an id that resolves to nothing is a wiring or retention problem, not a failed send.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the id of the notification to deliver
+        """
+        notification = await self.notification_backend.get_notification(notification_id)
+
+        if notification.status in ALREADY_DELIVERED_NOTIFICATION_STATUSES:
+            logger.info(
+                "Skipping background send of notification %s: its status is already %s",
+                notification_id,
+                notification.status,
+            )
+            return
+
+        context: NotificationContextDict | None = None
+        background_adapter_found = False
+
+        for adapter in self.notification_adapters:
+            if adapter.notification_type.value != notification.notification_type:
+                continue
+
+            if not isinstance(adapter, AsyncIOBackgroundNotificationAdapter):
+                # A foreground adapter has nothing to do in a worker, but the ones after it
+                # in the list might, so keep going.
+                continue
+
+            background_adapter_found = True
+
+            if context is None:
+                try:
+                    context = await self.get_notification_context(notification)
+                except NotificationContextGenerationError as context_error:
+                    logger.exception(
+                        "Failed to generate context for notification %s", notification_id
+                    )
+                    try:
+                        await self.notification_backend.mark_pending_as_failed(notification_id)
+                    except NotificationUpdateError as e:
+                        logger.exception(
+                            "Failed to mark notification %s as failed", notification_id
+                        )
+                        if self.raise_on_failed_send:
+                            raise NotificationMarkFailedError(
+                                "Failed to mark notification as failed"
+                            ) from e
+                        return
+                    if self.raise_on_failed_send:
+                        raise context_error
+                    return
+
+            try:
+                await adapter.send(notification=notification, context=context)
+            except Exception as adapter_error:  # noqa: BLE001
+                send_error = NotificationSendError("Failed to send notification")
+                logger.exception("Failed to send notification %s", notification_id)
+                try:
+                    await self.notification_backend.mark_pending_as_failed(notification_id)
+                except NotificationUpdateError:
+                    logger.exception("Failed to mark notification %s as failed", notification_id)
+                    if self.raise_on_failed_send:
+                        raise NotificationMarkFailedError(
+                            "Failed to mark notification as failed"
+                        ) from send_error
+                    continue
+                if self.raise_on_failed_send:
+                    raise send_error from adapter_error
+                continue
+
+            try:
+                await self.notification_backend.mark_pending_as_sent(notification_id)
+                await self.notification_backend.store_context_used(
+                    notification_id,
+                    context,
+                    adapter.adapter_import_str,
+                )
+            except NotificationUpdateError as e:
+                logger.exception("Failed to mark notification %s as sent", notification_id)
+                if self.raise_on_failed_send:
+                    raise NotificationMarkSentError("Failed to mark notification as sent") from e
+
+        if not background_adapter_found:
+            logger.error(
+                "No background notification adapter is configured for notification %s of type %s",
+                notification_id,
+                notification.notification_type,
+            )
+            if self.raise_on_failed_send:
+                raise NotificationSendError(
+                    "No background notification adapter found for this notification"
+                )

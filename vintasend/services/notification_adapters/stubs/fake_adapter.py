@@ -2,7 +2,10 @@ import uuid
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 from vintasend.constants import NotificationTypes
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
+from vintasend.services.notification_adapters.async_base import BackgroundNotificationAdapter
+from vintasend.services.notification_adapters.asyncio_background_base import (
+    AsyncIOBackgroundNotificationAdapter,
+)
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -93,7 +96,7 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
         self.sent_emails.append((notification, context, attachment_info))
 
 
-class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEmailAdapter[B, T]):
+class FakeAsyncEmailAdapter(BackgroundNotificationAdapter, Generic[B, T], FakeEmailAdapter[B, T]):
     """Background email adapter double.
 
     Delivery happens through the inherited `FakeEmailAdapter.send`, which is what
@@ -108,6 +111,26 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
         self.delayed_send_notification_ids: list[int | str | uuid.UUID] = []
 
     def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
+        self.delayed_send_notification_ids.append(notification_id)
+
+
+class FakeAsyncIOBackgroundEmailAdapter(
+    AsyncIOBackgroundNotificationAdapter, Generic[BAIO, T], FakeAsyncIOEmailAdapter[BAIO, T]
+):
+    """AsyncIO background email adapter double.
+
+    Delivery happens through the inherited `FakeAsyncIOEmailAdapter.send`, which is what
+    `AsyncIONotificationService.delayed_send` awaits inside the worker. `delayed_send` here
+    only records the ids it was handed, so a test can tell the two entrypoints apart.
+    """
+
+    notification_type = NotificationTypes.EMAIL
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.delayed_send_notification_ids: list[int | str | uuid.UUID] = []
+
+    async def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         self.delayed_send_notification_ids.append(notification_id)
 
 
