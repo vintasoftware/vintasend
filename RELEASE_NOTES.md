@@ -1,5 +1,45 @@
 # Release Notes
 
+## Version 1.4.0 (2026-07-22)
+
+### Bug Fixes
+- `NotificationService` and `AsyncIONotificationService` now reject two or more adapters that
+  declare the same `notification_type`, raising the new
+  `vintasend.exceptions.DuplicateNotificationAdapterError` at construction. Previously both
+  adapters were kept, and because the send loop has no `break`, every notification of that type
+  was sent twice: the second `mark_pending_as_sent` then failed because the row was no longer
+  `PENDING_SEND`, and if the first adapter failed while the second succeeded the notification was
+  marked FAILED and then overwritten as SENT. The error message names the offending notification
+  type and the `adapter_import_str` of every adapter declaring it.
+- `create_one_off_notification` now validates `email_or_phone` before anything is persisted, on
+  both services, raising the new `vintasend.exceptions.InvalidOneOffNotificationRecipientError`.
+  An empty string, a whitespace-only string, or a value that is neither an email address nor a
+  10-to-15-digit phone number (optionally `+`-prefixed) previously persisted a notification that
+  could never be delivered. Validation is on format only; it does not check deliverability. Both
+  new exceptions derive from `NotificationError`, which derives from `ValueError`, so existing
+  `except ValueError` handlers keep working.
+
+### Backwards compatibility
+- No seam method was added, renamed, or removed, and no existing method signature or semantic
+  changed. Custom backends, adapters and template renderers need no code changes, and the
+  `vintasend-django`, `vintasend-sqlalchemy`, `vintasend-celery`, and renderer/adapter packages
+  need no release.
+- **An application that configures two adapters for the same notification type now fails at
+  service construction instead of starting.** This is deliberate -- that configuration was
+  double-sending every notification of that type and corrupting its status -- but the failure
+  appears at deploy time rather than at upgrade time. The remedy is to remove the duplicate
+  adapter from `NOTIFICATION_ADAPTERS` (or from the `notification_adapters` argument). The error
+  message names the type and every adapter declaring it, so it tells you exactly what to delete.
+- **Custom adapters must set `notification_type` to a `NotificationTypes` member.** It has always
+  been declared that way on `BaseNotificationAdapter` and `AsyncIOBaseNotificationAdapter`, but it
+  is not an `@abstractmethod`, so an adapter that omitted it or declared it as a plain `str`
+  previously failed only at send time. Service construction now reads it, so such an adapter fails
+  earlier and with an `AttributeError` rather than a `NotificationError`.
+- **Callers passing an empty or malformed `email_or_phone` to `create_one_off_notification` now
+  get an exception where they previously got a persisted notification.** Those notifications were
+  never deliverable. Existing rows are untouched -- validation is on the create path only, and
+  `update_notification` is unchanged.
+
 ## Version 1.3.0 (2026-07-22)
 
 ### Bug Fixes

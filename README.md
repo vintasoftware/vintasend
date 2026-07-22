@@ -152,6 +152,12 @@ This is useful for:
 - Marketing campaigns to external email lists
 - Notifications to external parties who aren't users in your system
 
+`email_or_phone` is validated when the notification is created. It must be either an email
+address or a phone number of 10 to 15 digits, optionally prefixed with `+`. Empty, whitespace-only
+and malformed values raise `InvalidOneOffNotificationRecipientError` before anything is persisted,
+so a recipient that can never be delivered to is rejected up front rather than at send time. The
+check is on format only -- it does not verify that the address or number actually exists.
+
 ### Scheduled notifications
 
 VintaSend schedules notifications by creating them on the database for sending when the `send_after` value has passed. The sending isn't done automatically but we have a service method called `send_pending_notifications` to send all pending notifications found in the database.
