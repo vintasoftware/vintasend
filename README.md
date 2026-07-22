@@ -207,6 +207,104 @@ The `AsyncIONotificationService` exposes the same methods as coroutines (`await 
 > and count use.
 
 
+## Background Sending via Queue Service
+
+Background sending lets you decouple notification delivery from the web request. Adapters opt in by subclassing `BackgroundNotificationAdapter` (sync) or `AsyncIOBackgroundNotificationAdapter` (AsyncIO). When you send a notification through a background adapter, the service enqueues only the notification id and returns immediately — the worker processes the queue and actually delivers the notification.
+
+### Configuration
+
+Set `NOTIFICATION_QUEUE_SERVICE` to your queue service implementation:
+
+```python
+from vintasend.services.notification_service import NotificationService
+from myapp.queue_services import MyQueueService
+
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=...,
+    notification_queue_service=MyQueueService(),  # or as an import string
+)
+```
+
+Or via environment variable:
+
+```bash
+export NOTIFICATION_QUEUE_SERVICE="myapp.queue_services.MyQueueService"
+```
+
+### Queue Service Factory
+
+The worker needs `NOTIFICATION_SERVICE_FACTORY` to rebuild the service in its own process, since the queue payload carries only the notification id. The factory is called once per worker process and cached:
+
+```python
+# myapp/worker.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from vintasend.services.notification_service import NotificationService
+from vintasend_sqlalchemy.backends import SQLAlchemyNotificationBackend
+from myapp.queue_services import MyQueueService
+
+_engine = create_engine("postgresql://...")
+_SessionLocal = sessionmaker(bind=_engine)
+
+def notification_service_factory():
+    """Return a notification service for this worker process."""
+    session = _SessionLocal()
+    backend = SQLAlchemyNotificationBackend(session)
+    return NotificationService(
+        notification_backend=backend,
+        notification_adapters=[...],
+        notification_queue_service=MyQueueService(),
+    )
+```
+
+Then point the environment variable:
+
+```bash
+export NOTIFICATION_SERVICE_FACTORY="myapp.worker.notification_service_factory"
+```
+
+The worker and web process must read the same `NOTIFICATION_BACKEND` and `NOTIFICATION_QUEUE_SERVICE` settings.
+
+### Worker Entrypoints
+
+Register `send_notification` or `async_send_notification` as your queue task:
+
+```python
+# Sync task (Celery example)
+from celery import Celery
+from vintasend.tasks.background_tasks import send_notification
+
+celery_app = Celery()
+celery_app.task(send_notification)
+
+# AsyncIO task
+from vintasend.tasks.background_tasks import async_send_notification
+celery_app.task(async_send_notification)
+```
+
+Both entrypoints take the notification id and an optional explicit service override.
+
+### Example: Background Email
+
+```python
+from vintasend.services.notification_adapters.async_base import BackgroundNotificationAdapter
+from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
+
+class CeleryEmailAdapter(BackgroundNotificationAdapter):
+    """Email adapter that uses Celery for delivery."""
+    
+    def send(self, notification, context):
+        # Core calls this from the worker after the queue service enqueues
+        email_content = self.template_renderer.render(notification, context)
+        # Send email (attachments are loaded from backend)
+        self._send_email(notification.email_or_phone, email_content, notification.attachments)
+```
+
+### Attachments in Background Sends
+
+File attachments now work on the background path because the worker reloads the real notification from the backend, not from a serialized payload.
+
 ## Glossary
 
 * **Notification Backend**: It is a class that implements the methods necessary for VintaSend services to create, update, and retrieve Notifications from da database.
@@ -312,6 +410,25 @@ await notifications_service.create_notification(
 ```
 
 **Note**: Attachments work the same way with `AsyncIONotificationService` - just pass the `attachments` parameter with a list of `NotificationAttachment` objects.
+
+**Background sending** also works with `AsyncIONotificationService`. Subclass `AsyncIOBackgroundNotificationAdapter` and pass an `AsyncIOBaseNotificationQueueService` to send via a queue:
+
+```python
+from vintasend.services.notification_service import AsyncIONotificationService
+from vintasend.services.notification_adapters.asyncio_background_base import AsyncIOBackgroundNotificationAdapter
+
+class MyAsyncIOBackgroundAdapter(AsyncIOBackgroundNotificationAdapter):
+    async def send(self, notification, context):
+        # Worker calls this to deliver
+        email_content = self.template_renderer.render(notification, context)
+        await self._send_email(notification, email_content)
+
+notifications_service = AsyncIONotificationService(
+    notification_adapters=[MyAsyncIOBackgroundAdapter(...)],
+    notification_backend=...,
+    notification_queue_service=...,  # AsyncIO queue service
+)
+```
 
 ### Using frameworks that don't use a globally-available configuration
 
