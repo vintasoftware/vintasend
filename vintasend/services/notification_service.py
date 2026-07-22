@@ -328,6 +328,10 @@ class NotificationService(Generic[A, B]):
         """
         validated_attachments = self._validate_attachments(attachments or [])
 
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
+
         notification = self.notification_backend.persist_notification(
             user_id=user_id,
             notification_type=notification_type,
@@ -340,7 +344,7 @@ class NotificationService(Generic[A, B]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
-            tenant=tenant,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -382,6 +386,10 @@ class NotificationService(Generic[A, B]):
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
 
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
+
         notification = self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
             first_name=first_name,
@@ -396,7 +404,7 @@ class NotificationService(Generic[A, B]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
-            tenant=tenant,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -983,6 +991,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         validated_attachments = self._validate_attachments(attachments or [])
 
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
+
         notification = await self.notification_backend.persist_notification(
             user_id=user_id,
             notification_type=notification_type,
@@ -995,7 +1007,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
-            tenant=tenant,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1037,6 +1049,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
 
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
+
         notification = await self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
             first_name=first_name,
@@ -1051,7 +1067,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
-            tenant=tenant,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc

@@ -111,6 +111,7 @@ class BaseNotificationBackend(ABC):
         Mark a pending notification as sent. Implementations must set ``sent_at`` to
         the current time on the affected row.
         """
+        ...
 
     @abstractmethod
     def mark_pending_as_failed(
@@ -125,6 +126,7 @@ class BaseNotificationBackend(ABC):
         Mark a sent notification as read. Implementations must set ``read_at`` to
         the current time on the affected row.
         """
+        ...
 
     @abstractmethod
     def mark_sent_as_read_bulk(

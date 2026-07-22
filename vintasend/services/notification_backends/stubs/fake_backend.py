@@ -529,6 +529,7 @@ class FakeFileBackend(BaseNotificationBackend):
         ids = {str(i) for i in notification_ids}
         result: list[Notification] = []
         changed = False
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         for n in self.notifications:
             if str(n.id) not in ids or isinstance(n, OneOffNotification):
                 continue
@@ -536,7 +537,7 @@ class FakeFileBackend(BaseNotificationBackend):
                 continue
             if n.status == NotificationStatus.SENT.value:
                 n.status = NotificationStatus.READ.value
-                n.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
+                n.read_at = now
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
@@ -1063,6 +1064,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         ids = {str(i) for i in notification_ids}
         result: list[Notification] = []
         changed = False
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         for n in self.notifications:
             if str(n.id) not in ids or isinstance(n, OneOffNotification):
                 continue
@@ -1070,7 +1072,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 continue
             if n.status == NotificationStatus.SENT.value:
                 n.status = NotificationStatus.READ.value
-                n.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
+                n.read_at = now
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
