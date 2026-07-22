@@ -3,6 +3,7 @@ import datetime
 import logging
 import sys
 import uuid
+from collections import defaultdict
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
 
@@ -21,6 +22,7 @@ else:
 
 from vintasend.constants import NotificationTypes
 from vintasend.exceptions import (
+    DuplicateNotificationAdapterError,
     NotificationContextGenerationError,
     NotificationError,
     NotificationMarkFailedError,
@@ -61,6 +63,32 @@ from vintasend.utils.singleton_utils import SingletonMeta
 
 
 logger = logging.getLogger(__name__)
+
+
+def validate_unique_adapter_notification_types(
+    adapters: Iterable[BaseNotificationAdapter | AsyncIOBaseNotificationAdapter],
+) -> None:
+    """
+    Validate that no two adapters declare the same notification type.
+
+    :param adapters: An iterable of notification adapters.
+    :raises DuplicateNotificationAdapterError: If duplicate notification types are found.
+    """
+    grouped: defaultdict[str, list[str]] = defaultdict(list)
+    for adapter in adapters:
+        grouped[adapter.notification_type.value].append(adapter.adapter_import_str)
+
+    duplicates = [
+        f"{notification_type} ({', '.join(import_strs)})"
+        for notification_type, import_strs in grouped.items()
+        if len(import_strs) > 1
+    ]
+
+    if duplicates:
+        raise DuplicateNotificationAdapterError(
+            "Duplicate adapter notification types are not allowed. Found duplicates for: "
+            + ", ".join(duplicates)
+        )
 
 
 class Contexts(metaclass=SingletonMeta):
@@ -139,6 +167,9 @@ class NotificationService(Generic[A, B]):
             self.notification_adapters = notification_adapters
         else:
             raise NotificationError("Invalid notification adapters")
+
+        validate_unique_adapter_notification_types(self.notification_adapters)
+
         self.notification_adapters_import_strs = [
             (get_class_path(adapter), get_class_path(adapter.template_renderer))
             for adapter in self.notification_adapters
@@ -773,6 +804,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             self.notification_adapters = notification_adapters
         else:
             raise NotificationError("Invalid notification adapters")
+
+        validate_unique_adapter_notification_types(self.notification_adapters)
+
         self.notification_adapters_import_strs = [
             (get_class_path(adapter), get_class_path(adapter.template_renderer))
             for adapter in self.notification_adapters

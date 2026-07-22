@@ -13,7 +13,7 @@ RENDERER = (
     "fake_templated_email_renderer.FakeTemplateRenderer"
 )
 SYNC_ADAPTER = (
-    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
+    "vintasend.services.notification_adapters.stubs.fake_in_app_adapter.FakeInAppAdapter",
     RENDERER,
 )
 ASYNC_ADAPTER = (

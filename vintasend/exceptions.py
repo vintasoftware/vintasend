@@ -52,3 +52,7 @@ class NotificationBodyTemplateRenderingError(NotificationTemplateRenderingError)
 
 class NotificationSendError(NotificationError):
     pass
+
+
+class DuplicateNotificationAdapterError(NotificationError):
+    """Raised when two or more adapters declare the same notification type."""

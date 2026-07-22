@@ -13,6 +13,7 @@ from freezegun import freeze_time
 from vintasend.app_settings import NotificationSettings
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
+    DuplicateNotificationAdapterError,
     NotificationError,
     NotificationMarkFailedError,
     NotificationMarkSentError,
@@ -23,6 +24,7 @@ from vintasend.exceptions import (
 from vintasend.services.dataclasses import Notification, NotificationContextDict, OneOffNotification
 from vintasend.services.notification_adapters.async_base import NotificationDict
 from vintasend.services.notification_adapters.stubs.fake_adapter import (
+    FakeAsyncEmailAdapter,
     FakeAsyncIOEmailAdapter,
     FakeEmailAdapter,
 )
@@ -1421,6 +1423,103 @@ class NotificationServiceTestCase(TestCase):
             == "sync-singleton-test@example.com"
         )
 
+    def test_constructor_rejects_duplicate_adapter_notification_types(self):
+        """Test that constructing with duplicate adapter types raises DuplicateNotificationAdapterError."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        adapter1 = FakeEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=backend,
+        )
+        adapter2 = FakeAsyncEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=backend,
+        )
+
+        with pytest.raises(DuplicateNotificationAdapterError) as exc_info:
+            NotificationService(
+                notification_adapters=[adapter1, adapter2],
+                notification_backend=backend,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Duplicate adapter notification types are not allowed" in error_message
+        assert "EMAIL" in error_message
+        assert adapter1.adapter_import_str in error_message
+        assert adapter2.adapter_import_str in error_message
+
+    def test_constructor_rejects_duplicate_adapter_notification_types_from_import_strings(self):
+        """Test that duplicates arriving as (import_str, renderer_str) tuples are also rejected."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+
+        with pytest.raises(DuplicateNotificationAdapterError) as exc_info:
+            NotificationService(
+                notification_adapters=[
+                    (
+                        "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
+                        "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                    ),
+                    (
+                        "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                        "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                    ),
+                ],
+                notification_backend=backend,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Duplicate adapter notification types are not allowed" in error_message
+        assert "EMAIL" in error_message
+        assert (
+            "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter"
+            in error_message
+        )
+        assert (
+            "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter"
+            in error_message
+        )
+
+    def test_constructor_allows_single_adapter(self):
+        """Test that constructing with a single adapter works fine."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        adapter = FakeEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=backend,
+        )
+
+        service = NotificationService(
+            notification_adapters=[adapter],
+            notification_backend=backend,
+        )
+        assert [a.notification_type for a in service.notification_adapters] == [
+            NotificationTypes.EMAIL
+        ]
+
+    def test_constructor_allows_different_adapter_types(self):
+        """Test that constructing with adapters of different types works fine."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+
+        service = NotificationService(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_in_app_adapter.FakeInAppAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+            ],
+            notification_backend=backend,
+        )
+        assert [a.notification_type for a in service.notification_adapters] == [
+            NotificationTypes.EMAIL,
+            NotificationTypes.IN_APP,
+        ]
+
 
 class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
     def setup_method(self, method):
@@ -2648,6 +2747,103 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         adapters = list(service.notification_adapters)
         assert len(adapters) == 1
         assert adapters[0].adapter_kwargs == {"extra_config": "value"}
+
+    async def test_constructor_rejects_duplicate_adapter_notification_types(self):
+        """Test that constructing with duplicate adapter types raises DuplicateNotificationAdapterError."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeAsyncIOFileBackend(database_file_name="service-tests-notifications.json")
+        adapter1 = FakeAsyncIOEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=backend,
+        )
+        adapter2 = FakeAsyncIOEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=backend,
+        )
+
+        with pytest.raises(DuplicateNotificationAdapterError) as exc_info:
+            AsyncIONotificationService(
+                notification_adapters=[adapter1, adapter2],
+                notification_backend=backend,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Duplicate adapter notification types are not allowed" in error_message
+        assert "EMAIL" in error_message
+        # adapter1 and adapter2 are the same class, so they share one import string. Assert
+        # it appears twice, once per adapter, so this test still fails if the formatter only
+        # names the first adapter.
+        assert error_message.count(adapter1.adapter_import_str) == 2
+
+    async def test_constructor_rejects_duplicate_adapter_notification_types_from_import_strings(
+        self,
+    ):
+        """Test that duplicates arriving as (import_str, renderer_str) tuples are also rejected."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeAsyncIOFileBackend(database_file_name="service-tests-notifications.json")
+        adapter_import_str = (
+            "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter"
+        )
+
+        with pytest.raises(DuplicateNotificationAdapterError) as exc_info:
+            AsyncIONotificationService(
+                notification_adapters=[
+                    (
+                        adapter_import_str,
+                        "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                    ),
+                    (
+                        adapter_import_str,
+                        "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                    ),
+                ],
+                notification_backend=backend,
+            )
+
+        error_message = str(exc_info.value)
+        assert "Duplicate adapter notification types are not allowed" in error_message
+        assert "EMAIL" in error_message
+        assert error_message.count(adapter_import_str) == 2
+
+    async def test_constructor_allows_single_adapter(self):
+        """Test that constructing with a single adapter works fine."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeAsyncIOFileBackend(database_file_name="service-tests-notifications.json")
+        adapter = FakeAsyncIOEmailAdapter(
+            template_renderer=FakeTemplateRenderer(),
+            backend=backend,
+        )
+
+        service = AsyncIONotificationService(
+            notification_adapters=[adapter],
+            notification_backend=backend,
+        )
+        assert [a.notification_type for a in service.notification_adapters] == [
+            NotificationTypes.EMAIL
+        ]
+
+    async def test_constructor_allows_different_adapter_types(self):
+        """Test that constructing with adapters of different types works fine."""
+        _reset_notification_settings_singleton(self)
+        backend = FakeAsyncIOFileBackend(database_file_name="service-tests-notifications.json")
+
+        service = AsyncIONotificationService(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_in_app_adapter.FakeAsyncIOInAppAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+            ],
+            notification_backend=backend,
+        )
+        assert [a.notification_type for a in service.notification_adapters] == [
+            NotificationTypes.EMAIL,
+            NotificationTypes.IN_APP,
+        ]
 
 
 class NotificationServiceImportTestCase(TestCase):
