@@ -6,7 +6,7 @@ class BaseSingletonMeta(type):
     _instances: MappingProxyType[Any, Any]
 
 
-T = TypeVar('T', bound=BaseSingletonMeta)
+T = TypeVar("T", bound=BaseSingletonMeta)
 
 
 class SingletonMeta(Generic[T], BaseSingletonMeta):

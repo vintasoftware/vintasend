@@ -29,21 +29,25 @@ class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict", list[dict]]] = []
+        self.sent_emails: list[
+            tuple["Notification | OneOffNotification", "NotificationContextDict", list[dict]]
+        ] = []
 
-    def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
+    def send(
+        self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
+    ) -> None:
         self.template_renderer.render(notification, context)
 
         # Capture attachment information for testing
         attachment_info = [
             {
-                'id': str(attachment.id),
-                'filename': attachment.filename,
-                'content_type': attachment.content_type,
-                'size': attachment.size,
-                'is_inline': attachment.is_inline,
-                'description': attachment.description,
-                'checksum': attachment.checksum,
+                "id": str(attachment.id),
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "size": attachment.size,
+                "is_inline": attachment.is_inline,
+                "description": attachment.description,
+                "checksum": attachment.checksum,
             }
             for attachment in notification.attachments
         ]
@@ -61,21 +65,25 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.sent_emails: list[tuple["Notification | OneOffNotification", "NotificationContextDict", list[dict]]] = []
+        self.sent_emails: list[
+            tuple["Notification | OneOffNotification", "NotificationContextDict", list[dict]]
+        ] = []
 
-    async def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
+    async def send(
+        self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
+    ) -> None:
         self.template_renderer.render(notification, context)
 
         # Capture attachment information for testing
         attachment_info = [
             {
-                'id': str(attachment.id),
-                'filename': attachment.filename,
-                'content_type': attachment.content_type,
-                'size': attachment.size,
-                'is_inline': attachment.is_inline,
-                'description': attachment.description,
-                'checksum': attachment.checksum,
+                "id": str(attachment.id),
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "size": attachment.size,
+                "is_inline": attachment.is_inline,
+                "description": attachment.description,
+                "checksum": attachment.checksum,
             }
             for attachment in notification.attachments
         ]
@@ -86,10 +94,14 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
 class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEmailAdapter[B, T]):
     notification_type = NotificationTypes.EMAIL
 
-    def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
+    def send(
+        self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
+    ) -> None:
         pass
 
-    def delayed_send(self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict) -> None:
+    def delayed_send(
+        self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict
+    ) -> None:
         notification: "Notification | OneOffNotification"
         if "email_or_phone" in notification_dict:
             # This is a OneOffNotificationDict
@@ -141,7 +153,9 @@ class FakeAsyncEmailAdapter(AsyncBaseNotificationAdapter, Generic[B, T], FakeEma
             attachments=[],  # Default to empty attachments for delayed sending
         )
 
-    def one_off_notification_from_dict(self, notification_dict: OneOffNotificationDict) -> "OneOffNotification":
+    def one_off_notification_from_dict(
+        self, notification_dict: OneOffNotificationDict
+    ) -> "OneOffNotification":
         send_after = (
             datetime.datetime.fromisoformat(notification_dict["send_after"])
             if notification_dict["send_after"]

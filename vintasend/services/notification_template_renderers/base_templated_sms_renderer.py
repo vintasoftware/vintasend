@@ -7,8 +7,11 @@ from vintasend.services.notification_template_renderers.base import (
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import Notification, OneOffNotification
-    from vintasend.services.notification_service import NotificationContextDict
+    from vintasend.services.dataclasses import (
+        Notification,
+        NotificationContextDict,
+        OneOffNotification,
+    )
 
 
 class TemplatedSMS(NotificationSendInput):

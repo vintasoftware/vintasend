@@ -52,15 +52,9 @@ class PeriodicSendPendingNotificationsTestCase(TestCase):
         mocked_restore_config = MagicMock(return_value=restored_config)
 
         with (
-            patch(
-                "vintasend.tasks.periodic_tasks.NotificationService"
-            ) as mocked_service,
-            patch.object(
-                FakeAsyncEmailAdapter, "restore_backend_kwargs", mocked_restore_kwargs
-            ),
-            patch.object(
-                FakeAsyncEmailAdapter, "restore_config", mocked_restore_config
-            ),
+            patch("vintasend.tasks.periodic_tasks.NotificationService") as mocked_service,
+            patch.object(FakeAsyncEmailAdapter, "restore_backend_kwargs", mocked_restore_kwargs),
+            patch.object(FakeAsyncEmailAdapter, "restore_config", mocked_restore_config),
         ):
             periodic_send_pending_notifications(
                 notification_adapters=[SYNC_ADAPTER, ASYNC_ADAPTER],
@@ -83,9 +77,7 @@ class PeriodicSendPendingNotificationsTestCase(TestCase):
         restored_config = {"restored": "config"}
 
         with (
-            patch(
-                "vintasend.tasks.periodic_tasks.NotificationService"
-            ) as mocked_service,
+            patch("vintasend.tasks.periodic_tasks.NotificationService") as mocked_service,
             patch.object(
                 FakeAsyncEmailAdapter,
                 "restore_backend_kwargs",
@@ -110,9 +102,7 @@ class PeriodicSendPendingNotificationsTestCase(TestCase):
 
     def test_falls_back_to_raw_kwargs_when_no_async_adapter(self):
         """No async adapter in the list -> forward the raw kwargs/config unchanged."""
-        with patch(
-            "vintasend.tasks.periodic_tasks.NotificationService"
-        ) as mocked_service:
+        with patch("vintasend.tasks.periodic_tasks.NotificationService") as mocked_service:
             periodic_send_pending_notifications(
                 notification_adapters=[SYNC_ADAPTER],
                 backend_import_str=BACKEND,

@@ -151,9 +151,7 @@ def get_notification_backend(
 ) -> BaseNotificationBackend:
     app_settings = NotificationSettings(config)
     backend_import_str_with_fallback = (
-        backend_import_str
-        if backend_import_str is not None
-        else app_settings.NOTIFICATION_BACKEND
+        backend_import_str if backend_import_str is not None else app_settings.NOTIFICATION_BACKEND
     )
 
     try:
@@ -182,9 +180,7 @@ def get_asyncio_notification_backend(
 ) -> AsyncIOBaseNotificationBackend:
     app_settings = NotificationSettings(config)
     backend_import_str_with_fallback = (
-        backend_import_str
-        if backend_import_str is not None
-        else app_settings.NOTIFICATION_BACKEND
+        backend_import_str if backend_import_str is not None else app_settings.NOTIFICATION_BACKEND
     )
 
     try:

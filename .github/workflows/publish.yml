@@ -31,8 +31,6 @@ jobs:
 
       - name: Run tests
         run: poetry run tox
-        env:
-          OPENAI_API_KEY: "sk-fake-test-key-123"
 
   # Make sure tests pass before publishing
   check-tests:

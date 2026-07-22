@@ -10,12 +10,12 @@ from typing import Any, BinaryIO, TypedDict
 
 # Type alias for supported file inputs (for creating notifications)
 FileAttachment = (
-    BinaryIO |           # File-like object with read()
-    io.BytesIO |         # In-memory bytes
-    io.StringIO |        # In-memory text
-    Path |               # Path object
-    str |                # File path string OR URL
-    bytes                # Raw bytes data
+    BinaryIO  # File-like object with read()
+    | io.BytesIO  # In-memory bytes
+    | io.StringIO  # In-memory text
+    | Path  # Path object
+    | str  # File path string OR URL
+    | bytes  # Raw bytes data
 )
 
 
@@ -46,6 +46,7 @@ class AttachmentFile(ABC):
 @dataclass
 class NotificationAttachment:
     """Input attachment for creating notifications"""
+
     file: FileAttachment
     filename: str
     content_type: str | None = None  # Auto-detected if None
@@ -58,22 +59,23 @@ class NotificationAttachment:
 
     def _detect_content_type(self) -> str:
         content_type, _ = mimetypes.guess_type(self.filename)
-        return content_type or 'application/octet-stream'
+        return content_type or "application/octet-stream"
 
     def is_url(self) -> bool:
         """Check if file is a URL"""
         return isinstance(self.file, str) and (
-            self.file.startswith('http://') or
-            self.file.startswith('https://') or
-            self.file.startswith('s3://') or
-            self.file.startswith('gs://') or
-            self.file.startswith('azure://')
+            self.file.startswith("http://")
+            or self.file.startswith("https://")
+            or self.file.startswith("s3://")
+            or self.file.startswith("gs://")
+            or self.file.startswith("azure://")
         )
 
 
 @dataclass
 class StoredAttachment:
     """Represents an attachment stored by the backend"""
+
     id: str | uuid.UUID
     filename: str
     content_type: str
@@ -173,6 +175,7 @@ class Notification:
     created: datetime.datetime | None = None
     modified: datetime.datetime | None = None
 
+
 @dataclass
 class OneOffNotification:
     id: int | str | uuid.UUID  # noqa: A003
@@ -194,6 +197,7 @@ class OneOffNotification:
     attachments: list[StoredAttachment] = field(default_factory=list)
     created: datetime.datetime | None = None
     modified: datetime.datetime | None = None
+
 
 class UpdateNotificationKwargs(TypedDict, total=False):
     title: str

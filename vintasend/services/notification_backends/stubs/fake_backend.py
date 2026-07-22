@@ -79,18 +79,23 @@ class FakeFileBackend(BaseNotificationBackend):
         except FileNotFoundError:
             pass
 
-    def get_future_notifications(self, page: int, page_size: int) -> list[Notification | OneOffNotification]:
+    def get_future_notifications(
+        self, page: int, page_size: int
+    ) -> list[Notification | OneOffNotification]:
         return cast(
             list[Notification | OneOffNotification],
-            self.__paginate_notifications(self.get_all_future_notifications(), page, page_size)
+            self.__paginate_notifications(self.get_all_future_notifications(), page, page_size),
         )
 
     def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification | OneOffNotification]:
-        return cast(list[Notification | OneOffNotification], self.__paginate_notifications(
-            self.get_all_future_notifications_from_user(user_id), page, page_size
-        ))
+        return cast(
+            list[Notification | OneOffNotification],
+            self.__paginate_notifications(
+                self.get_all_future_notifications_from_user(user_id), page, page_size
+            ),
+        )
 
     def get_all_future_notifications(self) -> list[Notification | OneOffNotification]:
         return [
@@ -131,7 +136,9 @@ class FakeFileBackend(BaseNotificationBackend):
             )
         ]
 
-    def _convert_notification_to_json(self, notification: Notification | OneOffNotification) -> dict:
+    def _convert_notification_to_json(
+        self, notification: Notification | OneOffNotification
+    ) -> dict:
         if isinstance(notification, OneOffNotification):
             return {
                 "id": str(notification.id),
@@ -143,7 +150,9 @@ class FakeFileBackend(BaseNotificationBackend):
                 "body_template": notification.body_template,
                 "context_name": notification.context_name,
                 "context_kwargs": notification.context_kwargs,
-                "send_after": notification.send_after.isoformat() if notification.send_after else None,
+                "send_after": notification.send_after.isoformat()
+                if notification.send_after
+                else None,
                 "subject_template": notification.subject_template,
                 "preheader_template": notification.preheader_template,
                 "status": notification.status,
@@ -160,7 +169,9 @@ class FakeFileBackend(BaseNotificationBackend):
                 "body_template": notification.body_template,
                 "context_name": notification.context_name,
                 "context_kwargs": notification.context_kwargs,
-                "send_after": notification.send_after.isoformat() if notification.send_after else None,
+                "send_after": notification.send_after.isoformat()
+                if notification.send_after
+                else None,
                 "subject_template": notification.subject_template,
                 "preheader_template": notification.preheader_template,
                 "status": notification.status,
@@ -169,7 +180,9 @@ class FakeFileBackend(BaseNotificationBackend):
                 "is_one_off": False,
             }
 
-    def _convert_json_to_notification(self, notification: dict) -> Notification | OneOffNotification:
+    def _convert_json_to_notification(
+        self, notification: dict
+    ) -> Notification | OneOffNotification:
         # Determine if this is a OneOffNotification based on presence of email_or_phone field
         if "email_or_phone" in notification:
             return OneOffNotification(
@@ -222,7 +235,9 @@ class FakeFileBackend(BaseNotificationBackend):
         )
         json_output_file.close()
 
-    def get_pending_notifications(self, page: int, page_size: int) -> list[Notification | OneOffNotification]:
+    def get_pending_notifications(
+        self, page: int, page_size: int
+    ) -> list[Notification | OneOffNotification]:
         # page is 1-indexed
         return self.get_all_pending_notifications()[
             ((page - 1) * page_size) : ((page - 1) * page_size) + page_size
@@ -263,7 +278,9 @@ class FakeFileBackend(BaseNotificationBackend):
         self._store_notifications()
         return notification
 
-    def _store_attachments(self, attachments: list[NotificationAttachment]) -> list[StoredAttachment]:
+    def _store_attachments(
+        self, attachments: list[NotificationAttachment]
+    ) -> list[StoredAttachment]:
         """Store attachments in memory and return StoredAttachment instances"""
         stored_attachments = []
 
@@ -278,7 +295,7 @@ class FakeFileBackend(BaseNotificationBackend):
             stored_attachment = StoredAttachment(
                 id=attachment_id,
                 filename=attachment.filename,
-                content_type=attachment.content_type or 'application/octet-stream',
+                content_type=attachment.content_type or "application/octet-stream",
                 size=len(file_data),
                 checksum=hashlib.sha256(file_data).hexdigest(),
                 created_at=datetime.datetime.now(tz=datetime.timezone.utc),
@@ -303,33 +320,33 @@ class FakeFileBackend(BaseNotificationBackend):
                 return self._download_from_url(file)
             else:
                 # Read from file path
-                with open(file, 'rb') as f:
+                with open(file, "rb") as f:
                     return f.read()
         if isinstance(file, Path):
-            with open(file, 'rb') as f:
+            with open(file, "rb") as f:
                 return f.read()
-        if hasattr(file, 'read'):
-            current_pos = file.tell() if hasattr(file, 'tell') else 0
-            if hasattr(file, 'seek'):
+        if hasattr(file, "read"):
+            current_pos = file.tell() if hasattr(file, "tell") else 0
+            if hasattr(file, "seek"):
                 file.seek(0)
             data = file.read()
-            if hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(current_pos)
             if isinstance(data, str):
-                return data.encode('utf-8')
+                return data.encode("utf-8")
             return data
 
         raise ValueError(f"Unsupported file type: {type(file)}")
 
     def _is_url(self, file_str: str) -> bool:
         """Check if a string is a URL"""
-        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
 
     def _download_from_url(self, url: str) -> bytes:
         """Download file content from URL (simplified for testing)"""
         # For testing purposes, return dummy data
         # In a real implementation, this would use requests or similar
-        return f"Downloaded content from {url}".encode('utf-8')
+        return f"Downloaded content from {url}".encode()
 
     def persist_one_off_notification(
         self,
@@ -381,19 +398,25 @@ class FakeFileBackend(BaseNotificationBackend):
         self._store_notifications()
         return notification
 
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_pending_as_sent(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         self._store_notifications()
         return notification
 
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_pending_as_failed(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
         self._store_notifications()
         return notification
 
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_sent_as_read(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         self._store_notifications()
@@ -430,13 +453,14 @@ class FakeFileBackend(BaseNotificationBackend):
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
-        return cast(list[Notification], self.__paginate_notifications(
-            self.filter_all_in_app_unread_notifications(user_id), page, page_size
-        ))
+        return cast(
+            list[Notification],
+            self.__paginate_notifications(
+                self.filter_all_in_app_unread_notifications(user_id), page, page_size
+            ),
+        )
 
-    def filter_all_in_app_notifications(
-        self, user_id: int | str | uuid.UUID
-    ) -> list[Notification]:
+    def filter_all_in_app_notifications(self, user_id: int | str | uuid.UUID) -> list[Notification]:
         notifications = [
             n
             for n in self.notifications
@@ -450,9 +474,12 @@ class FakeFileBackend(BaseNotificationBackend):
     def filter_in_app_notifications(
         self, user_id: int | str | uuid.UUID, page: int = 1, page_size: int = 10
     ) -> list[Notification]:
-        return cast(list[Notification], self.__paginate_notifications(
-            self.filter_all_in_app_notifications(user_id), page, page_size
-        ))
+        return cast(
+            list[Notification],
+            self.__paginate_notifications(
+                self.filter_all_in_app_notifications(user_id), page, page_size
+            ),
+        )
 
     def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
         return len(self.filter_all_in_app_notifications(user_id))
@@ -483,7 +510,10 @@ class FakeFileBackend(BaseNotificationBackend):
         return result
 
     def __paginate_notifications(
-        self, notifications: list[Notification | OneOffNotification] | list[Notification], page: int, page_size: int
+        self,
+        notifications: list[Notification | OneOffNotification] | list[Notification],
+        page: int,
+        page_size: int,
     ) -> list[Notification | OneOffNotification] | list[Notification]:
         # page is 1-indexed
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
@@ -558,7 +588,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         except FileNotFoundError:
             pass
 
-    def _store_attachments(self, attachments: list[NotificationAttachment]) -> list[StoredAttachment]:
+    def _store_attachments(
+        self, attachments: list[NotificationAttachment]
+    ) -> list[StoredAttachment]:
         """Store attachments in memory and return StoredAttachment instances"""
         stored_attachments = []
 
@@ -573,7 +605,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             stored_attachment = StoredAttachment(
                 id=attachment_id,
                 filename=attachment.filename,
-                content_type=attachment.content_type or 'application/octet-stream',
+                content_type=attachment.content_type or "application/octet-stream",
                 size=len(file_data),
                 checksum=hashlib.sha256(file_data).hexdigest(),
                 created_at=datetime.datetime.now(tz=datetime.timezone.utc),
@@ -598,45 +630,51 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 return self._download_from_url(file)
             else:
                 # Read from file path
-                with open(file, 'rb') as f:
+                with open(file, "rb") as f:
                     return f.read()
         if isinstance(file, Path):
-            with open(file, 'rb') as f:
+            with open(file, "rb") as f:
                 return f.read()
-        if hasattr(file, 'read'):
-            current_pos = file.tell() if hasattr(file, 'tell') else 0
-            if hasattr(file, 'seek'):
+        if hasattr(file, "read"):
+            current_pos = file.tell() if hasattr(file, "tell") else 0
+            if hasattr(file, "seek"):
                 file.seek(0)
             data = file.read()
-            if hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(current_pos)
             if isinstance(data, str):
-                return data.encode('utf-8')
+                return data.encode("utf-8")
             return data
 
         raise ValueError(f"Unsupported file type: {type(file)}")
 
     def _is_url(self, file_str: str) -> bool:
         """Check if a string is a URL"""
-        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
 
     def _download_from_url(self, url: str) -> bytes:
         """Download file content from URL (simplified for testing)"""
         # For testing purposes, return dummy data
         # In a real implementation, this would use requests or similar
-        return f"Downloaded content from {url}".encode('utf-8')
+        return f"Downloaded content from {url}".encode()
 
     async def get_future_notifications(self, page: int, page_size: int) -> list[Notification]:
-        return cast(list[Notification], self.__paginate_notifications(
-            await self.get_all_future_notifications(), page, page_size
-        ))
+        return cast(
+            list[Notification],
+            self.__paginate_notifications(
+                await self.get_all_future_notifications(), page, page_size
+            ),
+        )
 
     async def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
-        return cast(list[Notification], self.__paginate_notifications(
-            await self.get_all_future_notifications_from_user(user_id), page, page_size
-        ))
+        return cast(
+            list[Notification],
+            self.__paginate_notifications(
+                await self.get_all_future_notifications_from_user(user_id), page, page_size
+            ),
+        )
 
     async def get_all_future_notifications(self) -> list[Notification | OneOffNotification]:
         return [
@@ -675,7 +713,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             )
         ]
 
-    def _convert_notification_to_json(self, notification: Notification | OneOffNotification) -> dict:
+    def _convert_notification_to_json(
+        self, notification: Notification | OneOffNotification
+    ) -> dict:
         base_dict = {
             "id": str(notification.id),
             "notification_type": notification.notification_type,
@@ -691,17 +731,21 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         }
 
         if isinstance(notification, OneOffNotification):
-            base_dict.update({
-                "email_or_phone": notification.email_or_phone,
-                "first_name": notification.first_name,
-                "last_name": notification.last_name,
-            })
+            base_dict.update(
+                {
+                    "email_or_phone": notification.email_or_phone,
+                    "first_name": notification.first_name,
+                    "last_name": notification.last_name,
+                }
+            )
         else:
             base_dict["user_id"] = str(notification.user_id)
 
         return base_dict
 
-    def _convert_json_to_notification(self, notification: dict) -> Notification | OneOffNotification:
+    def _convert_json_to_notification(
+        self, notification: dict
+    ) -> Notification | OneOffNotification:
         # Determine if this is a OneOffNotification based on presence of email_or_phone field
         if "email_or_phone" in notification:
             return OneOffNotification(
@@ -758,7 +802,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         if lock is not None:
             lock.release()
 
-    async def get_pending_notifications(self, page: int, page_size: int) -> list[Notification | OneOffNotification]:
+    async def get_pending_notifications(
+        self, page: int, page_size: int
+    ) -> list[Notification | OneOffNotification]:
         pending_notifications = await self.get_all_pending_notifications()
         return pending_notifications[
             ((page - 1) * page_size) : ((page - 1) * page_size) + page_size
@@ -910,7 +956,10 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
     ) -> list[Notification]:
         in_app_unread_notifications = await self.filter_all_in_app_unread_notifications(user_id)
-        return cast(list[Notification], self.__paginate_notifications(in_app_unread_notifications, page, page_size))
+        return cast(
+            list[Notification],
+            self.__paginate_notifications(in_app_unread_notifications, page, page_size),
+        )
 
     async def filter_all_in_app_notifications(
         self, user_id: int | str | uuid.UUID
@@ -929,7 +978,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         self, user_id: int | str | uuid.UUID, page: int = 1, page_size: int = 10
     ) -> list[Notification]:
         in_app_notifications = await self.filter_all_in_app_notifications(user_id)
-        return cast(list[Notification], self.__paginate_notifications(in_app_notifications, page, page_size))
+        return cast(
+            list[Notification], self.__paginate_notifications(in_app_notifications, page, page_size)
+        )
 
     async def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
         return len(await self.filter_all_in_app_notifications(user_id))
@@ -961,7 +1012,10 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         return result
 
     def __paginate_notifications(
-        self, notifications: list[Notification | OneOffNotification] | list[Notification], page: int, page_size: int
+        self,
+        notifications: list[Notification | OneOffNotification] | list[Notification],
+        page: int,
+        page_size: int,
     ) -> list[Notification | OneOffNotification] | list[Notification]:
         return notifications[((page - 1) * page_size) : ((page - 1) * page_size) + page_size]
 

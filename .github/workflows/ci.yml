@@ -3,6 +3,35 @@ name: CI
 on: [push]
 
 jobs:
+  lint:
+    name: Lint and type-check
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Single version is enough: ruff and mypy both target the minimum supported
+          # interpreter via `target-version` / `python_version` in pyproject.toml,
+          # independently of the interpreter they run on.
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install --with dev
+
+      - name: Run ruff
+        run: poetry run ruff check .
+
+      - name: Run mypy
+        run: poetry run mypy
+
   build-python:
     name: CI (Python ${{ matrix.python-version }})
 
@@ -30,8 +59,6 @@ jobs:
       - name: Run tests
         run: |
           poetry run tox
-        env:
-          OPENAI_API_KEY: "sk-fake-test-key-123"
 
       - name: Generate XML coverage report
         run: |

@@ -26,12 +26,26 @@ pytest-asyncio = "^1.4.0"
 pytest-xdist = {version = "^3.8.0", extras=["psutil"]}
 pytest-cov = "^7.1.0"
 gevent = "^26.5.0"
+ruff = "^0.15.22"
+mypy = "^2.3.0"
+pre-commit = "^4.6.1"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
+# Ruff's default `exclude` already covers .git, .venv, .tox, dist, build,
+# node_modules, .mypy_cache, etc. Only list what it doesn't.
+extend-exclude = ["htmlcov"]
+line-length = 100
+indent-width = 4
+# Must track the MINIMUM Python in [tool.poetry.dependencies]. Setting this higher
+# lets pyupgrade rewrite code into syntax that breaks the older interpreters we
+# still support and test against in tox (py310+).
+target-version = "py310"
+
+[tool.ruff.lint]
 select = [
     # pycodestyle
     "E",
@@ -49,8 +63,6 @@ select = [
     "BLE",
     # flake8-builtins
     "A",
-    # flake8-django
-    "DJ",
     # isort
     "I",
     # flake8-logging-format
@@ -60,34 +72,7 @@ select = [
     # Ruff-specific rules
     "RUF",
 ]
-exclude = [
-    ".bzr",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".git-rewrite",
-    ".hg",
-    ".mypy_cache",
-    ".nox",
-    ".pants.d",
-    ".pytype",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pypackages__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "venv",
-    "virtualenvs",
-    "*/migrations/*",
-]
 ignore = [
-    # Disable eradicate (commented code removal)
-    "ERA001",
     # Disable Conflicting lint rules,
     # see https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
     "W191",
@@ -108,19 +93,17 @@ ignore = [
     "BLE001",
     # Disable unused `noqa` directive
     "RUF100",
-    # Disable pyupgrade UP rules that conflict with django-ninja
-    "UP006",
+    # This library keeps `typing.X` aliases in annotations on purpose: the public
+    # API ships py.typed and is consumed on py310, where some collections.abc
+    # generics still behave differently at runtime under `from __future__` -less
+    # modules.
     "UP035",
     "UP037",
-    "UP040",
 ]
-line-length = 100
-indent-width = 4
-target-version = "py312"
 # Allow unused variables when underscore-prefixed:
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
-[tool.ruff.pycodestyle]
+[tool.ruff.lint.pycodestyle]
 ignore-overlong-task-comments = true
 
 [tool.ruff.lint.isort]
@@ -138,19 +121,19 @@ lines-after-imports = 2
 # Group all Django imports into a separate section.
 "django" = ["django"]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 # Ignore "E402", "F403", "F405" (import violations) in __init__.py files.
 # Ignore "S" (flake8-bandit) and "N802" (function name should be lowercase) in tests and docs.
-# Ignore "RUF" (Ruff-specific rules) and "I" (isort) in migrations.
 "__init__.py" = ["E402", "F403", "F405"]
 "**/{tests,docs}/*" = ["E402", "F403", "F405", "S", "N802"]
 "**/*test*.py" = ["E402", "F403", "F405", "S", "N802"]
-"**/{settings}/*" = ["E402", "F403", "F405"]
-"**/migrations/*" = ["RUF", "I"]
+# Stubs are test doubles shipped for downstream implementers to test against:
+# same allowances as tests.
+"**/stubs/*" = ["S", "N802"]
 
 [tool.coverage.run]
 branch = true
-source = ["backend"]
+source = ["vintasend"]
 concurrency = ["thread", "gevent", "multiprocessing"]
 omit = [
     "**/venv/*",
@@ -166,6 +149,34 @@ omit = [
 python_files = ["test_*.py"]
 addopts = "--dist=loadscope"
 
+[tool.mypy]
+files = ["vintasend"]
+# Must track the MINIMUM Python in [tool.poetry.dependencies]. Checking against a
+# newer version hides errors that only appear on the oldest interpreter we support
+# (e.g. `typing.Unpack` is 3.11+, so on py310 those annotations resolve differently).
+python_version = "3.10"
+show_error_codes = true
+# This package ships py.typed, so its re-export surface is part of the public API:
+# require anything re-exported to be declared in __all__ rather than leaking implicitly.
+no_implicit_reexport = true
+strict_equality = true
+warn_no_return = true
+# Deliberately NOT enabled yet, each needs a round of code changes first:
+#   warn_redundant_casts    (12 hits)  - the adapter/backend seams lean on cast()
+#   warn_return_any         (5 hits)
+#   disallow_incomplete_defs (39 hits)
+#   --strict                (560 hits)
+# `warn_unreachable` and `warn_unused_ignores` are intentionally left off: the former
+# flags the defensive isinstance() guards at the plugin boundaries (user-supplied
+# adapters can violate the declared types at runtime), and the latter's result depends
+# on whether the optional django/flask/fastapi packages happen to be installed.
+
 [[tool.mypy.overrides]]
 module = ["requests.*"]
+ignore_missing_imports = true
+
+# Optional integrations probed at runtime in app_settings.py. None are declared
+# dependencies, so they are absent in a clean checkout and in CI.
+[[tool.mypy.overrides]]
+module = ["django.*", "flask.*", "fastapi.*"]
 ignore_missing_imports = true

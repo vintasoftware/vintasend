@@ -34,7 +34,9 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_pending_notifications(self, page: int, page_size: int) -> Iterable["Notification | OneOffNotification"]:
+    def get_pending_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
@@ -42,7 +44,9 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification | OneOffNotification"]:
+    def get_future_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable["Notification | OneOffNotification"]:
         raise NotImplementedError
 
     @abstractmethod
@@ -107,15 +111,21 @@ class BaseNotificationBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> "Notification | OneOffNotification":
+    def mark_pending_as_sent(
+        self, notification_id: int | str | uuid.UUID
+    ) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> "Notification | OneOffNotification":
+    def mark_pending_as_failed(
+        self, notification_id: int | str | uuid.UUID
+    ) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> "Notification | OneOffNotification":
+    def mark_sent_as_read(
+        self, notification_id: int | str | uuid.UUID
+    ) -> "Notification | OneOffNotification":
         raise NotImplementedError
 
     @abstractmethod

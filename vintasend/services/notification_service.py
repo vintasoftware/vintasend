@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import inspect
 import logging
+import sys
 import uuid
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
@@ -12,9 +13,13 @@ from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 
 
-try:
+# `typing.Unpack` landed in 3.11; `typing_extensions` is a hard runtime dependency so the
+# fallback is always importable. Use a `sys.version_info` guard rather than try/except
+# ImportError: mypy evaluates the former statically, and without it the `Unpack[...]`
+# annotations silently degrade to `dict[str, Any]` when type-checking against py310.
+if sys.version_info >= (3, 11):
     from typing import Unpack
-except ImportError:
+else:
     from typing_extensions import Unpack
 
 from vintasend.constants import NotificationTypes
@@ -172,7 +177,9 @@ class NotificationService(Generic[A, B]):
             for adapter in notification_adapters
         )
 
-    def _validate_attachments(self, attachments: list[NotificationAttachment]) -> list[NotificationAttachment]:
+    def _validate_attachments(
+        self, attachments: list[NotificationAttachment]
+    ) -> list[NotificationAttachment]:
         """Validate attachments and return the validated list"""
         # For now, just pass through the attachments
         # In the future, this can include validation logic like:
@@ -196,27 +203,27 @@ class NotificationService(Generic[A, B]):
                 return self._download_from_url(file)
             else:
                 # Read from file path
-                with open(file, 'rb') as f:
+                with open(file, "rb") as f:
                     return f.read()
         elif isinstance(file, Path):
-            with open(file, 'rb') as f:
+            with open(file, "rb") as f:
                 return f.read()
-        elif hasattr(file, 'read'):
-            current_pos = file.tell() if hasattr(file, 'tell') else 0
-            if hasattr(file, 'seek'):
+        elif hasattr(file, "read"):
+            current_pos = file.tell() if hasattr(file, "tell") else 0
+            if hasattr(file, "seek"):
                 file.seek(0)
             data = file.read()
-            if hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(current_pos)
             if isinstance(data, str):
-                return data.encode('utf-8')
+                return data.encode("utf-8")
             return data
         else:
             raise ValueError(f"Unsupported file type: {type(file)}")
 
     def _is_url(self, file_str: str) -> bool:
         """Check if a string is a URL"""
-        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
 
     def _download_from_url(self, url: str) -> bytes:
         """Download file content from URL"""
@@ -453,7 +460,9 @@ class NotificationService(Generic[A, B]):
             user_id, page, page_size
         )
 
-    def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
+    def get_future_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -481,7 +490,9 @@ class NotificationService(Generic[A, B]):
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
         return not inspect.iscoroutinefunction(context_function)
 
-    def get_notification_context(self, notification: Notification | OneOffNotification) -> NotificationContextDict:
+    def get_notification_context(
+        self, notification: Notification | OneOffNotification
+    ) -> NotificationContextDict:
         """
         Generate the context for a notification. It uses the context_name and context_kwargs from the notification.
         Contexts are registered using the @register_context decorator.
@@ -537,7 +548,9 @@ class NotificationService(Generic[A, B]):
         logger.info("Sent %s notifications", notifications_sent)
         logger.info("Failed to send %s notifications", notifications_failed)
 
-    def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
+    def get_pending_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
 
@@ -550,7 +563,9 @@ class NotificationService(Generic[A, B]):
         """
         return self.notification_backend.get_pending_notifications(page, page_size)
 
-    def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def get_notification(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
@@ -562,7 +577,9 @@ class NotificationService(Generic[A, B]):
         """
         return self.notification_backend.get_notification(notification_id)
 
-    def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_read(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         """
         Mark a notification as read.
 
@@ -804,7 +821,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             for adapter in notification_adapters
         )
 
-    def _validate_attachments(self, attachments: list[NotificationAttachment]) -> list[NotificationAttachment]:
+    def _validate_attachments(
+        self, attachments: list[NotificationAttachment]
+    ) -> list[NotificationAttachment]:
         """Validate attachments and return the validated list"""
         # For now, just pass through the attachments
         # In the future, this can include validation logic like:
@@ -828,27 +847,27 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 return self._download_from_url(file)
             else:
                 # Read from file path
-                with open(file, 'rb') as f:
+                with open(file, "rb") as f:
                     return f.read()
         elif isinstance(file, Path):
-            with open(file, 'rb') as f:
+            with open(file, "rb") as f:
                 return f.read()
-        elif hasattr(file, 'read'):
-            current_pos = file.tell() if hasattr(file, 'tell') else 0
-            if hasattr(file, 'seek'):
+        elif hasattr(file, "read"):
+            current_pos = file.tell() if hasattr(file, "tell") else 0
+            if hasattr(file, "seek"):
                 file.seek(0)
             data = file.read()
-            if hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(current_pos)
             if isinstance(data, str):
-                return data.encode('utf-8')
+                return data.encode("utf-8")
             return data
         else:
             raise ValueError(f"Unsupported file type: {type(file)}")
 
     def _is_url(self, file_str: str) -> bool:
         """Check if a string is a URL"""
-        return file_str.startswith(('http://', 'https://', 's3://', 'gs://', 'azure://'))
+        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
 
     def _download_from_url(self, url: str) -> bytes:
         """Download file content from URL"""
@@ -861,7 +880,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         response.raise_for_status()
         return response.content
 
-    async def send(self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None) -> None:
+    async def send(
+        self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None
+    ) -> None:
         """
         Send a notification using the appropriate adapter
 
@@ -911,10 +932,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             try:
                 await self.notification_backend.mark_pending_as_sent(notification.id, lock)
                 await self.notification_backend.store_context_used(
-                    notification.id,
-                    context,
-                    adapter.adapter_import_str,
-                    lock
+                    notification.id, context, adapter.adapter_import_str, lock
                 )
             except NotificationUpdateError as e:
                 raise NotificationMarkSentError("Failed to mark notification as sent") from e
@@ -991,7 +1009,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
-    ) ->  OneOffNotification:
+    ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
         This method may raise the following exceptions:
@@ -1093,7 +1111,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id, page, page_size
         )
 
-    async def get_future_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
+    async def get_future_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
@@ -1107,7 +1127,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         return await self.notification_backend.get_future_notifications(page, page_size)
 
-    async def get_notification_context(self, notification: Notification | OneOffNotification) -> NotificationContextDict:
+    async def get_notification_context(
+        self, notification: Notification | OneOffNotification
+    ) -> NotificationContextDict:
         """
         Generate the context for a notification. It uses the context_name and context_kwargs from the notification.
         Contexts are registered using the @register_context decorator.
@@ -1179,7 +1201,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         )
         return None
 
-    async def get_pending_notifications(self, page: int, page_size: int) -> Iterable[Notification | OneOffNotification]:
+    async def get_pending_notifications(
+        self, page: int, page_size: int
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
 
@@ -1192,7 +1216,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         return await self.notification_backend.get_pending_notifications(page, page_size)
 
-    async def get_notification(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    async def get_notification(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
@@ -1204,7 +1230,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         return await self.notification_backend.get_notification(notification_id)
 
-    async def mark_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    async def mark_read(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         """
         Mark a notification as read.
 

@@ -303,8 +303,7 @@ class TestFakeEmailAdapterAttachments(TestCase):
         self.backend = FakeFileBackend(storage_dir="/tmp/test_attachments")
         self.template_renderer = FakeTemplateRenderer()
         self.adapter = FakeEmailAdapter(
-            backend=self.backend,
-            template_renderer=self.template_renderer
+            backend=self.backend, template_renderer=self.template_renderer
         )
 
     def test_send_notification_captures_attachment_info(self):
@@ -436,8 +435,7 @@ class TestNotificationServiceWithAttachments(TestCase):
         self.backend.notifications = []  # Clear any existing notifications
         self.template_renderer = FakeTemplateRenderer()
         self.adapter = FakeEmailAdapter(
-            backend=self.backend,
-            template_renderer=self.template_renderer
+            backend=self.backend, template_renderer=self.template_renderer
         )
 
         self.service = NotificationService(
@@ -452,7 +450,7 @@ class TestNotificationServiceWithAttachments(TestCase):
 
     def tearDown(self):
         # Clear notifications after each test
-        if hasattr(self, 'backend'):
+        if hasattr(self, "backend"):
             self.backend.notifications = []
 
     def test_create_notification_with_bytes_attachment(self):
@@ -623,8 +621,7 @@ class TestAsyncAttachmentFunctionality(IsolatedAsyncioTestCase):
         self.backend = FakeAsyncIOFileBackend(database_file_name="async_test_notifications.json")
         self.template_renderer = FakeTemplateRenderer()
         self.adapter = FakeAsyncIOEmailAdapter(
-            backend=self.backend,
-            template_renderer=self.template_renderer
+            backend=self.backend, template_renderer=self.template_renderer
         )
 
         self.service = AsyncIONotificationService(
@@ -730,14 +727,23 @@ class TestAttachmentValidation(TestCase):
             ("document.pdf", "application/pdf"),
             ("image.jpg", "image/jpeg"),
             ("image.png", "image/png"),
-            ("document.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-            ("spreadsheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            (
+                "document.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            (
+                "spreadsheet.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
             ("archive.zip", "application/zip"),
             ("data.json", "application/json"),
             ("style.css", "text/css"),
             ("script.js", "text/javascript"),
             ("unknown.xyz", "chemical/x-xyz"),  # This is what Python's mimetypes library returns
-            ("README", "application/octet-stream"),  # File with no extension defaults to octet-stream
+            (
+                "README",
+                "application/octet-stream",
+            ),  # File with no extension defaults to octet-stream
             ("Makefile", "application/octet-stream"),  # Another file with no extension
         ]
 
@@ -760,8 +766,7 @@ class TestAttachmentIntegration(TestCase):
 
         self.template_renderer = FakeTemplateRenderer()
         self.adapter = FakeEmailAdapter(
-            backend=self.backend,
-            template_renderer=self.template_renderer
+            backend=self.backend, template_renderer=self.template_renderer
         )
 
         self.service = NotificationService(
@@ -776,7 +781,7 @@ class TestAttachmentIntegration(TestCase):
 
     def tearDown(self):
         # Clear notifications after each test to avoid interference
-        if hasattr(self, 'backend'):
+        if hasattr(self, "backend"):
             self.backend.notifications = []
 
     def test_full_notification_flow_with_attachments(self):
@@ -898,7 +903,7 @@ class TestNotificationServiceFileHandling(TestCase):
 
     def tearDown(self):
         # Clear notifications after each test
-        if hasattr(self, 'backend'):
+        if hasattr(self, "backend"):
             self.backend.notifications = []
 
     def test_read_file_data_with_bytesio(self):
@@ -921,7 +926,7 @@ class TestNotificationServiceFileHandling(TestCase):
         file_obj = io.StringIO(test_data)
 
         result = self.service._read_file_data(file_obj)
-        assert result == test_data.encode('utf-8')
+        assert result == test_data.encode("utf-8")
 
     def test_read_file_data_with_file_path(self):
         """Test _read_file_data with file path"""
@@ -950,7 +955,7 @@ class TestNotificationServiceFileHandling(TestCase):
         finally:
             os.unlink(temp_file_path)
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_read_file_data_with_url(self, mock_get):
         """Test _read_file_data with URL (should call _download_from_url)"""
         # Mock the requests.get response
@@ -983,13 +988,14 @@ class TestNotificationServiceFileHandling(TestCase):
 
     def test_read_file_data_seek_behavior_without_tell(self):
         """Test _read_file_data with file object that doesn't support tell"""
+
         class NoTellFile:
             def __init__(self, data):
                 self.data = data
                 self.position = 0
 
             def read(self):
-                return self.data[self.position:]
+                return self.data[self.position :]
 
             def seek(self, pos):
                 self.position = pos
@@ -1002,6 +1008,7 @@ class TestNotificationServiceFileHandling(TestCase):
 
     def test_read_file_data_no_seek_support(self):
         """Test _read_file_data with file object that doesn't support seek"""
+
         class NoSeekFile:
             def __init__(self, data):
                 self.data = data
@@ -1051,7 +1058,7 @@ class TestNotificationServiceUrlHandling(TestCase):
             result = self.service._is_url(url)
             assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_download_from_url_success(self, mock_get):
         """Test _download_from_url with successful download"""
         # Mock the requests.get response
@@ -1067,7 +1074,7 @@ class TestNotificationServiceUrlHandling(TestCase):
         assert result == b"Mocked document content"
         mock_get.assert_called_once_with(url, timeout=30)
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_download_from_url_different_schemes(self, mock_get):
         """Test _download_from_url with different URL schemes"""
         # Mock the requests.get response
@@ -1091,7 +1098,7 @@ class TestNotificationServiceUrlHandling(TestCase):
         for url in urls:
             mock_get.assert_any_call(url, timeout=30)
 
-    @patch('vintasend.services.notification_service.requests')
+    @patch("vintasend.services.notification_service.requests")
     def test_download_from_url_import_error(self, mock_requests):
         """Test _download_from_url handles missing requests library"""
         # This test is for the sync version which doesn't have try/except for imports
@@ -1147,7 +1154,7 @@ class TestAsyncNotificationServiceFileHandling(IsolatedAsyncioTestCase):
         file_obj = io.StringIO(test_data)
 
         result = self.service._read_file_data(file_obj)
-        assert result == test_data.encode('utf-8')
+        assert result == test_data.encode("utf-8")
 
     def test_async_read_file_data_with_file_path(self):
         """Test async _read_file_data with file path"""
@@ -1175,7 +1182,7 @@ class TestAsyncNotificationServiceFileHandling(IsolatedAsyncioTestCase):
         finally:
             os.unlink(temp_file_path)
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_async_read_file_data_with_url(self, mock_get):
         """Test async _read_file_data with URL"""
         # Mock the requests.get response
@@ -1228,7 +1235,7 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
             result = self.service._is_url(url)
             assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_async_download_from_url_success(self, mock_get):
         """Test async _download_from_url with successful download"""
         # Mock the requests.get response
@@ -1243,12 +1250,13 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
         assert result == b"Mocked async document content"
         mock_get.assert_called_once_with(url, timeout=30)
 
-    @patch('builtins.__import__')
+    @patch("builtins.__import__")
     def test_async_download_from_url_requests_import_error(self, mock_import):
         """Test async _download_from_url handles missing requests library"""
+
         # Mock __import__ to raise ImportError for 'requests' module
         def side_effect(name, *args, **kwargs):
-            if name == 'requests':
+            if name == "requests":
                 raise ImportError("No module named 'requests'")
             return __import__(name, *args, **kwargs)
 
@@ -1259,7 +1267,7 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
         with pytest.raises(ImportError, match="requests library is required"):
             self.service._download_from_url(url)
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_async_download_from_url_different_schemes(self, mock_get):
         """Test async _download_from_url with different URL schemes"""
         # Mock the requests.get response
@@ -1282,6 +1290,8 @@ class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
         assert mock_get.call_count == len(urls)
         for url in urls:
             mock_get.assert_any_call(url, timeout=30)
+
+
 class TestFileHandlingEdgeCases(TestCase):
     """Test edge cases for file handling methods"""
 
@@ -1322,7 +1332,7 @@ class TestFileHandlingEdgeCases(TestCase):
         assert result == large_data
         assert len(result) == 10000
 
-    @patch('vintasend.services.notification_service.requests.get')
+    @patch("vintasend.services.notification_service.requests.get")
     def test_url_handling_with_query_parameters(self, mock_get):
         """Test URL handling with query parameters and fragments"""
         # Mock the requests.get response

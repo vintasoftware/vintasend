@@ -38,7 +38,9 @@ from vintasend.services.notification_template_renderers.stubs.fake_templated_ema
 def notification_to_dict(notification: "Notification") -> NotificationDict:
     return NotificationDict(
         id=notification.id if not isinstance(notification.id, uuid.UUID) else str(notification.id),
-        user_id=notification.user_id if not isinstance(notification.user_id, uuid.UUID) else str(notification.user_id),
+        user_id=notification.user_id
+        if not isinstance(notification.user_id, uuid.UUID)
+        else str(notification.user_id),
         notification_type=notification.notification_type,
         title=notification.title,
         body_template=notification.body_template,
@@ -54,6 +56,7 @@ def notification_to_dict(notification: "Notification") -> NotificationDict:
         context_used=notification.context_used,
         adapter_extra_parameters=notification.adapter_extra_parameters,
     )
+
 
 class NotificationServiceTestCase(TestCase):
     def setup_method(self, method):
@@ -208,7 +211,7 @@ class NotificationServiceTestCase(TestCase):
 
         notification_service.send(notification)
 
-        assert len(list(notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(notification_service.notification_adapters)).sent_emails) == 1
 
         sent_notification = notification_service.get_notification(notification.id)
         assert sent_notification.status == NotificationStatus.SENT.value
@@ -230,7 +233,7 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     def test_create_one_off_notification(self):
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -249,14 +252,18 @@ class NotificationServiceTestCase(TestCase):
         )
 
         assert len(self.notification_service.notification_backend.notifications) == 1
-        assert one_off_notification == self.notification_service.notification_backend.notifications[0]
+        assert (
+            one_off_notification == self.notification_service.notification_backend.notifications[0]
+        )
         assert isinstance(one_off_notification, OneOffNotification)
         assert one_off_notification.email_or_phone == "test@example.com"
         assert one_off_notification.first_name == "John"
         assert one_off_notification.last_name == "Doe"
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
-    @patch("vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_sent")
+    @patch(
+        "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_sent"
+    )
     def test_create_notification_with_failing_mark_as_sent(self, mock_mark_pending_as_sent):
         assert len(self.notification_service.notification_backend.notifications) == 0
         mock_mark_pending_as_sent.side_effect = NotificationUpdateError()
@@ -274,7 +281,9 @@ class NotificationServiceTestCase(TestCase):
                 preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
             )
 
-    @patch("vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_failed")
+    @patch(
+        "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_failed"
+    )
     def test_create_notification_with_failing_mark_as_failed(self, mock_mark_pending_as_failed):
         self.notification_service = NotificationService(
             notification_adapters=[
@@ -319,7 +328,7 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
 
     def test_create_notification_with_send_after_in_the_past(self):
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -337,7 +346,7 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     def test_update_notification(self):
         notification = self.notification_service.create_notification(
@@ -358,7 +367,7 @@ class NotificationServiceTestCase(TestCase):
         )
 
         assert updated_notification.title == "Updated Test Notification"
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
 
     def test_update_notification_changing_send_after_to_the_past(self):
         notification = self.notification_service.create_notification(
@@ -373,14 +382,16 @@ class NotificationServiceTestCase(TestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        new_send_after = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=1)
+        new_send_after = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(
+            days=1
+        )
         updated_notification = self.notification_service.update_notification(
             notification_id=notification.id,
             send_after=new_send_after,
         )
 
         assert updated_notification.send_after == new_send_after
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     def test_update_notification_changing_send_after_to_none(self):
         notification = self.notification_service.create_notification(
@@ -401,7 +412,7 @@ class NotificationServiceTestCase(TestCase):
         )
 
         assert updated_notification.send_after is None
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     def test_send_pending_notifications(self):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
@@ -431,7 +442,7 @@ class NotificationServiceTestCase(TestCase):
         with freeze_time(send_after + datetime.timedelta(days=1)):
             self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_notifications(self, mock_send):
@@ -464,11 +475,13 @@ class NotificationServiceTestCase(TestCase):
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
 
     @patch("vintasend.services.notification_service.NotificationService.send")
-    def test_send_pending_notifications_counts_failed_marking_notifications_as_failed(self, mock_send):
+    def test_send_pending_notifications_counts_failed_marking_notifications_as_failed(
+        self, mock_send
+    ):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
         self.notification_service.create_notification(
             user_id=1,
@@ -498,11 +511,13 @@ class NotificationServiceTestCase(TestCase):
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         assert mocked_logger.exception.call_count == 2
 
     @patch("vintasend.services.notification_service.NotificationService.send")
-    def test_send_pending_notifications_counts_failed_marking_notifications_as_sent(self, mock_send):
+    def test_send_pending_notifications_counts_failed_marking_notifications_as_sent(
+        self, mock_send
+    ):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
         self.notification_service.create_notification(
             user_id=1,
@@ -532,7 +547,7 @@ class NotificationServiceTestCase(TestCase):
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
 
     def test_get_pending_notifications(self):
@@ -769,7 +784,6 @@ class NotificationServiceTestCase(TestCase):
         assert {n.id for n in result} == {already_read.id, sent.id}
         assert all(n.status == NotificationStatus.READ.value for n in result)
 
-
     @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter.send")
     def test_mark_notification_as_failed_if_sending_fails(self, mock_adapter_send):
         notification = self.notification_service.create_notification(
@@ -918,15 +932,21 @@ class NotificationServiceTestCase(TestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        pending_notifications = self.notification_service.get_future_notifications(page=1, page_size=1)
+        pending_notifications = self.notification_service.get_future_notifications(
+            page=1, page_size=1
+        )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification1.id
+        assert next(iter(pending_notifications)).id == notification1.id
 
-        pending_notifications = self.notification_service.get_future_notifications(page=2, page_size=1)
+        pending_notifications = self.notification_service.get_future_notifications(
+            page=2, page_size=1
+        )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification2.id
+        assert next(iter(pending_notifications)).id == notification2.id
 
-        pending_notifications = self.notification_service.get_future_notifications(page=3, page_size=1)
+        pending_notifications = self.notification_service.get_future_notifications(
+            page=3, page_size=1
+        )
         assert len(list(pending_notifications)) == 0
 
     def test_get_all_future_notifications_from_user(self):
@@ -980,7 +1000,9 @@ class NotificationServiceTestCase(TestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        pending_notifications = self.notification_service.get_all_future_notifications_from_user(user_id=1)
+        pending_notifications = self.notification_service.get_all_future_notifications_from_user(
+            user_id=1
+        )
         assert len(list(pending_notifications)) == 1
 
     def test_get_future_notifications_from_user(self):
@@ -1047,15 +1069,21 @@ class NotificationServiceTestCase(TestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        pending_notifications = self.notification_service.get_future_notifications_from_user(user_id=1, page=1, page_size=1)
+        pending_notifications = self.notification_service.get_future_notifications_from_user(
+            user_id=1, page=1, page_size=1
+        )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification1.id
+        assert next(iter(pending_notifications)).id == notification1.id
 
-        pending_notifications = self.notification_service.get_future_notifications_from_user(user_id=1, page=2, page_size=1)
+        pending_notifications = self.notification_service.get_future_notifications_from_user(
+            user_id=1, page=2, page_size=1
+        )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification2.id
+        assert next(iter(pending_notifications)).id == notification2.id
 
-        pending_notifications = self.notification_service.get_future_notifications_from_user(user_id=1, page=3, page_size=1)
+        pending_notifications = self.notification_service.get_future_notifications_from_user(
+            user_id=1, page=3, page_size=1
+        )
         assert len(list(pending_notifications)) == 0
 
     def test_update_non_existing_notification(self):
@@ -1221,7 +1249,7 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     def test_delayed_send_with_unsupported_notification_type(self):
         self.notification_service = NotificationService(
@@ -1233,7 +1261,7 @@ class NotificationServiceTestCase(TestCase):
                 (
                     "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
                     "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
-                )
+                ),
             ],
             notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
             notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
@@ -1254,7 +1282,9 @@ class NotificationServiceTestCase(TestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        assert len(self.notification_service.notification_backend.get_all_pending_notifications()) == 0
+        assert (
+            len(self.notification_service.notification_backend.get_all_pending_notifications()) == 0
+        )
 
         with freeze_time(send_after + datetime.timedelta(days=1)):
             self.notification_service.delayed_send(
@@ -1262,7 +1292,10 @@ class NotificationServiceTestCase(TestCase):
                 {"test": "test"},
             )
 
-            assert len(self.notification_service.notification_backend.get_all_pending_notifications()) == 1
+            assert (
+                len(self.notification_service.notification_backend.get_all_pending_notifications())
+                == 1
+            )
 
     def test_delayed_send_without_async_adapter(self):
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -1288,9 +1321,13 @@ class NotificationServiceTestCase(TestCase):
         assert len(self.notification_service.notification_backend.notifications) == 1
 
     def test_instanciate_with_adapters_and_backend_instances_instead_of_string(self):
-        notification_backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        notification_backend = FakeFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
         notification_adapters = [
-            FakeEmailAdapter(backend=notification_backend, template_renderer=FakeTemplateRenderer()),
+            FakeEmailAdapter(
+                backend=notification_backend, template_renderer=FakeTemplateRenderer()
+            ),
         ]
 
         service = NotificationService(
@@ -1462,7 +1499,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         await notification_service.send(notification)
 
-        assert len(list(notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(notification_service.notification_adapters)).sent_emails) == 1
 
         sent_notification = await notification_service.get_notification(notification.id)
         assert sent_notification.status == NotificationStatus.SENT.value
@@ -1485,7 +1522,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @pytest.mark.asyncio
     async def test_create_one_off_notification(self):
@@ -1505,15 +1542,19 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         )
 
         assert len(self.notification_service.notification_backend.notifications) == 1
-        assert one_off_notification == self.notification_service.notification_backend.notifications[0]
+        assert (
+            one_off_notification == self.notification_service.notification_backend.notifications[0]
+        )
         assert isinstance(one_off_notification, OneOffNotification)
         assert one_off_notification.email_or_phone == "test@example.com"
         assert one_off_notification.first_name == "John"
         assert one_off_notification.last_name == "Doe"
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @pytest.mark.asyncio
-    @patch("vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend.mark_pending_as_sent")
+    @patch(
+        "vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend.mark_pending_as_sent"
+    )
     async def test_create_notification_with_failing_mark_as_sent(self, mock_mark_pending_as_sent):
         assert len(self.notification_service.notification_backend.notifications) == 0
         mock_mark_pending_as_sent.side_effect = NotificationUpdateError()
@@ -1532,8 +1573,12 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             )
 
     @pytest.mark.asyncio
-    @patch("vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend.mark_pending_as_failed")
-    async def test_create_notification_with_failing_mark_as_failed(self, mock_mark_pending_as_failed):
+    @patch(
+        "vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend.mark_pending_as_failed"
+    )
+    async def test_create_notification_with_failing_mark_as_failed(
+        self, mock_mark_pending_as_failed
+    ):
         self.notification_service = AsyncIONotificationService(
             notification_adapters=[
                 (
@@ -1578,7 +1623,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
 
     @pytest.mark.asyncio
     async def test_create_notification_with_send_after_in_the_past(self):
@@ -1597,7 +1642,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @pytest.mark.asyncio
     async def test_update_notification(self):
@@ -1619,7 +1664,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         )
 
         assert updated_notification.title == "Updated Test Notification"
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
 
     @pytest.mark.asyncio
     async def test_update_notification_changing_send_after_to_the_past(self):
@@ -1635,14 +1680,16 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        new_send_after = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=1)
+        new_send_after = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(
+            days=1
+        )
         updated_notification = await self.notification_service.update_notification(
             notification_id=notification.id,
             send_after=new_send_after,
         )
 
         assert updated_notification.send_after == new_send_after
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @pytest.mark.asyncio
     async def test_update_notification_changing_send_after_to_none(self):
@@ -1664,7 +1711,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         )
 
         assert updated_notification.send_after is None
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @pytest.mark.asyncio
     async def test_send_pending_notifications(self):
@@ -1695,7 +1742,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         with freeze_time(send_after + datetime.timedelta(days=1)):
             await self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 1
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_service.AsyncIONotificationService.send")
@@ -1732,12 +1779,14 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 await self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_service.AsyncIONotificationService.send")
-    async def test_send_pending_notifications_counts_failed_marking_notifications_as_failed(self, mock_send):
+    async def test_send_pending_notifications_counts_failed_marking_notifications_as_failed(
+        self, mock_send
+    ):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
         await self.notification_service.create_notification(
             user_id=1,
@@ -1767,12 +1816,14 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 await self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         assert mocked_logger.exception.call_count == 2
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_service.AsyncIONotificationService.send")
-    async def test_send_pending_notifications_counts_failed_marking_notifications_as_sent(self, mock_send):
+    async def test_send_pending_notifications_counts_failed_marking_notifications_as_sent(
+        self, mock_send
+    ):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
         await self.notification_service.create_notification(
             user_id=1,
@@ -1802,7 +1853,7 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             with patch("vintasend.services.notification_service.logger") as mocked_logger:
                 await self.notification_service.send_pending_notifications()
 
-        assert len(list(self.notification_service.notification_adapters)[0].sent_emails) == 0
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1960,7 +2011,11 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             page = list(await backend.filter_in_app_notifications(1, page=1, page_size=2))
             assert len(page) == 2
 
-            sent_ids = [n.id for n in backend.notifications if n.user_id == 1 and n.status == NotificationStatus.SENT.value]
+            sent_ids = [
+                n.id
+                for n in backend.notifications
+                if n.user_id == 1 and n.status == NotificationStatus.SENT.value
+            ]
             result = list(await backend.mark_sent_as_read_bulk(sent_ids, user_id=1))
             assert {n.id for n in result} == set(sent_ids)
             assert all(n.status == NotificationStatus.READ.value for n in result)
@@ -1972,7 +2027,9 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             await backend.clear()
 
     @pytest.mark.asyncio
-    @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter.send")
+    @patch(
+        "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter.send"
+    )
     async def test_mark_notification_as_failed_if_sending_fails(self, mock_adapter_send):
         notification = await self.notification_service.create_notification(
             user_id=1,
@@ -2008,7 +2065,9 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        pending_notifications_before = await self.notification_service.get_all_future_notifications()
+        pending_notifications_before = (
+            await self.notification_service.get_all_future_notifications()
+        )
         assert len(list(pending_notifications_before)) == 1
 
         await self.notification_service.cancel_notification(notification.id)
@@ -2123,15 +2182,21 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             preheader_template="vintasend_django/emails/test.test_templated_email_preheader.html",
         )
 
-        pending_notifications = await self.notification_service.get_future_notifications(page=1, page_size=1)
+        pending_notifications = await self.notification_service.get_future_notifications(
+            page=1, page_size=1
+        )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification1.id
+        assert next(iter(pending_notifications)).id == notification1.id
 
-        pending_notifications = await self.notification_service.get_future_notifications(page=2, page_size=1)
+        pending_notifications = await self.notification_service.get_future_notifications(
+            page=2, page_size=1
+        )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification2.id
+        assert next(iter(pending_notifications)).id == notification2.id
 
-        pending_notifications = await self.notification_service.get_future_notifications(page=3, page_size=1)
+        pending_notifications = await self.notification_service.get_future_notifications(
+            page=3, page_size=1
+        )
         assert len(list(pending_notifications)) == 0
 
     @pytest.mark.asyncio
@@ -2186,7 +2251,9 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             preheader_template="vintasend_django/emails/test.test_templated_email_preheader.html",
         )
 
-        pending_notifications = await self.notification_service.get_all_future_notifications_from_user(user_id=1)
+        pending_notifications = (
+            await self.notification_service.get_all_future_notifications_from_user(user_id=1)
+        )
         assert len(list(pending_notifications)) == 1
 
     @pytest.mark.asyncio
@@ -2258,13 +2325,13 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             user_id=1, page=1, page_size=1
         )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification1.id
+        assert next(iter(pending_notifications)).id == notification1.id
 
         pending_notifications = await self.notification_service.get_future_notifications_from_user(
             user_id=1, page=2, page_size=1
         )
         assert len(list(pending_notifications)) == 1
-        assert list(pending_notifications)[0].id == notification2.id
+        assert next(iter(pending_notifications)).id == notification2.id
 
         pending_notifications = await self.notification_service.get_future_notifications_from_user(
             user_id=1, page=3, page_size=1
@@ -2408,9 +2475,13 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
     @pytest.mark.asyncio
     async def test_instanciate_with_adapters_and_backend_instances_instead_of_string(self):
-        notification_backend = FakeAsyncIOFileBackend(database_file_name="service-tests-notifications.json")
+        notification_backend = FakeAsyncIOFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
         notification_adapters = [
-            FakeAsyncIOEmailAdapter(backend=notification_backend, template_renderer=FakeTemplateRenderer()),
+            FakeAsyncIOEmailAdapter(
+                backend=notification_backend, template_renderer=FakeTemplateRenderer()
+            ),
         ]
         service = AsyncIONotificationService(
             notification_adapters=notification_adapters,
@@ -2419,4 +2490,3 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert service.notification_backend == notification_backend
         assert service.notification_adapters == notification_adapters
-

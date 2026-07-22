@@ -11,7 +11,9 @@ def periodic_send_pending_notifications(
     backend_kwargs: dict | None = None,
     config: dict | None = None,
 ):
-    adapter_intances = get_notification_adapters(notification_adapters, backend_import_str, backend_kwargs)
+    adapter_intances = get_notification_adapters(
+        notification_adapters, backend_import_str, backend_kwargs
+    )
     desserialized_backend_kwargs = None
     desserialized_config = None
     for adapter in adapter_intances:
@@ -31,5 +33,5 @@ def periodic_send_pending_notifications(
         notification_adapters=notification_adapters,
         notification_backend=backend_import_str,
         notification_backend_kwargs=desserialized_backend_kwargs,
-        config=desserialized_config
+        config=desserialized_config,
     ).send_pending_notifications()

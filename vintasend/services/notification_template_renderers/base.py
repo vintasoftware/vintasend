@@ -5,8 +5,11 @@ from vintasend.services.utils import get_class_path
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import Notification, OneOffNotification
-    from vintasend.services.notification_service import NotificationContextDict
+    from vintasend.services.dataclasses import (
+        Notification,
+        NotificationContextDict,
+        OneOffNotification,
+    )
 
 
 class NotificationSendInput:

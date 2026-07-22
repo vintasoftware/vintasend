@@ -97,9 +97,13 @@ class AsyncBaseNotificationAdapter(
         return self.template_renderer.template_renderer_kwargs
 
     @staticmethod
-    def restore_template_renderer_kwargs(template_renderer_kwargs: dict[str, Any]) -> dict[str, Any]:
+    def restore_template_renderer_kwargs(
+        template_renderer_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
         return template_renderer_kwargs
 
     @abstractmethod
-    def delayed_send(self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict) -> None:
+    def delayed_send(
+        self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict
+    ) -> None:
         raise NotImplementedError

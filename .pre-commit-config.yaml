@@ -1,7 +1,7 @@
 fail_fast: true
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v6.0.0
     hooks:
       - id: check-added-large-files
         args: ["--maxkb=500"]
@@ -16,11 +16,30 @@ repos:
       - id: debug-statements
       - id: detect-private-key
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    # Ruff version.
-    rev: v0.1.6
+    # Keep in sync with the ruff pin in pyproject.toml [tool.poetry.group.dev.dependencies].
+    rev: v0.15.22
     hooks:
-      # Run the linter.
-      - id: ruff
+      # Run the linter. (`ruff` is now a legacy alias for `ruff-check`.)
+      - id: ruff-check
         args: [--fix]
       # Run the formatter.
       - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    # Keep in sync with the mypy pin in pyproject.toml [tool.poetry.group.dev.dependencies].
+    rev: v2.3.0
+    hooks:
+      - id: mypy
+        # Type-check the package as a whole using [tool.mypy] in pyproject.toml rather
+        # than the changed files pre-commit would otherwise pass in. Checking a subset
+        # of modules in isolation reports errors that a full-package run does not.
+        pass_filenames: false
+        # Override the mirror's default `--ignore-missing-imports`, which would apply
+        # globally and mask real errors. pyproject.toml scopes that per-module instead.
+        args: []
+        # pre-commit runs hooks in an isolated venv, so anything imported by the code
+        # under check has to be declared here to match the poetry env that CI uses.
+        additional_dependencies:
+          - typing-extensions>=4.15.0
+          - packaging>=26.2
+          - pytest>=9.0.3
+          - freezegun>=1.5.5

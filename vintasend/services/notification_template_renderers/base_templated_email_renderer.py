@@ -9,8 +9,11 @@ from vintasend.services.notification_template_renderers.base import (
 
 
 if TYPE_CHECKING:
-    from vintasend.services.dataclasses import Notification, OneOffNotification
-    from vintasend.services.notification_service import NotificationContextDict
+    from vintasend.services.dataclasses import (
+        Notification,
+        NotificationContextDict,
+        OneOffNotification,
+    )
 
 
 @dataclass
@@ -22,6 +25,9 @@ class TemplatedEmail(NotificationSendInput):
 class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer):
     @abstractmethod
     def render(
-        self, notification: "Notification | OneOffNotification", context: "NotificationContextDict", **kwargs
+        self,
+        notification: "Notification | OneOffNotification",
+        context: "NotificationContextDict",
+        **kwargs,
     ) -> TemplatedEmail:
         raise NotImplementedError

@@ -33,11 +33,11 @@ def send_notification(
     desserialized_backend_kwargs = (
         adapter_cls.restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
     )
-    desserialized_config = (
-        adapter_cls.restore_config(config) if config else None
-    )
+    desserialized_config = adapter_cls.restore_config(config) if config else None
     desserialized_adapter_kwargs = (
-        adapter_cls.restore_adapter_kwargs(adapters[0][0][1]) if isinstance(adapters[0][0], tuple) else {}
+        adapter_cls.restore_adapter_kwargs(adapters[0][0][1])
+        if isinstance(adapters[0][0], tuple)
+        else {}
     )
 
     desserialized_template_renderer_kwargs = (
@@ -49,11 +49,11 @@ def send_notification(
     adapters_import_tuple = (
         (
             adapters[0][0] if isinstance(adapters[0][0], str) else adapters[0][0][0],
-            desserialized_adapter_kwargs
+            desserialized_adapter_kwargs,
         ),
         (
             adapters[0][1] if isinstance(adapters[0][1], str) else adapters[0][1][0],
-            desserialized_template_renderer_kwargs
+            desserialized_template_renderer_kwargs,
         ),
     )
     try:

@@ -110,7 +110,9 @@ class AsyncIOBaseNotificationAdapter(Generic[B, T], ABC):
         self.config = config
 
     @abstractmethod
-    async def send(self, notification: "Notification | OneOffNotification", context: "NotificationContextDict") -> None:
+    async def send(
+        self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
+    ) -> None:
         """
         Send the notification to the user.
 
