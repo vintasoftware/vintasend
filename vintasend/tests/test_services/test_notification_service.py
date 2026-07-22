@@ -2,12 +2,14 @@ import datetime
 import subprocess
 import sys
 import uuid
+from types import MappingProxyType
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
 
 import pytest
 from freezegun import freeze_time
 
+from vintasend.app_settings import NotificationSettings
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationError,
@@ -58,6 +60,32 @@ def notification_to_dict(notification: "Notification") -> NotificationDict:
         context_used=notification.context_used,
         adapter_extra_parameters=notification.adapter_extra_parameters,
     )
+
+
+def _reset_notification_settings_singleton(test_case: TestCase) -> None:
+    """Clear the NotificationSettings singleton for one test, then restore it.
+
+    NotificationSettings uses SingletonMeta: the first construction wins, and every later
+    `config` argument is ignored. SingletonMeta.__call__ stores the built instance on an
+    `_instances` attribute it sets directly on the class being constructed. Once
+    NotificationSettings has been built once, that per-class attribute shadows the empty
+    default living on SingletonMeta itself, so clearing SingletonMeta's own `_instances` has
+    no effect at that point. NotificationSettings's own `_instances` attribute is the one
+    that must be cleared, and it must be restored after the test. This state is process-global,
+    so leaking it would make other tests order-dependent.
+    """
+    sentinel = object()
+    original = vars(NotificationSettings).get("_instances", sentinel)
+
+    def _restore() -> None:
+        if original is sentinel:
+            if "_instances" in vars(NotificationSettings):
+                delattr(NotificationSettings, "_instances")
+        else:
+            NotificationSettings._instances = original
+
+    test_case.addCleanup(_restore)
+    NotificationSettings._instances = MappingProxyType({})
 
 
 class NotificationServiceTestCase(TestCase):
@@ -1340,6 +1368,49 @@ class NotificationServiceTestCase(TestCase):
         assert service.notification_backend == notification_backend
         assert service.notification_adapters == notification_adapters
 
+    def test_instances_config_initializes_notification_settings_singleton(self):
+        """Config must reach NotificationSettings even when backend/adapters are instances.
+
+        Neither get_notification_backend nor BaseNotificationAdapter.__init__ runs on that
+        path, so NotificationService.__init__ has to construct NotificationSettings(config)
+        itself, or the config argument is silently dropped and the app falls back to
+        framework defaults.
+        """
+        _reset_notification_settings_singleton(self)
+
+        class _FakeConfig:
+            NOTIFICATION_DEFAULT_FROM_EMAIL = "sync-singleton-test@example.com"
+
+        notification_backend = FakeFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        notification_adapters = [
+            FakeEmailAdapter(
+                backend=notification_backend, template_renderer=FakeTemplateRenderer()
+            ),
+        ]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            NotificationService(
+                notification_adapters=notification_adapters,
+                notification_backend=notification_backend,
+                config=_FakeConfig(),
+            )
+
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "sync-singleton-test@example.com"
+        )
+
+        # First construction wins: a later call with a different config is ignored, because
+        # the singleton is already built and SingletonMeta returns the cached instance
+        # without re-running __init__.
+        NotificationSettings(object())
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "sync-singleton-test@example.com"
+        )
+
 
 class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
     def setup_method(self, method):
@@ -2501,6 +2572,49 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert service.notification_backend == notification_backend
         assert service.notification_adapters == notification_adapters
+
+    async def test_instances_config_initializes_notification_settings_singleton(self):
+        """Config must reach NotificationSettings even when backend/adapters are instances.
+
+        Neither get_asyncio_notification_backend nor AsyncIOBaseNotificationAdapter.__init__
+        runs on that path, so AsyncIONotificationService.__init__ has to construct
+        NotificationSettings(config) itself, or the config argument is silently dropped and
+        the app falls back to framework defaults.
+        """
+        _reset_notification_settings_singleton(self)
+
+        class _FakeConfig:
+            NOTIFICATION_DEFAULT_FROM_EMAIL = "async-singleton-test@example.com"
+
+        notification_backend = FakeAsyncIOFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        notification_adapters = [
+            FakeAsyncIOEmailAdapter(
+                backend=notification_backend, template_renderer=FakeTemplateRenderer()
+            ),
+        ]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            AsyncIONotificationService(
+                notification_adapters=notification_adapters,
+                notification_backend=notification_backend,
+                config=_FakeConfig(),
+            )
+
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "async-singleton-test@example.com"
+        )
+
+        # First construction wins: a later call with a different config is ignored, because
+        # the singleton is already built and SingletonMeta returns the cached instance
+        # without re-running __init__.
+        NotificationSettings(object())
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "async-singleton-test@example.com"
+        )
 
 
 class NotificationServiceImportTestCase(TestCase):

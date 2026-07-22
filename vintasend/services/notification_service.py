@@ -212,7 +212,7 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            notification: Notification - the notification to be sent
+            notification: Notification | OneOffNotification - the notification to be sent
         """
         try:
             context = self.get_notification_context(notification)
@@ -470,7 +470,7 @@ class NotificationService(Generic[A, B]):
             * NotificationContextGenerationError if the context generation fails.
 
         Parameters:
-            notification: Notification - the notification to generate the context for
+            notification: Notification | OneOffNotification - the notification to generate the context for
         """
         context_function = Contexts().get_function(notification.context_name)
         if context_function is None:
@@ -556,10 +556,10 @@ class NotificationService(Generic[A, B]):
             * NotificationUpdateError if the notification fails to be marked as read.
 
         Parameters:
-            notification: Notification - the notification to mark as read
+            notification_id: int | str | uuid.UUID - the notification to mark as read
 
         Returns:
-            Notification | OneOffNotification- the updated notification
+            Notification | OneOffNotification - the updated notification
         """
         return self.notification_backend.mark_sent_as_read(notification_id)
 
@@ -672,7 +672,7 @@ class NotificationService(Generic[A, B]):
         Cancel a notification.
 
         Parameters:
-            notifictaion_id: int | str | uuid.UUID - the ID of the notification to cancel
+            notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
         return self.notification_backend.cancel_notification(notification_id)
 
@@ -740,6 +740,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
     ):
+        # initialize the notification settings singleton for the first time
+        # to ensure all components have access to the same settings
+        NotificationSettings(config)
+
         if isinstance(notification_backend, AsyncIOBaseNotificationBackend):
             self.notification_backend = cast(BAIO, notification_backend)
         else:
@@ -940,6 +944,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
+
         This method may raise the following exceptions:
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
@@ -1066,7 +1071,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationContextGenerationError if the context generation fails.
 
         Parameters:
-            notification: Notification - the notification to generate the context for
+            notification: Notification | OneOffNotification - the notification to generate the context for
         """
         context_function = Contexts().get_function(notification.context_name)
         if context_function is None:
@@ -1182,7 +1187,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationUpdateError if the notification fails to be marked as read.
 
         Parameters:
-            notification: Notification - the notification to mark as read
+            notification_id: int | str | uuid.UUID - the notification to mark as read
 
         Returns:
             Notification | OneOffNotification - the updated notification
