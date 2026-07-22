@@ -60,3 +60,7 @@ class DuplicateNotificationAdapterError(NotificationError):
 
 class InvalidOneOffNotificationRecipientError(NotificationError):
     """Raised when a one-off notification's email_or_phone is empty or malformed."""
+
+
+class TenantReassignmentError(NotificationError):
+    """Raised when an update attempts to change a notification's tenant after creation."""

@@ -66,6 +66,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list["NotificationAttachment"] | None = None,
+        tenant: str | None = None,
         lock: asyncio.Lock | None = None,
     ) -> "Notification": ...
 
@@ -85,6 +86,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list["NotificationAttachment"] | None = None,
+        tenant: str | None = None,
         lock: asyncio.Lock | None = None,
     ) -> "OneOffNotification": ...
 
@@ -105,7 +107,12 @@ class AsyncIOBaseNotificationBackend(ABC):
     @abstractmethod
     async def mark_pending_as_sent(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification | OneOffNotification": ...
+    ) -> "Notification | OneOffNotification":
+        """
+        Mark a pending notification as sent. Implementations must set ``sent_at`` to
+        the current time on the affected row.
+        """
+        ...
 
     @abstractmethod
     async def mark_pending_as_failed(
@@ -115,7 +122,12 @@ class AsyncIOBaseNotificationBackend(ABC):
     @abstractmethod
     async def mark_sent_as_read(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification | OneOffNotification": ...
+    ) -> "Notification | OneOffNotification":
+        """
+        Mark a sent notification as read. Implementations must set ``read_at`` to
+        the current time on the affected row.
+        """
+        ...
 
     @abstractmethod
     async def mark_sent_as_read_bulk(
@@ -129,11 +141,13 @@ class AsyncIOBaseNotificationBackend(ABC):
 
         Semantics:
             * Every notification in ``notification_ids`` that is currently SENT is
-              moved to READ.
+              moved to READ, and ``read_at`` is set to the current time on every
+              row moved this way.
             * If ``user_id`` is provided, the update is scoped to that user; rows
               owned by other users are never touched. This is the safe default for
               an endpoint and callers are strongly encouraged to always pass it.
-            * Idempotent: ids that are already READ cause no error.
+            * Idempotent: ids that are already READ cause no error and their
+              ``read_at`` is left untouched.
             * Returns the serialized notifications for the requested ids that are
               READ after the operation (newly-marked + already-read), so the caller
               sees the final state. Ids that are missing, not owned, or in a
