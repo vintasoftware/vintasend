@@ -471,9 +471,12 @@ class NotificationServiceTestCase(TestCase):
         )
 
         with freeze_time(send_after + datetime.timedelta(days=1)):
-            self.notification_service.send_pending_notifications()
+            with patch("vintasend.services.notification_service.logger") as mocked_logger:
+                self.notification_service.send_pending_notifications()
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+        mocked_logger.info.assert_any_call("Sent %s notifications", 1)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 0)
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_notifications(self, mock_send):
@@ -508,6 +511,8 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
+        mocked_logger.info.assert_any_call("Sent %s notifications", 0)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 1)
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_marking_notifications_as_failed(
@@ -544,6 +549,8 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         assert mocked_logger.exception.call_count == 2
+        mocked_logger.info.assert_any_call("Sent %s notifications", 0)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 1)
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_marking_notifications_as_sent(
@@ -580,6 +587,8 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
+        mocked_logger.info.assert_any_call("Sent %s notifications", 1)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 0)
 
     def test_get_pending_notifications(self):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
