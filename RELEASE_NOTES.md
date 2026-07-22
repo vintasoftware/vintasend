@@ -1,5 +1,42 @@
 # Release Notes
 
+## Version 1.3.0 (2026-07-22)
+
+### Bug Fixes
+- `AsyncIONotificationService` now accepts the same `(import_str, kwargs)` adapter tuple form
+  that `NotificationService` already accepted, for example
+  `notification_adapters=[(("pkg.Adapter", {"k": 1}), "pkg.Renderer")]`. The async construction
+  helper, `get_asyncio_notification_adapters`, already handled this shape; the service's own
+  validation guard did not, and rejected it with `NotificationError("Invalid notification
+  adapters")` before the helper ever ran.
+
+### Internal Improvements
+- Extracted the file-attachment and context-function helpers duplicated between `NotificationService`
+  and `AsyncIONotificationService` into `vintasend.services.service_utils`; both classes now delegate
+  to one shared implementation of each. No public signature changed.
+- Closed sync/AsyncIO parity gaps between the two services: `AsyncIONotificationService.send_pending_notifications`
+  now tracks sent/failed counters and logs the same summary lines its sync twin,
+  `NotificationService.send_pending_notifications`, always has; `AsyncIONotificationService.__init__`
+  now initializes the `NotificationSettings` singleton up front, matching `NotificationService.__init__`.
+- Importing `vintasend.services.notification_service` no longer imports `requests` as a side effect --
+  `download_from_url` now imports it lazily, at call time, with a friendly `ImportError` if it's
+  missing.
+
+### Backwards compatibility
+- `AsyncIONotificationService.__init__` now constructs the `NotificationSettings` singleton
+  immediately, matching `NotificationService.__init__`. `NotificationSettings` is a singleton:
+  the first construction wins, and every later `config` argument is ignored. An application
+  that builds `AsyncIONotificationService(...)` with `config=None` before anything else
+  constructs `NotificationSettings` with a real config will now get the `None`-derived
+  settings everywhere, where previously the in-request construction with the real config
+  would have won. Build the service after your config is available, or pass `config` to the
+  service, rather than relying on some other later construction of `NotificationSettings` to
+  supply it.
+- A host application that relied on the transitive `requests` import (see the `requests` bullet
+  above) instead of depending on `requests` itself will see that `ImportError` move from import
+  time to call time. `requests` remains a declared runtime dependency in `pyproject.toml`, so
+  this affects nobody who installs the package normally.
+
 ## Version 1.2.0 (2026-06-14)
 
 ### Features

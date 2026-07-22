@@ -1,11 +1,16 @@
 import datetime
+import inspect
+import subprocess
+import sys
 import uuid
+from types import MappingProxyType
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
 
 import pytest
 from freezegun import freeze_time
 
+from vintasend.app_settings import NotificationSettings
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationError,
@@ -56,6 +61,32 @@ def notification_to_dict(notification: "Notification") -> NotificationDict:
         context_used=notification.context_used,
         adapter_extra_parameters=notification.adapter_extra_parameters,
     )
+
+
+def _reset_notification_settings_singleton(test_case: TestCase) -> None:
+    """Clear the NotificationSettings singleton for one test, then restore it.
+
+    NotificationSettings uses SingletonMeta: the first construction wins, and every later
+    `config` argument is ignored. SingletonMeta.__call__ stores the built instance on an
+    `_instances` attribute it sets directly on the class being constructed. Once
+    NotificationSettings has been built once, that per-class attribute shadows the empty
+    default living on SingletonMeta itself, so clearing SingletonMeta's own `_instances` has
+    no effect at that point. NotificationSettings's own `_instances` attribute is the one
+    that must be cleared, and it must be restored after the test. This state is process-global,
+    so leaking it would make other tests order-dependent.
+    """
+    sentinel = object()
+    original = vars(NotificationSettings).get("_instances", sentinel)
+
+    def _restore() -> None:
+        if original is sentinel:
+            if "_instances" in vars(NotificationSettings):
+                delattr(NotificationSettings, "_instances")
+        else:
+            NotificationSettings._instances = original
+
+    test_case.addCleanup(_restore)
+    NotificationSettings._instances = MappingProxyType({})
 
 
 class NotificationServiceTestCase(TestCase):
@@ -440,9 +471,12 @@ class NotificationServiceTestCase(TestCase):
         )
 
         with freeze_time(send_after + datetime.timedelta(days=1)):
-            self.notification_service.send_pending_notifications()
+            with patch("vintasend.services.notification_service.logger") as mocked_logger:
+                self.notification_service.send_pending_notifications()
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+        mocked_logger.info.assert_any_call("Sent %s notifications", 1)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 0)
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_notifications(self, mock_send):
@@ -477,6 +511,8 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
+        mocked_logger.info.assert_any_call("Sent %s notifications", 0)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 1)
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_marking_notifications_as_failed(
@@ -513,6 +549,8 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         assert mocked_logger.exception.call_count == 2
+        mocked_logger.info.assert_any_call("Sent %s notifications", 0)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 1)
 
     @patch("vintasend.services.notification_service.NotificationService.send")
     def test_send_pending_notifications_counts_failed_marking_notifications_as_sent(
@@ -549,6 +587,8 @@ class NotificationServiceTestCase(TestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
+        mocked_logger.info.assert_any_call("Sent %s notifications", 1)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 0)
 
     def test_get_pending_notifications(self):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
@@ -1338,6 +1378,49 @@ class NotificationServiceTestCase(TestCase):
         assert service.notification_backend == notification_backend
         assert service.notification_adapters == notification_adapters
 
+    def test_instances_config_initializes_notification_settings_singleton(self):
+        """Config must reach NotificationSettings even when backend/adapters are instances.
+
+        Neither get_notification_backend nor BaseNotificationAdapter.__init__ runs on that
+        path, so NotificationService.__init__ has to construct NotificationSettings(config)
+        itself, or the config argument is silently dropped and the app falls back to
+        framework defaults.
+        """
+        _reset_notification_settings_singleton(self)
+
+        class _FakeConfig:
+            NOTIFICATION_DEFAULT_FROM_EMAIL = "sync-singleton-test@example.com"
+
+        notification_backend = FakeFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        notification_adapters = [
+            FakeEmailAdapter(
+                backend=notification_backend, template_renderer=FakeTemplateRenderer()
+            ),
+        ]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            NotificationService(
+                notification_adapters=notification_adapters,
+                notification_backend=notification_backend,
+                config=_FakeConfig(),
+            )
+
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "sync-singleton-test@example.com"
+        )
+
+        # First construction wins: a later call with a different config is ignored, because
+        # the singleton is already built and SingletonMeta returns the cached instance
+        # without re-running __init__.
+        NotificationSettings(object())
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "sync-singleton-test@example.com"
+        )
+
 
 class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
     def setup_method(self, method):
@@ -1740,9 +1823,12 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         )
 
         with freeze_time(send_after + datetime.timedelta(days=1)):
-            await self.notification_service.send_pending_notifications()
+            with patch("vintasend.services.notification_service.logger") as mocked_logger:
+                await self.notification_service.send_pending_notifications()
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+        mocked_logger.info.assert_any_call("Sent %s notifications", 1)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 0)
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_service.AsyncIONotificationService.send")
@@ -1781,6 +1867,8 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
+        mocked_logger.info.assert_any_call("Sent %s notifications", 0)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 1)
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_service.AsyncIONotificationService.send")
@@ -1818,6 +1906,8 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         assert mocked_logger.exception.call_count == 2
+        mocked_logger.info.assert_any_call("Sent %s notifications", 0)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 1)
 
     @pytest.mark.asyncio
     @patch("vintasend.services.notification_service.AsyncIONotificationService.send")
@@ -1855,6 +1945,8 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
         mocked_logger.exception.assert_called_once()
+        mocked_logger.info.assert_any_call("Sent %s notifications", 1)
+        mocked_logger.info.assert_any_call("Failed to send %s notifications", 0)
 
     @pytest.mark.asyncio
     async def test_get_pending_notifications(self):
@@ -2490,3 +2582,178 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert service.notification_backend == notification_backend
         assert service.notification_adapters == notification_adapters
+
+    async def test_instances_config_initializes_notification_settings_singleton(self):
+        """Config must reach NotificationSettings even when backend/adapters are instances.
+
+        Neither get_asyncio_notification_backend nor AsyncIOBaseNotificationAdapter.__init__
+        runs on that path, so AsyncIONotificationService.__init__ has to construct
+        NotificationSettings(config) itself, or the config argument is silently dropped and
+        the app falls back to framework defaults.
+        """
+        _reset_notification_settings_singleton(self)
+
+        class _FakeConfig:
+            NOTIFICATION_DEFAULT_FROM_EMAIL = "async-singleton-test@example.com"
+
+        notification_backend = FakeAsyncIOFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        notification_adapters = [
+            FakeAsyncIOEmailAdapter(
+                backend=notification_backend, template_renderer=FakeTemplateRenderer()
+            ),
+        ]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            AsyncIONotificationService(
+                notification_adapters=notification_adapters,
+                notification_backend=notification_backend,
+                config=_FakeConfig(),
+            )
+
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "async-singleton-test@example.com"
+        )
+
+        # First construction wins: a later call with a different config is ignored, because
+        # the singleton is already built and SingletonMeta returns the cached instance
+        # without re-running __init__.
+        NotificationSettings(object())
+        assert (
+            NotificationSettings().NOTIFICATION_DEFAULT_FROM_EMAIL
+            == "async-singleton-test@example.com"
+        )
+
+    async def test_instanciate_with_adapter_kwargs_tuple_form(self):
+        """The sync service accepts an (import_str, kwargs) tuple as an adapter's first
+        element, and get_asyncio_notification_adapters already handles that shape too. The
+        async service's own construction guard must accept it as well.
+        """
+        service = AsyncIONotificationService(
+            notification_adapters=[
+                (
+                    (
+                        "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter",
+                        {"extra_config": "value"},
+                    ),
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend",
+            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
+        )
+
+        adapters = list(service.notification_adapters)
+        assert len(adapters) == 1
+        assert adapters[0].adapter_kwargs == {"extra_config": "value"}
+
+
+class NotificationServiceImportTestCase(TestCase):
+    def test_importing_module_does_not_import_requests(self):
+        """Importing notification_service must not pull in requests as a side effect.
+
+        requests is only needed by service_utils.download_from_url, which imports it lazily
+        at call time, so a bare import of the service module must not add it to sys.modules.
+        """
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import vintasend.services.notification_service, sys; "
+                "assert 'requests' not in sys.modules",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+# Methods that intentionally exist on only one of NotificationService / AsyncIONotificationService.
+# Per AGENTS.md's sync/AsyncIO parity rule, any other one-sided method is a drift bug, not a
+# design choice, and should fail the test below instead of growing this list. Each entry names
+# the one class that carries the method and why the asymmetry is deliberate, so a method that
+# moves to the other class -- rather than simply appearing on a second class -- still fails.
+SERVICE_METHOD_PARITY_ALLOWLIST: dict[str, tuple[str, str]] = {
+    "delayed_send": (
+        "NotificationService",
+        "Sends through an AsyncBaseNotificationAdapter, a sync adapter that hands delivery to "
+        "a task queue (see AGENTS.md's note on notification_adapters/async_base.py) rather than "
+        "genuine async/await. AsyncIONotificationService has no such adapter kind to send "
+        "through today; the background-send-queue plan adds one.",
+    ),
+    "_send_notification_with_error_logging": (
+        "AsyncIONotificationService",
+        "Its send_pending_notifications sends notifications concurrently with asyncio.gather, "
+        "which needs a per-notification coroutine to carry the try/except/logging for each one. "
+        "The sync twin runs the same branches inline in a plain for loop and never needed a "
+        "separate helper for it.",
+    ),
+}
+
+
+class ServiceMethodParityTestCase(TestCase):
+    """
+    Guards the sync/AsyncIO parity rule from AGENTS.md: NotificationService and
+    AsyncIONotificationService must expose the same set of methods, except for the
+    differences named in SERVICE_METHOD_PARITY_ALLOWLIST above.
+
+    "Method set" here covers every function, staticmethod, classmethod, and property defined
+    directly on the class body, including `_`-prefixed helpers and dunders such as __init__,
+    not just the public, non-underscore API. Most of the drift this plan exists to close lives
+    in the `_`-prefixed helpers, so a check limited to public names would miss it.
+    """
+
+    def _method_names(self, cls: type) -> set[str]:
+        return {
+            name
+            for name, value in vars(cls).items()
+            if inspect.isfunction(value) or isinstance(value, (staticmethod, classmethod, property))
+        }
+
+    def test_method_sets_match_except_for_allowlisted_differences(self):
+        sync_names = self._method_names(NotificationService)
+        async_names = self._method_names(AsyncIONotificationService)
+
+        sync_only = sync_names - async_names
+        async_only = async_names - sync_names
+
+        unexplained_sync_only = sync_only - SERVICE_METHOD_PARITY_ALLOWLIST.keys()
+        unexplained_async_only = async_only - SERVICE_METHOD_PARITY_ALLOWLIST.keys()
+
+        assert not unexplained_sync_only, (
+            "NotificationService defines methods AsyncIONotificationService lacks, with no "
+            f"allowlist entry explaining why: {sorted(unexplained_sync_only)}. Add a matching "
+            "method to AsyncIONotificationService, or a reasoned entry to "
+            "SERVICE_METHOD_PARITY_ALLOWLIST."
+        )
+        assert not unexplained_async_only, (
+            "AsyncIONotificationService defines methods NotificationService lacks, with no "
+            f"allowlist entry explaining why: {sorted(unexplained_async_only)}. Add a matching "
+            "method to NotificationService, or a reasoned entry to "
+            "SERVICE_METHOD_PARITY_ALLOWLIST."
+        )
+
+        # sync_only and async_only are disjoint by construction (each is one side minus the
+        # other), so checking membership in the named owner's set alone catches a method that
+        # moved to the other class, not just one that vanished from both.
+        owner_by_class_name = {
+            "NotificationService": sync_only,
+            "AsyncIONotificationService": async_only,
+        }
+        for method_name, (owner_class_name, _reason) in SERVICE_METHOD_PARITY_ALLOWLIST.items():
+            assert method_name in owner_by_class_name[owner_class_name], (
+                f"SERVICE_METHOD_PARITY_ALLOWLIST says {method_name!r} belongs only to "
+                f"{owner_class_name}, but it is not one-sided in {owner_class_name}'s favor "
+                "any more -- it may have moved to the other class, or stopped being one-sided "
+                "at all. Update the allowlist entry to match reality."
+            )
+
+        # An allowlist entry that no longer names a real asymmetry means the drift it
+        # described has already been fixed elsewhere, so flag it rather than let it go stale.
+        stale_entries = set(SERVICE_METHOD_PARITY_ALLOWLIST.keys()) - (sync_only | async_only)
+        assert not stale_entries, (
+            f"SERVICE_METHOD_PARITY_ALLOWLIST names methods that are no longer asymmetric: "
+            f"{sorted(stale_entries)}. Remove the stale entries."
+        )

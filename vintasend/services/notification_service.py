@@ -1,13 +1,10 @@
 import asyncio
 import datetime
-import inspect
 import logging
 import sys
 import uuid
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
-
-import requests
 
 from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -51,6 +48,14 @@ from vintasend.services.notification_adapters.async_base import (
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.service_utils import (
+    download_from_url,
+    is_asyncio_context_function,
+    is_sync_context_function,
+    is_url,
+    read_file_data,
+    validate_attachments,
+)
 from vintasend.services.utils import get_class_path
 from vintasend.utils.singleton_utils import SingletonMeta
 
@@ -180,56 +185,20 @@ class NotificationService(Generic[A, B]):
     def _validate_attachments(
         self, attachments: list[NotificationAttachment]
     ) -> list[NotificationAttachment]:
-        """Validate attachments and return the validated list"""
-        # For now, just pass through the attachments
-        # In the future, this can include validation logic like:
-        # - File size limits
-        # - Content type validation
-        # - URL validation
-        # - Security checks
-        for attachment in attachments:
-            if attachment.is_url():
-                # URL validation is already handled in the is_url() method
-                pass
-
-        return attachments
+        """Validate attachments and return the validated list."""
+        return validate_attachments(attachments)
 
     def _read_file_data(self, file) -> bytes:
-        """Read file data from various file-like object types"""
-        from pathlib import Path
-
-        if isinstance(file, str):
-            if self._is_url(file):
-                return self._download_from_url(file)
-            else:
-                # Read from file path
-                with open(file, "rb") as f:
-                    return f.read()
-        elif isinstance(file, Path):
-            with open(file, "rb") as f:
-                return f.read()
-        elif hasattr(file, "read"):
-            current_pos = file.tell() if hasattr(file, "tell") else 0
-            if hasattr(file, "seek"):
-                file.seek(0)
-            data = file.read()
-            if hasattr(file, "seek"):
-                file.seek(current_pos)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            return data
-        else:
-            raise ValueError(f"Unsupported file type: {type(file)}")
+        """Read file data from a path, URL, `Path` object, or file-like object."""
+        return read_file_data(file)
 
     def _is_url(self, file_str: str) -> bool:
-        """Check if a string is a URL"""
-        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
+        """Check whether a string is a URL rather than a local file path."""
+        return is_url(file_str)
 
     def _download_from_url(self, url: str) -> bytes:
-        """Download file content from URL"""
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.content
+        """Download file content from a URL."""
+        return download_from_url(url)
 
     def send(self, notification: Notification | OneOffNotification) -> None:
         """
@@ -243,7 +212,7 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            notification: Notification - the notification to be sent
+            notification: Notification | OneOffNotification - the notification to be sent
         """
         try:
             context = self.get_notification_context(notification)
@@ -481,14 +450,14 @@ class NotificationService(Generic[A, B]):
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], Coroutine[Any, Any, NotificationContextDict]]]:
-        return inspect.iscoroutinefunction(context_function)
+        return is_asyncio_context_function(context_function)
 
     def _is_sync_context_function(
         self,
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
-        return not inspect.iscoroutinefunction(context_function)
+        return is_sync_context_function(context_function)
 
     def get_notification_context(
         self, notification: Notification | OneOffNotification
@@ -501,7 +470,7 @@ class NotificationService(Generic[A, B]):
             * NotificationContextGenerationError if the context generation fails.
 
         Parameters:
-            notification: Notification - the notification to generate the context for
+            notification: Notification | OneOffNotification - the notification to generate the context for
         """
         context_function = Contexts().get_function(notification.context_name)
         if context_function is None:
@@ -587,10 +556,10 @@ class NotificationService(Generic[A, B]):
             * NotificationUpdateError if the notification fails to be marked as read.
 
         Parameters:
-            notification: Notification - the notification to mark as read
+            notification_id: int | str | uuid.UUID - the notification to mark as read
 
         Returns:
-            Notification | OneOffNotification- the updated notification
+            Notification | OneOffNotification - the updated notification
         """
         return self.notification_backend.mark_sent_as_read(notification_id)
 
@@ -703,7 +672,7 @@ class NotificationService(Generic[A, B]):
         Cancel a notification.
 
         Parameters:
-            notifictaion_id: int | str | uuid.UUID - the ID of the notification to cancel
+            notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
         return self.notification_backend.cancel_notification(notification_id)
 
@@ -766,11 +735,17 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
     def __init__(
         self,
-        notification_adapters: Iterable[AAIO] | Iterable[tuple[str, str]] | None = None,
+        notification_adapters: Iterable[AAIO]
+        | Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]
+        | None = None,
         notification_backend: BAIO | str | None = None,
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
     ):
+        # initialize the notification settings singleton for the first time
+        # to ensure all components have access to the same settings
+        NotificationSettings(config)
+
         if isinstance(notification_backend, AsyncIOBaseNotificationBackend):
             self.notification_backend = cast(BAIO, notification_backend)
         else:
@@ -804,81 +779,60 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ]
 
     def _check_is_base_notification_adapter_iterable(
-        self, notification_adapters: Iterable[AAIO] | Iterable[tuple[str, str]] | None
+        self,
+        notification_adapters: Iterable[AAIO]
+        | Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]
+        | None,
     ) -> TypeGuard[Iterable[AAIO]]:
         return notification_adapters is not None and all(
             isinstance(adapter, AsyncIOBaseNotificationAdapter) for adapter in notification_adapters
         )
 
     def _check_is_adapters_tuple_iterable(
-        self, notification_adapters: Iterable[AAIO] | Iterable[tuple[str, str]] | None
-    ) -> TypeGuard[Iterable[tuple[str, str]]]:
+        self,
+        notification_adapters: Iterable[AAIO]
+        | Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]
+        | None,
+    ) -> TypeGuard[Iterable[tuple[str, str | tuple[str, dict[str, Any]]]]]:
         return notification_adapters is not None and all(
             (isinstance(adapter, tuple) or isinstance(adapter, list))
             and len(adapter) == 2
-            and isinstance(adapter[0], str)
-            and isinstance(adapter[1], str)
+            and (
+                isinstance(adapter[0], str)
+                or (
+                    isinstance(adapter[0], tuple)
+                    and isinstance(adapter[0][0], str)
+                    and isinstance(adapter[0][1], dict)
+                )
+            )
+            and (
+                isinstance(adapter[1], str)
+                or (
+                    isinstance(adapter[1], tuple)
+                    and isinstance(adapter[1][0], str)
+                    and isinstance(adapter[1][1], dict)
+                )
+            )
             for adapter in notification_adapters
         )
 
     def _validate_attachments(
         self, attachments: list[NotificationAttachment]
     ) -> list[NotificationAttachment]:
-        """Validate attachments and return the validated list"""
-        # For now, just pass through the attachments
-        # In the future, this can include validation logic like:
-        # - File size limits
-        # - Content type validation
-        # - URL validation
-        # - Security checks
-        for attachment in attachments:
-            if attachment.is_url():
-                # URL validation is already handled in the is_url() method
-                pass
-
-        return attachments
+        """Validate attachments and return the validated list."""
+        return validate_attachments(attachments)
 
     def _read_file_data(self, file) -> bytes:
-        """Read file data from various file-like object types"""
-        from pathlib import Path
-
-        if isinstance(file, str):
-            if self._is_url(file):
-                return self._download_from_url(file)
-            else:
-                # Read from file path
-                with open(file, "rb") as f:
-                    return f.read()
-        elif isinstance(file, Path):
-            with open(file, "rb") as f:
-                return f.read()
-        elif hasattr(file, "read"):
-            current_pos = file.tell() if hasattr(file, "tell") else 0
-            if hasattr(file, "seek"):
-                file.seek(0)
-            data = file.read()
-            if hasattr(file, "seek"):
-                file.seek(current_pos)
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            return data
-        else:
-            raise ValueError(f"Unsupported file type: {type(file)}")
+        """Read file data from a path, URL, `Path` object, or file-like object."""
+        return read_file_data(file)
 
     def _is_url(self, file_str: str) -> bool:
-        """Check if a string is a URL"""
-        return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
+        """Check whether a string is a URL rather than a local file path."""
+        return is_url(file_str)
 
     def _download_from_url(self, url: str) -> bytes:
-        """Download file content from URL"""
-        try:
-            import requests
-        except ImportError as e:
-            raise ImportError("requests library is required to download files from URLs") from e
-
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.content
+        """Download file content from a URL."""
+        return download_from_url(url)
 
     async def send(
         self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None
@@ -1012,6 +966,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
+
         This method may raise the following exceptions:
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
@@ -1138,7 +1093,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationContextGenerationError if the context generation fails.
 
         Parameters:
-            notification: Notification - the notification to generate the context for
+            notification: Notification | OneOffNotification - the notification to generate the context for
         """
         context_function = Contexts().get_function(notification.context_name)
         if context_function is None:
@@ -1157,30 +1112,40 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], Coroutine[Any, Any, NotificationContextDict]]]:
-        return inspect.iscoroutinefunction(context_function)
+        return is_asyncio_context_function(context_function)
 
     def _is_sync_context_function(
         self,
         context_function: Callable[[Any], NotificationContextDict]
         | Callable[[Any], Coroutine[Any, Any, NotificationContextDict]],
     ) -> TypeGuard[Callable[[Any], NotificationContextDict]]:
-        return not inspect.iscoroutinefunction(context_function)
+        return is_sync_context_function(context_function)
 
     async def _send_notification_with_error_logging(
         self, notification: "Notification | OneOffNotification", lock: asyncio.Lock | None = None
-    ) -> None:
+    ) -> bool:
+        """
+        Send a notification, logging success or failure, and report whether it counts as sent.
+
+        Returns:
+            bool - True if the notification counts as sent, False if it counts as failed.
+        """
         try:
             await self.send(notification, lock)
         except NotificationSendError:
             logger.exception("Failed to send notification %s", notification.id)
+            return False
         except NotificationMarkFailedError:
             logger.exception("Failed to send notification %s", notification.id)
             logger.exception("Failed to mark notification %s as failed", notification.id)
+            return False
         except NotificationMarkSentError:
             logger.info("Notification %s sent", notification.id)
             logger.exception("Failed to mark notification %s as sent", notification.id)
+            return True
         else:
             logger.info("Notification %s sent", notification.id)
+            return True
 
     async def send_pending_notifications(self) -> None:
         """
@@ -1193,13 +1158,17 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         pending_notifications = await self.notification_backend.get_all_pending_notifications()
         lock = asyncio.Lock()
-        await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self._send_notification_with_error_logging(notification, lock)
                 for notification in pending_notifications
             ]
         )
-        return None
+        notifications_sent = sum(1 for result in results if result)
+        notifications_failed = len(results) - notifications_sent
+
+        logger.info("Sent %s notifications", notifications_sent)
+        logger.info("Failed to send %s notifications", notifications_failed)
 
     async def get_pending_notifications(
         self, page: int, page_size: int
@@ -1240,7 +1209,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationUpdateError if the notification fails to be marked as read.
 
         Parameters:
-            notification: Notification - the notification to mark as read
+            notification_id: int | str | uuid.UUID - the notification to mark as read
 
         Returns:
             Notification | OneOffNotification - the updated notification
