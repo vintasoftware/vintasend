@@ -29,5 +29,4 @@ class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer):
         notification: "Notification | OneOffNotification",
         context: "NotificationContextDict",
         **kwargs,
-    ) -> TemplatedEmail:
-        raise NotImplementedError
+    ) -> TemplatedEmail: ...

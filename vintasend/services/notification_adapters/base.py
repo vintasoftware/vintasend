@@ -115,4 +115,3 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
         :param notification: The notification to send.
         :param context: The context to render the notification templates.
         """
-        raise NotImplementedError

@@ -30,36 +30,30 @@ class BaseNotificationBackend(ABC):
         self.backend_kwargs = kwargs
 
     @abstractmethod
-    def get_all_pending_notifications(self) -> Iterable["Notification | OneOffNotification"]:
-        raise NotImplementedError
+    def get_all_pending_notifications(self) -> Iterable["Notification | OneOffNotification"]: ...
 
     @abstractmethod
     def get_pending_notifications(
         self, page: int, page_size: int
-    ) -> Iterable["Notification | OneOffNotification"]:
-        raise NotImplementedError
+    ) -> Iterable["Notification | OneOffNotification"]: ...
 
     @abstractmethod
-    def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
-        raise NotImplementedError
+    def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]: ...
 
     @abstractmethod
     def get_future_notifications(
         self, page: int, page_size: int
-    ) -> Iterable["Notification | OneOffNotification"]:
-        raise NotImplementedError
+    ) -> Iterable["Notification | OneOffNotification"]: ...
 
     @abstractmethod
     def get_all_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable["Notification | OneOffNotification"]:
-        raise NotImplementedError
+    ) -> Iterable["Notification | OneOffNotification"]: ...
 
     @abstractmethod
     def get_future_notifications_from_user(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable["Notification | OneOffNotification"]:
-        raise NotImplementedError
+    ) -> Iterable["Notification | OneOffNotification"]: ...
 
     @abstractmethod
     def persist_notification(
@@ -75,8 +69,7 @@ class BaseNotificationBackend(ABC):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list["NotificationAttachment"] | None = None,
-    ) -> "Notification":
-        raise NotImplementedError
+    ) -> "Notification": ...
 
     @abstractmethod
     def persist_one_off_notification(
@@ -94,8 +87,7 @@ class BaseNotificationBackend(ABC):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list["NotificationAttachment"] | None = None,
-    ) -> "OneOffNotification":
-        raise NotImplementedError
+    ) -> "OneOffNotification": ...
 
     @abstractmethod
     def persist_notification_update(
@@ -108,25 +100,21 @@ class BaseNotificationBackend(ABC):
         Notifications that have already been sent should not be updated. If a notification has already been sent,
         the method should raise a NotificationUpdateError.
         """
-        raise NotImplementedError
 
     @abstractmethod
     def mark_pending_as_sent(
         self, notification_id: int | str | uuid.UUID
-    ) -> "Notification | OneOffNotification":
-        raise NotImplementedError
+    ) -> "Notification | OneOffNotification": ...
 
     @abstractmethod
     def mark_pending_as_failed(
         self, notification_id: int | str | uuid.UUID
-    ) -> "Notification | OneOffNotification":
-        raise NotImplementedError
+    ) -> "Notification | OneOffNotification": ...
 
     @abstractmethod
     def mark_sent_as_read(
         self, notification_id: int | str | uuid.UUID
-    ) -> "Notification | OneOffNotification":
-        raise NotImplementedError
+    ) -> "Notification | OneOffNotification": ...
 
     @abstractmethod
     def mark_sent_as_read_bulk(
@@ -152,29 +140,24 @@ class BaseNotificationBackend(ABC):
         Unlike ``mark_sent_as_read``, this method NEVER raises when zero rows are
         updated -- it is idempotent by construction.
         """
-        raise NotImplementedError
 
     @abstractmethod
-    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
-        raise NotImplementedError
+    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None: ...
 
     @abstractmethod
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
-    ) -> "Notification | OneOffNotification":
-        raise NotImplementedError
+    ) -> "Notification | OneOffNotification": ...
 
     @abstractmethod
     def filter_all_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID
-    ) -> Iterable["Notification"]:
-        raise NotImplementedError
+    ) -> Iterable["Notification"]: ...
 
     @abstractmethod
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int, page_size: int
-    ) -> Iterable["Notification"]:
-        raise NotImplementedError
+    ) -> Iterable["Notification"]: ...
 
     @abstractmethod
     def filter_all_in_app_notifications(
@@ -190,7 +173,6 @@ class BaseNotificationBackend(ABC):
         for end-user facing listings; this unpaginated variant is meant for internal
         and count use.
         """
-        raise NotImplementedError
 
     @abstractmethod
     def filter_in_app_notifications(
@@ -201,7 +183,6 @@ class BaseNotificationBackend(ABC):
 
         Same SENT/READ filtering as ``filter_all_in_app_notifications``.
         """
-        raise NotImplementedError
 
     def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
         """
@@ -224,8 +205,7 @@ class BaseNotificationBackend(ABC):
         return sum(1 for _ in self.filter_all_in_app_unread_notifications(user_id))
 
     @abstractmethod
-    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
-        raise NotImplementedError
+    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str: ...
 
     @abstractmethod
     def store_context_used(
@@ -233,5 +213,4 @@ class BaseNotificationBackend(ABC):
         notification_id: int | str | uuid.UUID,
         context: dict,
         adapter_import_str: str,
-    ) -> None:
-        raise NotImplementedError
+    ) -> None: ...

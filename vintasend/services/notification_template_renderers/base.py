@@ -44,4 +44,3 @@ class BaseNotificationTemplateRenderer(ABC):
         :param notification: The notification to render.
         :return: The input necessary to send the notification.
         """
-        raise NotImplementedError

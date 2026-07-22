@@ -105,5 +105,4 @@ class AsyncBaseNotificationAdapter(
     @abstractmethod
     def delayed_send(
         self, notification_dict: NotificationDict | OneOffNotificationDict, context_dict: dict
-    ) -> None:
-        raise NotImplementedError
+    ) -> None: ...
