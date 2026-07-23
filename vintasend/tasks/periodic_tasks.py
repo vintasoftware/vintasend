@@ -1,37 +1,25 @@
-from collections.abc import Iterable
+"""Periodic entrypoint for draining notifications whose send time has arrived."""
 
-from vintasend.services.helpers import get_notification_adapters
-from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
+from typing import Any
+
 from vintasend.services.notification_service import NotificationService
+from vintasend.tasks.background_tasks import get_notification_service
 
 
 def periodic_send_pending_notifications(
-    notification_adapters: Iterable[tuple[str, str]] | None = None,
-    backend_import_str: str | None = None,
-    backend_kwargs: dict | None = None,
-    config: dict | None = None,
-):
-    adapter_intances = get_notification_adapters(
-        notification_adapters, backend_import_str, backend_kwargs
+    notification_service: "NotificationService[Any, Any] | None" = None,
+) -> None:
+    """
+    Send every pending notification, on a schedule.
+
+    Like `send_notification`, this runs outside the web process and gets its service from
+    `NOTIFICATION_SERVICE_FACTORY` -- cached per process and shared with the background-send
+    entrypoint.
+
+    :param notification_service: an explicit service, for hosts that would rather wire it
+        themselves than go through NOTIFICATION_SERVICE_FACTORY.
+    """
+    service = (
+        notification_service if notification_service is not None else get_notification_service()
     )
-    desserialized_backend_kwargs = None
-    desserialized_config = None
-    for adapter in adapter_intances:
-        if isinstance(adapter, AsyncBaseNotificationAdapter):
-            desserialized_backend_kwargs = (
-                adapter.restore_backend_kwargs(backend_kwargs) if backend_kwargs else None
-            )
-            desserialized_config = adapter.restore_config(config) if config else None
-
-            break
-
-    if not desserialized_backend_kwargs or not desserialized_config:
-        desserialized_backend_kwargs = backend_kwargs
-        desserialized_config = config
-
-    NotificationService(
-        notification_adapters=notification_adapters,
-        notification_backend=backend_import_str,
-        notification_backend_kwargs=desserialized_backend_kwargs,
-        config=desserialized_config,
-    ).send_pending_notifications()
+    service.send_pending_notifications()
