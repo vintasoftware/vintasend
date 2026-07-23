@@ -451,6 +451,53 @@ A backend that returns a detached object from `persist_notification` may hand ba
 still looks `PENDING_SEND` even though the clone was, in fact, sent; re-fetch through
 `get_notification` or `filter_notifications` if you need the backend's own freshest copy.
 
+#### Rendering a notification from historical template content
+
+`render_email_template_from_content` reproduces how an email notification rendered in the past,
+for a preview or an audit trail -- without touching the notification's currently configured
+templates, and without sending or persisting anything:
+
+```python
+from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
+    EmailTemplateContent,
+)
+
+notification = notification_service.get_notification(notification_id)
+
+historical_content = EmailTemplateContent(
+    subject_template="Your order {{ order_id }} has shipped",
+    body_template="<p>Hi {{ first_name }}, your order is on its way.</p>",
+    # preheader_template is optional -- a Python-only concept with no TS counterpart
+    preheader_template="Your order is on its way",
+)
+
+templated_email = notification_service.render_email_template_from_content(
+    notification,
+    historical_content,
+    # Render with the context the notification actually used, not a freshly generated one
+    notification.context_used,
+)
+
+templated_email.subject   # "Your order 123 has shipped"
+templated_email.body      # "<p>Hi Ada, your order is on its way.</p>"
+templated_email.preheader # "Your order is on its way"
+```
+
+`AsyncIONotificationService.render_email_template_from_content` is the same signature, awaited.
+
+This is a pure, read-shaped operation: it performs no I/O, generates no context (the context you
+pass is used verbatim -- typically a notification's stored `context_used`), and never sends or
+writes anything. It raises `NotificationRenderError` if the notification's type has no email
+adapter configured, or if the configured renderer is not a `BaseTemplatedEmailRenderer`.
+
+**Injection-safety caveat.** `template_content` is rendered as-is through the configured
+renderer -- an inline template string is an injection surface if it comes from user input.
+Only pass template content sourced from your own application's template history (for example, a
+version you stored alongside the notification, or a git-tracked template file at a known past
+revision), never a string a user typed in. Jinja2-backed renderers still apply their normal
+autoescape defaults on top of this, but that's a mitigation, not a substitute for keeping the
+template source trusted.
+
 #### `tenant` is a filter field, not an access control
 
 `tenant` behaves like `user_id` elsewhere in this library: it's an opaque string this package
@@ -669,6 +716,21 @@ push there as usual. This repo's lint, type-check, and test commands deliberatel
 `implementations/` — each package has its own dependencies, its own tooling config, and
 its own CI. Committing here only records which commit of each implementation this repo
 points at.
+
+#### Creating a new implementation
+
+If none of the packages above cover what you need, don't start from a blank directory.
+`templates/vintasend-implementation-template/` is a ready-to-clone skeleton with one `TODO`
+stub per seam (backend, adapter, template renderer, queue service, attachment manager) and a
+matching test for each, so your clone installs and passes its test suite before you write any
+real logic:
+
+```bash
+python templates/vintasend-implementation-template/scripts/clone.py /path/to/vintasend-your-integration --package-name vintasend-your-integration
+```
+
+See that package's `README.md` for the full clone-and-rename workflow and a per-component
+checklist of exactly which methods to implement.
 
 
 ## Advanced Usage
