@@ -96,3 +96,14 @@ class NotificationQueueServiceResolutionError(NotificationError):
 
 class NotificationServiceFactoryError(NotificationError):
     """Raised when a worker's ``NOTIFICATION_SERVICE_FACTORY`` cannot be imported or called."""
+
+
+class InvalidGitCommitShaError(NotificationError):
+    """Raised when a git commit SHA provider returns a non-null value that is not 40
+    lowercase hex characters once trimmed and lowercased."""
+
+
+class GitCommitShaReassignmentError(NotificationError):
+    """Raised when an update attempts to set a notification's git_commit_sha. The field is
+    system-managed -- only NotificationService writes it, at send time, through
+    store_git_commit_sha."""

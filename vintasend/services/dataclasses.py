@@ -236,6 +236,10 @@ class Notification:
     sent_at: datetime.datetime | None = None
     read_at: datetime.datetime | None = None
     tenant: str | None = None
+    # System-managed: resolved and written by NotificationService at send time through an
+    # injected BaseGitCommitShaProvider. Never set on creation, and update_notification
+    # rejects it in raw kwargs -- see GitCommitShaReassignmentError.
+    git_commit_sha: str | None = None
 
 
 @dataclass
@@ -262,6 +266,10 @@ class OneOffNotification:
     sent_at: datetime.datetime | None = None
     read_at: datetime.datetime | None = None
     tenant: str | None = None
+    # System-managed: resolved and written by NotificationService at send time through an
+    # injected BaseGitCommitShaProvider. Never set on creation, and update_notification
+    # rejects it in raw kwargs -- see GitCommitShaReassignmentError.
+    git_commit_sha: str | None = None
 
 
 class UpdateNotificationKwargs(TypedDict, total=False):
@@ -279,3 +287,10 @@ class UpdateNotificationKwargs(TypedDict, total=False):
     # if it were already stored, which is wrong. Revisit this if an update-side upload flow is
     # ever added.
     attachments: list[StoredAttachment]
+    # git_commit_sha is deliberately absent. It is system-managed: NotificationService
+    # resolves and writes it at send time through an injected BaseGitCommitShaProvider via
+    # the dedicated store_git_commit_sha backend method, never through
+    # persist_notification_update. update_notification checks the raw kwargs dict (this
+    # TypedDict is not enforced at runtime) and raises GitCommitShaReassignmentError if a
+    # caller tries to pass it -- the same precedent as the declined attachments widening
+    # above and the existing tenant guard.
