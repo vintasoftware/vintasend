@@ -1,16 +1,5 @@
-"""Integration tests for `NOTIFICATION_ATTACHMENT_MANAGER` settings resolution.
-
-`app_settings.py` detects Django, Flask, or FastAPI at runtime and none of the three is
-a dependency of this package (nor installed in this test environment). Per
-`Skill(add-env-var)`, only the FastAPI path is directly testable without installing a
-framework -- it reads off a plain config object rather than importing `fastapi`. The
-Django and Flask paths are guarded with `importlib.util.find_spec` and skipped when the
-package isn't present, so they still run for real in an environment that has them.
-"""
-
 import importlib.util
 import os
-from types import MappingProxyType
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -25,32 +14,15 @@ from vintasend.app_settings import (
     NotificationSettingsDict,
 )
 from vintasend.services.helpers import get_attachment_manager
+from vintasend.tests.utils import _reset_notification_settings_singleton
 
 
 _DJANGO_INSTALLED = importlib.util.find_spec("django") is not None
 _FLASK_INSTALLED = importlib.util.find_spec("flask") is not None
 
 
-def _reset_notification_settings_singleton(test_case: TestCase) -> None:
-    """Clear the NotificationSettings singleton for one test, then restore it.
-
-    NotificationSettings uses SingletonMeta: the first construction wins, and every
-    later `config` argument is ignored. See the identical helper in
-    `test_notification_service.py` for the full explanation of why clearing
-    `NotificationSettings._instances` (not `SingletonMeta._instances`) is required.
-    """
-    sentinel = object()
-    original = vars(NotificationSettings).get("_instances", sentinel)
-
-    def _restore() -> None:
-        if original is sentinel:
-            if "_instances" in vars(NotificationSettings):
-                delattr(NotificationSettings, "_instances")
-        else:
-            NotificationSettings._instances = original
-
-    test_case.addCleanup(_restore)
-    NotificationSettings._instances = MappingProxyType({})
+class _FakeFastAPIConfig:
+    """Stands in for a FastAPI config object: `get_fastapi_setting` only calls `getattr`."""
 
 
 class NotificationSettingsDictTestCase(TestCase):
@@ -181,3 +153,99 @@ class FlaskAttachmentManagerSettingTestCase(TestCase):
                     settings = NotificationSettings()
 
         assert settings.NOTIFICATION_ATTACHMENT_MANAGER == "my_app.attachments.MyAttachmentManager"
+
+
+class NotificationQueueServiceSettingTestCase(TestCase):
+    def setUp(self):
+        _reset_notification_settings_singleton(self)
+
+    def test_unset_reads_as_empty_dict_when_no_framework_is_detected(self):
+        """`get_config` returns `{}`, not `None`, when no framework is detected."""
+        with patch("vintasend.app_settings.detect_framework", return_value="Unknown"):
+            settings = NotificationSettings()
+
+        assert settings.NOTIFICATION_QUEUE_SERVICE == {}
+
+    def test_resolves_from_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_QUEUE_SERVICE = "myapp.queue.MyQueueService"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_QUEUE_SERVICE == "myapp.queue.MyQueueService"
+
+    def test_resolves_from_env_var_when_framework_config_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ, {"NOTIFICATION_QUEUE_SERVICE": "env.queue.EnvQueueService"}
+            ):
+                settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_QUEUE_SERVICE == "env.queue.EnvQueueService"
+
+    def test_env_var_wins_over_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_QUEUE_SERVICE = "myapp.queue.MyQueueService"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ, {"NOTIFICATION_QUEUE_SERVICE": "env.queue.EnvQueueService"}
+            ):
+                settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_QUEUE_SERVICE == "env.queue.EnvQueueService"
+
+    def test_defaults_to_none_when_framework_detected_but_setting_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_QUEUE_SERVICE is None
+
+
+class NotificationServiceFactorySettingTestCase(TestCase):
+    def setUp(self):
+        _reset_notification_settings_singleton(self)
+
+    def test_unset_reads_as_empty_dict_when_no_framework_is_detected(self):
+        """`get_config` returns `{}`, not `None`, when no framework is detected."""
+        with patch("vintasend.app_settings.detect_framework", return_value="Unknown"):
+            settings = NotificationSettings()
+
+        assert settings.NOTIFICATION_SERVICE_FACTORY == {}
+
+    def test_resolves_from_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_SERVICE_FACTORY = "myapp.worker.build_service"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_SERVICE_FACTORY == "myapp.worker.build_service"
+
+    def test_resolves_from_env_var_when_framework_config_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ, {"NOTIFICATION_SERVICE_FACTORY": "env.worker.build_service"}
+            ):
+                settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_SERVICE_FACTORY == "env.worker.build_service"
+
+    def test_env_var_wins_over_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_SERVICE_FACTORY = "myapp.worker.build_service"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ, {"NOTIFICATION_SERVICE_FACTORY": "env.worker.build_service"}
+            ):
+                settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_SERVICE_FACTORY == "env.worker.build_service"
+
+    def test_defaults_to_none_when_framework_detected_but_setting_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_SERVICE_FACTORY is None

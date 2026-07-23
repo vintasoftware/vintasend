@@ -27,8 +27,10 @@ from vintasend.exceptions import (
     NotificationError,
     NotificationMarkFailedError,
     NotificationMarkSentError,
+    NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
+    TenantReassignmentError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
@@ -59,6 +61,10 @@ from vintasend.services.notification_backends.asyncio_base import (
 from vintasend.services.notification_backends.base import (
     BaseNotificationBackend,
     supports_attachments,
+from vintasend.services.notification_backends.filters import (
+    DEFAULT_BACKEND_FILTER_CAPABILITIES,
+    NotificationFilter,
+    NotificationOrderBy,
 )
 from vintasend.services.service_utils import (
     is_asyncio_context_function,
@@ -238,7 +244,11 @@ class NotificationService(Generic[A, B]):
         """Validate attachments and return the validated list."""
         return validate_attachments(attachments)
 
-    def send(self, notification: Notification | OneOffNotification) -> None:
+    def send(
+        self,
+        notification: Notification | OneOffNotification,
+        context: NotificationContextDict | None = None,
+    ) -> None:
         """
         Send a notification using the appropriate adapter
 
@@ -251,16 +261,23 @@ class NotificationService(Generic[A, B]):
 
         Parameters:
             notification: Notification | OneOffNotification - the notification to be sent
+            context: NotificationContextDict | None - a pre-computed context to send with,
+                bypassing context generation entirely. Used by ``resend_notification`` to reuse
+                a stored ``context_used`` verbatim; regular callers leave this ``None`` so
+                context is generated as usual.
         """
-        try:
-            context = self.get_notification_context(notification)
-        except NotificationContextGenerationError:
-            logger.exception("Failed to generate context for notification %s", notification.id)
+        if context is None:
             try:
-                self.notification_backend.mark_pending_as_failed(notification.id)
-            except NotificationUpdateError as e:
-                raise NotificationMarkFailedError("Failed to mark notification as failed") from e
-            return
+                context = self.get_notification_context(notification)
+            except NotificationContextGenerationError:
+                logger.exception("Failed to generate context for notification %s", notification.id)
+                try:
+                    self.notification_backend.mark_pending_as_failed(notification.id)
+                except NotificationUpdateError as e:
+                    raise NotificationMarkFailedError(
+                        "Failed to mark notification as failed"
+                    ) from e
+                return
 
         for adapter in self.notification_adapters:
             if adapter.notification_type.value != notification.notification_type:
@@ -306,6 +323,7 @@ class NotificationService(Generic[A, B]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -327,6 +345,8 @@ class NotificationService(Generic[A, B]):
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
             attachments: list[AnyNotificationAttachment] | None - attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
 
@@ -346,6 +366,9 @@ class NotificationService(Generic[A, B]):
         # not accept the keyword (e.g. attachment-unaware backends) then keep working.
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
+
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
 
         notification = self.notification_backend.persist_notification(**persist_kwargs)
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
@@ -369,6 +392,7 @@ class NotificationService(Generic[A, B]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> "OneOffNotification":
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -380,6 +404,20 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
+        Parameters:
+            email_or_phone: str - the email or phone that the one-off notification will be 
+                sent to
+            notification_type: str - the type of notification to send
+            title: str - the title of the notification
+            body_template: str - the string that represents the body template
+            context_name: str - the name of the context function to generate the context
+            context_kwargs: NotificationContextDict - the context kwargs to generate the context
+            send_after: datetime.datetime | None - the date and time to send the notification
+            subject_template: str - the  string that represents the subject template
+            preheader_template: str - the string that represents the preheader template
+            attachments: list[AnyNotificationAttachment] | None - attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
@@ -400,6 +438,9 @@ class NotificationService(Generic[A, B]):
         }
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
+  
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
 
         notification = self.notification_backend.persist_one_off_notification(**persist_kwargs)
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
@@ -417,6 +458,8 @@ class NotificationService(Generic[A, B]):
         Update a notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * TenantReassignmentError if ``tenant`` is present in kwargs -- a
+              notification's tenant cannot be reassigned after creation.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -426,6 +469,8 @@ class NotificationService(Generic[A, B]):
             notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
+        if "tenant" in kwargs:
+            raise TenantReassignmentError("A notification's tenant cannot be reassigned")
         notification = self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -715,6 +760,143 @@ class NotificationService(Generic[A, B]):
             raise NotificationError("No in-app notification adapter found")
         return self.notification_backend.count_in_app_unread_notifications(user_id)
 
+    def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        """
+        Query notifications with a composable filter, ordering and pagination.
+
+        The filter supports ``and`` / ``or`` / ``not`` groups, scalar-or-list membership, string
+        lookups and inclusive date ranges. An empty filter (``{}``) matches every notification.
+        Both ``Notification`` and ``OneOffNotification`` are returned. See
+        ``BaseNotificationBackend.filter_notifications`` for the full semantics.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` matches everything)
+            page: int - the 1-indexed page number to get
+            page_size: int - the number of notifications per page
+            order_by: NotificationOrderBy | None - the primary sort field and direction
+
+        Returns:
+            Iterable[Notification | OneOffNotification] - the selected page of matches
+        """
+        return self.notification_backend.filter_notifications(
+            filter, page=page, page_size=page_size, order_by=order_by
+        )
+
+    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        """
+        Count notifications matching ``filter``, ignoring pagination.
+
+        This is the total a dashboard needs to render pagination; ``filter_notifications``
+        returns an ``Iterable`` that cannot be ``len()``-ed.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` counts everything)
+
+        Returns:
+            int - the number of matching notifications
+        """
+        return self.notification_backend.count_notifications(filter)
+
+    def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter capabilities the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER an
+        all-``True`` default, so every capability the backend does not mention comes back
+        ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
+        kept byte-identical to the TypeScript sibling so one dashboard consumes either.
+
+        Returns:
+            dict[str, bool] - the merged capability report
+        """
+        return {
+            **DEFAULT_BACKEND_FILTER_CAPABILITIES,
+            **self.notification_backend.get_filter_capabilities(),
+        }
+
+    def resend_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        use_stored_context_if_available: bool = False,
+    ) -> Notification:
+        """
+        Resend a notification by cloning it into a brand-new PENDING row and sending that
+        clone immediately. This is the operation a dashboard "retry" action drives.
+
+        The source notification is re-read from the backend and left completely untouched --
+        its id, status and timestamps never change. The clone is a new row with its own id,
+        carrying over the source's user, template, context and attachment configuration.
+
+        This method may raise the following exceptions:
+            * NotificationResendError if the notification is a one-off, or is still scheduled
+              in the future (``send_after`` set and not yet due).
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if the adapter fails to send the notification.
+            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the notification to resend
+            use_stored_context_if_available: bool - when True and the source notification has
+                a stored ``context_used``, the clone reuses it verbatim instead of regenerating
+                context at send time. Defaults to False.
+
+        Returns:
+            Notification - the newly created clone
+        """
+        source = self.notification_backend.get_notification(notification_id)
+        if isinstance(source, OneOffNotification):
+            raise NotificationResendError("One-off notifications cannot be resent")
+        if source.send_after is not None and source.send_after > datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            raise NotificationResendError(
+                "Cannot resend a notification that is still scheduled in the future"
+            )
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if source.tenant is not None:
+            extra_persist_kwargs["tenant"] = source.tenant
+
+        clone = self.notification_backend.persist_notification(
+            user_id=source.user_id,
+            notification_type=source.notification_type,
+            title=source.title,
+            body_template=source.body_template,
+            context_name=source.context_name,
+            context_kwargs=source.context_kwargs,
+            send_after=None,
+            subject_template=source.subject_template,
+            preheader_template=source.preheader_template,
+            adapter_extra_parameters=source.adapter_extra_parameters,
+            **extra_persist_kwargs,
+        )
+
+        if source.attachments:
+            clone = cast(
+                Notification,
+                self.notification_backend.persist_notification_update(
+                    notification_id=clone.id,
+                    update_data={"attachments": list(source.attachments)},
+                ),
+            )
+
+        reused_context: NotificationContextDict | None = None
+        if use_stored_context_if_available and source.context_used is not None:
+            reused_context = cast(NotificationContextDict, source.context_used)
+
+        if clone.send_after is None or clone.send_after <= datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            self.send(clone, context=reused_context)
+        return clone
+
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
         Cancel a notification.
@@ -889,7 +1071,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         return validate_attachments(attachments)
 
     async def send(
-        self, notification: Notification | OneOffNotification, lock: asyncio.Lock | None = None
+        self,
+        notification: Notification | OneOffNotification,
+        lock: asyncio.Lock | None = None,
+        context: NotificationContextDict | None = None,
     ) -> None:
         """
         Send a notification using the appropriate adapter
@@ -903,16 +1088,23 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         Parameters:
             notification: Notification | OneOffNotification - the notification to be sent
+            context: NotificationContextDict | None - a pre-computed context to send with,
+                bypassing context generation entirely. Used by ``resend_notification`` to reuse
+                a stored ``context_used`` verbatim; regular callers leave this ``None`` so
+                context is generated as usual.
         """
-        try:
-            context = await self.get_notification_context(notification)
-        except NotificationContextGenerationError:
-            logger.exception("Failed to generate context for notification %s", notification.id)
+        if context is None:
             try:
-                await self.notification_backend.mark_pending_as_failed(notification.id, lock)
-            except NotificationUpdateError as e:
-                raise NotificationMarkFailedError("Failed to mark notification as failed") from e
-            return None
+                context = await self.get_notification_context(notification)
+            except NotificationContextGenerationError:
+                logger.exception("Failed to generate context for notification %s", notification.id)
+                try:
+                    await self.notification_backend.mark_pending_as_failed(notification.id, lock)
+                except NotificationUpdateError as e:
+                    raise NotificationMarkFailedError(
+                        "Failed to mark notification as failed"
+                    ) from e
+                return None
 
         for adapter in self.notification_adapters:
             if adapter.notification_type.value != notification.notification_type:
@@ -959,6 +1151,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -980,6 +1173,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
             attachments: list[AnyNotificationAttachment] | None - attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
 
@@ -999,6 +1194,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         # not accept the keyword (e.g. attachment-unaware backends) then keep working.
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
+  
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_notification(**persist_kwargs)
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
@@ -1022,6 +1220,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -1033,6 +1232,20 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
+        Parameters:
+            email_or_phone: str - the email or phone that the one-off notification will be 
+                sent to
+            notification_type: str - the type of notification to send
+            title: str - the title of the notification
+            body_template: str - the string that represents the body template
+            context_name: str - the name of the context function to generate the context
+            context_kwargs: NotificationContextDict - the context kwargs to generate the context
+            send_after: datetime.datetime | None - the date and time to send the notification
+            subject_template: str - the  string that represents the subject template
+            preheader_template: str - the string that represents the preheader template
+            attachments: list[AnyNotificationAttachment] | None - attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
@@ -1053,6 +1266,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         }
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
+  
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_one_off_notification(
             **persist_kwargs
@@ -1072,6 +1288,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Update a notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * TenantReassignmentError if ``tenant`` is present in kwargs -- a
+              notification's tenant cannot be reassigned after creation.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -1081,6 +1299,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
+        if "tenant" in kwargs:
+            raise TenantReassignmentError("A notification's tenant cannot be reassigned")
         notification = await self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -1387,6 +1607,143 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ):
             raise NotificationError("No in-app notification adapter found")
         return await self.notification_backend.count_in_app_unread_notifications(user_id)
+
+    async def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        """
+        Query notifications with a composable filter, ordering and pagination.
+
+        The filter supports ``and`` / ``or`` / ``not`` groups, scalar-or-list membership, string
+        lookups and inclusive date ranges. An empty filter (``{}``) matches every notification.
+        Both ``Notification`` and ``OneOffNotification`` are returned. See
+        ``AsyncIOBaseNotificationBackend.filter_notifications`` for the full semantics.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` matches everything)
+            page: int - the 1-indexed page number to get
+            page_size: int - the number of notifications per page
+            order_by: NotificationOrderBy | None - the primary sort field and direction
+
+        Returns:
+            Iterable[Notification | OneOffNotification] - the selected page of matches
+        """
+        return await self.notification_backend.filter_notifications(
+            filter, page=page, page_size=page_size, order_by=order_by
+        )
+
+    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        """
+        Count notifications matching ``filter``, ignoring pagination.
+
+        This is the total a dashboard needs to render pagination; ``filter_notifications``
+        returns an ``Iterable`` that cannot be ``len()``-ed.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` counts everything)
+
+        Returns:
+            int - the number of matching notifications
+        """
+        return await self.notification_backend.count_notifications(filter)
+
+    async def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter capabilities the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER an
+        all-``True`` default, so every capability the backend does not mention comes back
+        ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
+        kept byte-identical to the TypeScript sibling so one dashboard consumes either.
+
+        Returns:
+            dict[str, bool] - the merged capability report
+        """
+        return {
+            **DEFAULT_BACKEND_FILTER_CAPABILITIES,
+            **await self.notification_backend.get_filter_capabilities(),
+        }
+
+    async def resend_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        use_stored_context_if_available: bool = False,
+    ) -> Notification:
+        """
+        Resend a notification by cloning it into a brand-new PENDING row and sending that
+        clone immediately. This is the operation a dashboard "retry" action drives.
+
+        The source notification is re-read from the backend and left completely untouched --
+        its id, status and timestamps never change. The clone is a new row with its own id,
+        carrying over the source's user, template, context and attachment configuration.
+
+        This method may raise the following exceptions:
+            * NotificationResendError if the notification is a one-off, or is still scheduled
+              in the future (``send_after`` set and not yet due).
+            * NotificationContextGenerationError if the context generation fails;
+            * NotificationSendError if the adapter fails to send the notification.
+            * NotificationMarkFailedError if the notification fails to be marked as failed.
+            * NotificationMarkSentError if the notification fails to be marked as sent.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the notification to resend
+            use_stored_context_if_available: bool - when True and the source notification has
+                a stored ``context_used``, the clone reuses it verbatim instead of regenerating
+                context at send time. Defaults to False.
+
+        Returns:
+            Notification - the newly created clone
+        """
+        source = await self.notification_backend.get_notification(notification_id)
+        if isinstance(source, OneOffNotification):
+            raise NotificationResendError("One-off notifications cannot be resent")
+        if source.send_after is not None and source.send_after > datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            raise NotificationResendError(
+                "Cannot resend a notification that is still scheduled in the future"
+            )
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if source.tenant is not None:
+            extra_persist_kwargs["tenant"] = source.tenant
+
+        clone = await self.notification_backend.persist_notification(
+            user_id=source.user_id,
+            notification_type=source.notification_type,
+            title=source.title,
+            body_template=source.body_template,
+            context_name=source.context_name,
+            context_kwargs=source.context_kwargs,
+            send_after=None,
+            subject_template=source.subject_template,
+            preheader_template=source.preheader_template,
+            adapter_extra_parameters=source.adapter_extra_parameters,
+            **extra_persist_kwargs,
+        )
+
+        if source.attachments:
+            clone = cast(
+                Notification,
+                await self.notification_backend.persist_notification_update(
+                    notification_id=clone.id,
+                    update_data={"attachments": list(source.attachments)},
+                ),
+            )
+
+        reused_context: NotificationContextDict | None = None
+        if use_stored_context_if_available and source.context_used is not None:
+            reused_context = cast(NotificationContextDict, source.context_used)
+
+        if clone.send_after is None or clone.send_after <= datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ):
+            await self.send(clone, context=reused_context)
+        return clone
 
     async def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
