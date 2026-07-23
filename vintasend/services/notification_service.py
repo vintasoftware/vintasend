@@ -598,9 +598,14 @@ class NotificationService(Generic[A, B]):
         application and the flip target when a replica reports a duplicate/conflict. Requires the
         row to already exist on the replica; an absent row is logged and skipped, since inline
         replication cannot create a row with the primary's id without snapshot-apply support.
+
+        Best-effort: this read-then-write fallback does NOT converge attachments or intermediate
+        audit fields (e.g. ``sent_at``) -- ``update_data`` only carries the plain content fields.
+        A backend that needs full-fidelity replication, including attachments, should implement
+        ``apply_replication_snapshot_if_newer`` instead of relying on this fallback.
         """
         try:
-            replica.get_notification(snapshot.id)
+            replica_row = replica.get_notification(snapshot.id)
         except NotificationNotFoundError:
             logger.warning(
                 "Replica lacks notification %s and does not implement "
@@ -626,12 +631,23 @@ class NotificationService(Generic[A, B]):
             )
         if snapshot.git_commit_sha is not None:
             replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        # Reach the snapshot's status through the same intermediate transitions a real backend
+        # requires, rather than forcing a single terminal `mark_*` call: a row still PENDING_SEND
+        # must pass through SENT on its way to READ, matching the state machine every backend
+        # (including strict ones) enforces.
+        current_status = replica_row.status
         if snapshot.status == NotificationStatus.SENT.value:
-            replica.mark_pending_as_sent(snapshot.id)
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                replica.mark_pending_as_sent(snapshot.id)
         elif snapshot.status == NotificationStatus.FAILED.value:
-            replica.mark_pending_as_failed(snapshot.id)
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                replica.mark_pending_as_failed(snapshot.id)
         elif snapshot.status == NotificationStatus.READ.value:
-            replica.mark_sent_as_read(snapshot.id)
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                replica.mark_pending_as_sent(snapshot.id)
+                replica.mark_sent_as_read(snapshot.id)
+            elif current_status == NotificationStatus.SENT.value:
+                replica.mark_sent_as_read(snapshot.id)
 
     def _replicate_store_context_used(
         self,
@@ -2064,9 +2080,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         application and the flip target when a replica reports a duplicate/conflict. Requires the
         row to already exist on the replica; an absent row is logged and skipped, since inline
         replication cannot create a row with the primary's id without snapshot-apply support.
+
+        Best-effort: this read-then-write fallback does NOT converge attachments or intermediate
+        audit fields (e.g. ``sent_at``) -- ``update_data`` only carries the plain content fields.
+        A backend that needs full-fidelity replication, including attachments, should implement
+        ``apply_replication_snapshot_if_newer`` instead of relying on this fallback.
         """
         try:
-            await replica.get_notification(snapshot.id)
+            replica_row = await replica.get_notification(snapshot.id)
         except NotificationNotFoundError:
             logger.warning(
                 "Replica lacks notification %s and does not implement "
@@ -2094,12 +2115,23 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             )
         if snapshot.git_commit_sha is not None:
             await replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        # Reach the snapshot's status through the same intermediate transitions a real backend
+        # requires, rather than forcing a single terminal `mark_*` call: a row still PENDING_SEND
+        # must pass through SENT on its way to READ, matching the state machine every backend
+        # (including strict ones) enforces.
+        current_status = replica_row.status
         if snapshot.status == NotificationStatus.SENT.value:
-            await replica.mark_pending_as_sent(snapshot.id)
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                await replica.mark_pending_as_sent(snapshot.id)
         elif snapshot.status == NotificationStatus.FAILED.value:
-            await replica.mark_pending_as_failed(snapshot.id)
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                await replica.mark_pending_as_failed(snapshot.id)
         elif snapshot.status == NotificationStatus.READ.value:
-            await replica.mark_sent_as_read(snapshot.id)
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                await replica.mark_pending_as_sent(snapshot.id)
+                await replica.mark_sent_as_read(snapshot.id)
+            elif current_status == NotificationStatus.SENT.value:
+                await replica.mark_sent_as_read(snapshot.id)
 
     async def _replicate_store_context_used(
         self,
