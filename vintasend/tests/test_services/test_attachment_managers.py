@@ -147,6 +147,18 @@ class ReadFileDataTestCase(TestCase):
 
         assert result == test_data
 
+    def test_read_file_data_with_empty_stringio(self):
+        assert self.manager.file_to_bytes(io.StringIO("")) == b""
+
+    def test_read_file_data_with_empty_bytesio(self):
+        assert self.manager.file_to_bytes(io.BytesIO(b"")) == b""
+
+    def test_read_file_data_large_content(self):
+        large_data = b"x" * 10000
+        result = self.manager.file_to_bytes(io.BytesIO(large_data))
+        assert result == large_data
+        assert len(result) == 10000
+
 
 class IsUrlTestCase(TestCase):
     def test_is_url_detection(self):
@@ -166,6 +178,15 @@ class IsUrlTestCase(TestCase):
             result = sync_base.is_url(url)
             assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
 
+    def test_is_url_with_query_parameters_and_fragments(self):
+        # A URL keeps being a URL when it carries a query string or fragment.
+        for url in (
+            "https://example.com/file.pdf?version=1&download=true",
+            "http://example.com/image.png#preview",
+            "https://api.example.com/data.json?format=pdf&size=large",
+        ):
+            assert sync_base.is_url(url) is True
+
 
 class DownloadFromUrlTestCase(TestCase):
     @patch("requests.get")
@@ -180,6 +201,33 @@ class DownloadFromUrlTestCase(TestCase):
 
         assert result == b"Mocked document content"
         mock_get.assert_called_once_with(url, timeout=30)
+
+    @patch("requests.get")
+    def test_download_from_url_handles_multiple_schemes(self, mock_get):
+        mock_response = Mock()
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+
+        urls = [
+            "https://secure.example.com/file.pdf",
+            "http://example.com/image.png",
+            "https://api.example.com/data.json?format=pdf",
+        ]
+        for i, url in enumerate(urls):
+            mock_response.content = f"Mocked content {i}".encode()
+            assert sync_base.download_from_url(url) == f"Mocked content {i}".encode()
+
+        assert mock_get.call_count == len(urls)
+        for url in urls:
+            mock_get.assert_any_call(url, timeout=30)
+
+    @patch("requests.get")
+    def test_download_from_url_propagates_errors_from_requests(self, mock_get):
+        # An error raised while downloading is not swallowed.
+        mock_get.side_effect = ImportError("boom")
+
+        with pytest.raises(ImportError):
+            sync_base.download_from_url("https://example.com/x.pdf")
 
     def test_download_from_url_raises_friendly_import_error_when_requests_missing(self):
         with patch.dict(sys.modules, {"requests": None}):
