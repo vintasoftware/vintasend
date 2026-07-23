@@ -14,14 +14,16 @@ Tests cover:
 import datetime
 import hashlib
 import io
-import os
-import tempfile
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
 
 import pytest
 
+from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
+    FakeAsyncIOAttachmentManager,
+    FakeAttachmentManager,
+)
 from vintasend.services.dataclasses import (
     Notification,
     NotificationAttachment,
@@ -32,6 +34,10 @@ from vintasend.services.notification_adapters.stubs.fake_adapter import (
     FakeAsyncIOEmailAdapter,
     FakeEmailAdapter,
 )
+from vintasend.services.notification_backends.asyncio_base import (
+    supports_attachments as asyncio_supports_attachments,
+)
+from vintasend.services.notification_backends.base import supports_attachments
 from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
     FakeFileAttachmentFile,
@@ -152,10 +158,17 @@ class TestStoredAttachmentDataClass(TestCase):
 
 
 class TestFakeFileBackendAttachments(TestCase):
-    """Test attachment functionality in FakeFileBackend"""
+    """Test that FakeFileBackend delegates all file I/O to the injected manager."""
 
     def setUp(self):
         self.backend = FakeFileBackend(storage_dir="/tmp/test_attachments")
+        self.manager = FakeAttachmentManager()
+        self.backend.inject_attachment_manager(self.manager)
+
+    def test_backend_has_no_private_file_reading_helper(self):
+        """The backend must not read bytes itself -- that logic moved to the manager."""
+        assert not hasattr(self.backend, "_read_attachment_data")
+        assert not hasattr(self.backend, "_download_from_url")
 
     def test_store_attachments_with_bytes(self):
         """Test storing attachments with bytes data"""
@@ -167,7 +180,7 @@ class TestFakeFileBackendAttachments(TestCase):
             description="Test bytes attachment",
         )
 
-        stored = self.backend._store_attachments([attachment])
+        stored = self.backend._store_attachments([attachment], "notif-1")
 
         assert len(stored) == 1
         stored_attachment = stored[0]
@@ -176,9 +189,10 @@ class TestFakeFileBackendAttachments(TestCase):
         assert stored_attachment.size == len(test_data)
         assert stored_attachment.description == "Test bytes attachment"
 
-        # Verify file data can be retrieved
+        # The bytes were handed to the injected manager, and the handle reads them back.
         retrieved_data = stored_attachment.get_file_data()
         assert retrieved_data == test_data
+        assert self.manager._storage[stored_attachment.file_id] == test_data
 
     def test_store_attachments_with_file_like_object(self):
         """Test storing attachments with file-like objects"""
@@ -190,7 +204,7 @@ class TestFakeFileBackendAttachments(TestCase):
             file=file_obj,
         )
 
-        stored = self.backend._store_attachments([attachment])
+        stored = self.backend._store_attachments([attachment], "notif-2")
 
         assert len(stored) == 1
         stored_attachment = stored[0]
@@ -200,27 +214,33 @@ class TestFakeFileBackendAttachments(TestCase):
         retrieved_data = stored_attachment.get_file_data()
         assert retrieved_data == test_data
 
-    def test_store_attachments_with_url(self):
-        """Test storing attachments from URLs (using fake download)"""
+    @patch("requests.get")
+    def test_store_attachments_with_url(self, mock_get):
+        """Test storing attachments from URLs -- the manager owns the download."""
+        mock_response = Mock()
+        mock_response.content = b"Downloaded content from example"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+
         url = "http://example.com/document.pdf"
         attachment = NotificationAttachment(
             filename="document.pdf",
             file=url,
         )
 
-        stored = self.backend._store_attachments([attachment])
+        stored = self.backend._store_attachments([attachment], "notif-3")
 
         assert len(stored) == 1
         stored_attachment = stored[0]
         assert stored_attachment.filename == "document.pdf"
 
-        # Should contain fake downloaded content
-        retrieved_data = stored_attachment.get_file_data()
-        assert b"Downloaded content from" in retrieved_data
+        # The manager performed the download, not the backend.
+        mock_get.assert_called_once_with(url, timeout=30)
+        assert stored_attachment.get_file_data() == b"Downloaded content from example"
 
     def test_store_attachments_empty_list(self):
         """Test storing empty attachment list"""
-        stored = self.backend._store_attachments([])
+        stored = self.backend._store_attachments([], "notif-4")
         assert stored == []
 
     def test_store_attachments_multiple(self):
@@ -237,13 +257,24 @@ class TestFakeFileBackendAttachments(TestCase):
             ),
         ]
 
-        stored = self.backend._store_attachments(attachments)
+        stored = self.backend._store_attachments(attachments, "notif-5")
 
         assert len(stored) == 2
         assert stored[0].filename == "file1.txt"
         assert stored[1].filename == "file2.txt"
         assert stored[0].is_inline is False
         assert stored[1].is_inline is True
+
+    def test_get_attachments_reconstructs_through_manager(self):
+        """get_attachments rebuilds each handle from the manager and returns join rows."""
+        attachment = NotificationAttachment(filename="doc.txt", file=b"doc bytes")
+        self.backend._store_attachments([attachment], "notif-6")
+
+        fetched = self.backend.get_attachments("notif-6")
+
+        assert len(fetched) == 1
+        assert fetched[0].filename == "doc.txt"
+        assert fetched[0].get_file_data() == b"doc bytes"
 
     def test_persist_notification_with_attachments(self):
         """Test creating notification with attachments through backend"""
@@ -437,10 +468,12 @@ class TestNotificationServiceWithAttachments(TestCase):
         self.adapter = FakeEmailAdapter(
             backend=self.backend, template_renderer=self.template_renderer
         )
+        self.manager = FakeAttachmentManager()
 
         self.service = NotificationService(
             notification_adapters=[self.adapter],
             notification_backend=self.backend,
+            attachment_manager=self.manager,
         )
 
         # Register a simple context function
@@ -452,6 +485,10 @@ class TestNotificationServiceWithAttachments(TestCase):
         # Clear notifications after each test
         if hasattr(self, "backend"):
             self.backend.notifications = []
+
+    def test_service_injects_manager_into_backend(self):
+        """The service wires its resolved manager into the backend."""
+        assert self.backend._attachment_manager is self.manager
 
     def test_create_notification_with_bytes_attachment(self):
         """Test creating notification with bytes attachment"""
@@ -479,6 +516,8 @@ class TestNotificationServiceWithAttachments(TestCase):
         stored_attachment = notification.attachments[0]
         assert stored_attachment.filename == "service_test.txt"
         assert stored_attachment.size == len(attachment_data)
+        # The bytes flowed service -> backend -> injected manager.
+        assert self.manager._storage[stored_attachment.file_id] == attachment_data
 
     def test_create_one_off_notification_with_attachment(self):
         """Test creating one-off notification with attachment"""
@@ -567,6 +606,7 @@ class TestAttachmentErrorHandling(TestCase):
 
     def setUp(self):
         self.backend = FakeFileBackend(storage_dir="/tmp/test_attachments")
+        self.backend.inject_attachment_manager(FakeAttachmentManager())
 
     def test_unsupported_file_type_error(self):
         """Test error handling for unsupported file types"""
@@ -577,7 +617,7 @@ class TestAttachmentErrorHandling(TestCase):
         )
 
         # Should not raise an error
-        stored = self.backend._store_attachments([attachment])
+        stored = self.backend._store_attachments([attachment], "err-1")
         assert len(stored) == 1
 
     def test_nonexistent_file_path_error(self):
@@ -588,11 +628,11 @@ class TestAttachmentErrorHandling(TestCase):
         )
 
         with pytest.raises(FileNotFoundError):
-            self.backend._store_attachments([attachment])
+            self.backend._store_attachments([attachment], "err-2")
 
     def test_empty_attachment_list(self):
         """Test handling empty attachment list"""
-        stored = self.backend._store_attachments([])
+        stored = self.backend._store_attachments([], "err-3")
         assert stored == []
 
     def test_none_attachment_list(self):
@@ -679,21 +719,83 @@ class TestAsyncAttachmentFunctionality(IsolatedAsyncioTestCase):
         assert attachment_info["filename"] == "async_test.txt"
 
     async def test_async_backend_store_attachments(self):
-        """Test async backend attachment storage"""
+        """Test async backend attachment storage delegates to the injected manager."""
+        manager = FakeAsyncIOAttachmentManager()
+        self.backend.inject_attachment_manager(manager)
         attachment = NotificationAttachment(
             filename="async_backend_test.txt",
             file=b"Async backend content",
         )
 
-        stored = self.backend._store_attachments([attachment])
+        stored = await self.backend._store_attachments([attachment], "async-1")
 
         assert len(stored) == 1
         stored_attachment = stored[0]
         assert stored_attachment.filename == "async_backend_test.txt"
 
-        # Verify file data can be retrieved
+        # Verify file data can be retrieved through the manager
         retrieved_data = stored_attachment.get_file_data()
         assert retrieved_data == b"Async backend content"
+        assert manager._storage[stored_attachment.file_id] == b"Async backend content"
+
+
+class TestAsyncIONotificationServiceWithAttachments(IsolatedAsyncioTestCase):
+    """Test AsyncIONotificationService attachment manager injection."""
+
+    async def asyncSetUp(self):
+        self.backend = FakeAsyncIOFileBackend(
+            database_file_name="async_injection_test_notifications.json"
+        )
+        self.template_renderer = FakeTemplateRenderer()
+        self.adapter = FakeAsyncIOEmailAdapter(
+            backend=self.backend, template_renderer=self.template_renderer
+        )
+        self.manager = FakeAsyncIOAttachmentManager()
+
+        self.service = AsyncIONotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+            attachment_manager=self.manager,
+        )
+
+        @register_context("async_test_context")
+        def async_test_context(context_kwargs):
+            return NotificationContextDict(context_kwargs)
+
+    async def asyncTearDown(self):
+        await self.backend.clear()
+
+    async def test_service_injects_manager_into_backend(self):
+        """The async service wires its resolved manager into the backend."""
+        assert self.backend._attachment_manager is self.manager
+
+    async def test_create_notification_with_bytes_attachment(self):
+        """Bytes flow service -> backend -> injected async manager."""
+        attachment_data = b"Async service layer test content"
+        attachment = NotificationAttachment(
+            filename="async_service_test.txt",
+            content_type="text/plain",
+            file=attachment_data,
+            description="Async service layer test",
+        )
+
+        notification = await self.service.create_notification(
+            user_id=123,
+            notification_type="email",
+            title="Async Service Test with Attachment",
+            body_template="Hello {{name}}",
+            context_name="async_test_context",
+            context_kwargs=NotificationContextDict({"name": "User"}),
+            subject_template="Test Subject",
+            preheader_template="Test Preheader",
+            attachments=[attachment],
+        )
+
+        assert len(notification.attachments) == 1
+        stored_attachment = notification.attachments[0]
+        assert stored_attachment.filename == "async_service_test.txt"
+        assert stored_attachment.size == len(attachment_data)
+        assert self.manager._storage[stored_attachment.file_id] == attachment_data
 
 
 class TestAttachmentValidation(TestCase):
@@ -768,10 +870,12 @@ class TestAttachmentIntegration(TestCase):
         self.adapter = FakeEmailAdapter(
             backend=self.backend, template_renderer=self.template_renderer
         )
+        self.manager = FakeAttachmentManager()
 
         self.service = NotificationService(
             notification_adapters=[self.adapter],
             notification_backend=self.backend,
+            attachment_manager=self.manager,
         )
 
         # Register context function
@@ -838,13 +942,14 @@ class TestAttachmentIntegration(TestCase):
         text_attachment = notification.attachments[2]
         assert text_attachment.filename == "data.txt"
 
-        # Verify file access works
+        # Verify file access works -- the bytes came from the injected manager.
         pdf_data = pdf_attachment.get_file_data()
         assert pdf_data == b"PDF document content"
+        assert self.manager._storage[pdf_attachment.file_id] == b"PDF document content"
 
         # Verify URLs work
         pdf_url = pdf_attachment.get_file_url()
-        assert "fake://attachment/" in pdf_url
+        assert "fake://attachments/" in pdf_url
 
         # Check that notification is in backend storage
         assert len(self.backend.notifications) == 1
@@ -882,491 +987,115 @@ class TestAttachmentIntegration(TestCase):
         assert len(self.backend.notifications) == 1
 
 
-class TestNotificationServiceFileHandling(TestCase):
-    """Test the _read_file_data method in NotificationService"""
+class _AttachmentUnawareBackend(FakeFileBackend):
+    """A backend that predates the attachment seam: it does not expose
+    ``inject_attachment_manager``. Simulated by shadowing the inherited method with a
+    property that raises, so ``hasattr`` -- and therefore ``supports_attachments`` --
+    reports it as absent, exactly as a genuinely older backend would.
+    """
+
+    @property
+    def inject_attachment_manager(self):  # type: ignore[override]
+        raise AttributeError("this backend does not support attachment managers")
+
+
+class TestDuckTypedInjectionIsOptional(TestCase):
+    """A backend without ``inject_attachment_manager`` still works end to end."""
 
     def setUp(self):
-        self.backend = FakeFileBackend()
+        self.backend = _AttachmentUnawareBackend(storage_dir="/tmp/no_attach")
+        self.backend.notifications = []
         self.adapter = FakeEmailAdapter(
-            template_renderer=FakeTemplateRenderer(),
-            backend=self.backend,
-        )
-        self.service = NotificationService(
-            notification_adapters=[self.adapter],
-            notification_backend=self.backend,
+            backend=self.backend, template_renderer=FakeTemplateRenderer()
         )
 
-        # Register context for testing
-        @register_context("file_test")
-        def test_context(context_kwargs):
+        @register_context("no_attach_context")
+        def no_attach_context(context_kwargs):
             return NotificationContextDict(context_kwargs)
 
     def tearDown(self):
-        # Clear notifications after each test
-        if hasattr(self, "backend"):
-            self.backend.notifications = []
+        self.backend.notifications = []
 
-    def test_read_file_data_with_bytesio(self):
-        """Test _read_file_data with BytesIO object"""
-        test_data = b"BytesIO content"
-        file_obj = io.BytesIO(test_data)
+    def test_supports_attachments_returns_false(self):
+        assert supports_attachments(self.backend) is False
 
-        # Set position to middle to test seek functionality
-        file_obj.seek(5)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == test_data
-
-        # Verify position was restored
-        assert file_obj.tell() == 5
-
-    def test_read_file_data_with_stringio(self):
-        """Test _read_file_data with StringIO object"""
-        test_data = "StringIO content"
-        file_obj = io.StringIO(test_data)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == test_data.encode("utf-8")
-
-    def test_read_file_data_with_file_path(self):
-        """Test _read_file_data with file path"""
-        # Create a temporary file
-        test_data = b"File path content"
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(test_data)
-            temp_file_path = temp_file.name
-
-        try:
-            result = self.service._read_file_data(temp_file_path)
-            assert result == test_data
-        finally:
-            os.unlink(temp_file_path)
-
-    def test_read_file_data_with_path_object(self):
-        """Test _read_file_data with pathlib.Path object"""
-        test_data = b"Path object content"
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(test_data)
-            temp_file_path = Path(temp_file.name)
-
-        try:
-            result = self.service._read_file_data(temp_file_path)
-            assert result == test_data
-        finally:
-            os.unlink(temp_file_path)
-
-    @patch("requests.get")
-    def test_read_file_data_with_url(self, mock_get):
-        """Test _read_file_data with URL (should call _download_from_url)"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.content = b"Mocked downloaded content"
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        url = "http://example.com/test.pdf"
-        result = self.service._read_file_data(url)
-
-        # Should contain the mocked downloaded content
-        assert result == b"Mocked downloaded content"
-        mock_get.assert_called_once_with(url, timeout=30)
-
-    def test_read_file_data_with_unsupported_type(self):
-        """Test _read_file_data with unsupported file type"""
-        with pytest.raises(ValueError, match="Unsupported file type"):
-            self.service._read_file_data(12345)  # int is not supported
-
-    def test_read_file_data_with_bytes_should_fail(self):
-        """Test _read_file_data with raw bytes should fail (not a supported input)"""
-        with pytest.raises(ValueError, match="Unsupported file type"):
-            self.service._read_file_data(b"raw bytes content")
-
-    def test_read_file_data_with_nonexistent_file(self):
-        """Test _read_file_data with non-existent file path"""
-        with pytest.raises(FileNotFoundError):
-            self.service._read_file_data("/path/that/does/not/exist.txt")
-
-    def test_read_file_data_seek_behavior_without_tell(self):
-        """Test _read_file_data with file object that doesn't support tell"""
-
-        class NoTellFile:
-            def __init__(self, data):
-                self.data = data
-                self.position = 0
-
-            def read(self):
-                return self.data[self.position :]
-
-            def seek(self, pos):
-                self.position = pos
-
-        test_data = b"No tell file content"
-        file_obj = NoTellFile(test_data)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == test_data
-
-    def test_read_file_data_no_seek_support(self):
-        """Test _read_file_data with file object that doesn't support seek"""
-
-        class NoSeekFile:
-            def __init__(self, data):
-                self.data = data
-
-            def read(self):
-                return self.data
-
-            def tell(self):
-                return 0
-
-        test_data = b"No seek file content"
-        file_obj = NoSeekFile(test_data)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == test_data
-
-
-class TestNotificationServiceUrlHandling(TestCase):
-    """Test the _download_from_url and _is_url methods in NotificationService"""
-
-    def setUp(self):
-        self.backend = FakeFileBackend()
-        self.adapter = FakeEmailAdapter(
-            template_renderer=FakeTemplateRenderer(),
-            backend=self.backend,
-        )
-        self.service = NotificationService(
+    def test_service_constructs_and_persists_without_attachments(self):
+        # Even with a manager configured, an attachment-unaware backend is left untouched
+        # and can still create a plain notification.
+        service = NotificationService(
             notification_adapters=[self.adapter],
             notification_backend=self.backend,
+            attachment_manager=FakeAttachmentManager(),
         )
 
-    def test_is_url_detection(self):
-        """Test _is_url method with various URL schemes"""
-        test_cases = [
-            ("http://example.com/file.pdf", True),
-            ("https://example.com/file.pdf", True),
-            ("s3://bucket/file.pdf", True),
-            ("gs://bucket/file.pdf", True),
-            ("azure://container/file.pdf", True),
-            ("/local/path/file.pdf", False),
-            ("relative/path/file.pdf", False),
-            ("file.pdf", False),
-            ("ftp://example.com/file.pdf", False),  # Not supported
-        ]
+        notification = service.create_notification(
+            user_id=123,
+            notification_type="email",
+            title="No Attachments",
+            body_template="Hello {{name}}",
+            context_name="no_attach_context",
+            context_kwargs=NotificationContextDict({"name": "User"}),
+            subject_template="Subject",
+            preheader_template="Preheader",
+        )
 
-        for url, expected in test_cases:
-            result = self.service._is_url(url)
-            assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
-
-    @patch("requests.get")
-    def test_download_from_url_success(self, mock_get):
-        """Test _download_from_url with successful download"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.content = b"Mocked document content"
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        url = "http://example.com/document.pdf"
-        result = self.service._download_from_url(url)
-
-        # Should contain fake downloaded content
-        assert result == b"Mocked document content"
-        mock_get.assert_called_once_with(url, timeout=30)
-
-    @patch("requests.get")
-    def test_download_from_url_different_schemes(self, mock_get):
-        """Test _download_from_url with different URL schemes"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        urls = [
-            "https://secure.example.com/file.pdf",
-            "http://example.com/image.png",
-            "https://api.example.com/data.json",
-        ]
-
-        for i, url in enumerate(urls):
-            mock_response.content = f"Mocked content {i}".encode()
-            result = self.service._download_from_url(url)
-            assert result == f"Mocked content {i}".encode()
-
-        # Verify all calls were made
-        assert mock_get.call_count == len(urls)
-        for url in urls:
-            mock_get.assert_any_call(url, timeout=30)
-
-    @patch("requests.get")
-    def test_download_from_url_import_error(self, mock_get):
-        """Test _download_from_url propagates an ImportError raised while downloading"""
-        mock_get.side_effect = ImportError("No module named 'requests'")
-
-        url = "https://example.com/test-import.pdf"
-
-        with pytest.raises(ImportError):
-            self.service._download_from_url(url)
-
-    @patch("builtins.__import__")
-    def test_download_from_url_requests_import_error(self, mock_import):
-        """Test _download_from_url handles missing requests library"""
-
-        # Mock __import__ to raise ImportError for 'requests' module
-        def side_effect(name, *args, **kwargs):
-            if name == "requests":
-                raise ImportError("No module named 'requests'")
-            return __import__(name, *args, **kwargs)
-
-        mock_import.side_effect = side_effect
-
-        url = "https://example.com/test-import.pdf"
-
-        with pytest.raises(ImportError, match="requests library is required"):
-            self.service._download_from_url(url)
+        assert notification.attachments == []
+        assert len(self.backend.notifications) == 1
 
 
-class TestAsyncNotificationServiceFileHandling(IsolatedAsyncioTestCase):
-    """Test the _read_file_data method in AsyncIONotificationService"""
+class _AsyncIOAttachmentUnawareBackend(FakeAsyncIOFileBackend):
+    """The AsyncIO mirror of ``_AttachmentUnawareBackend``: a backend that predates the
+    attachment seam. Shadowing the inherited method with a property that raises makes
+    ``hasattr`` -- and therefore ``asyncio_supports_attachments`` -- report it as absent,
+    exactly as a genuinely older AsyncIO backend would.
+    """
+
+    @property
+    def inject_attachment_manager(self):  # type: ignore[override]
+        raise AttributeError("this backend does not support attachment managers")
+
+
+class TestAsyncIODuckTypedInjectionIsOptional(IsolatedAsyncioTestCase):
+    """An AsyncIO backend without ``inject_attachment_manager`` still works end to end."""
 
     async def asyncSetUp(self):
-        self.backend = FakeAsyncIOFileBackend()
-        self.adapter = FakeAsyncIOEmailAdapter(
-            template_renderer=FakeTemplateRenderer(),
-            backend=self.backend,
+        self.backend = _AsyncIOAttachmentUnawareBackend(
+            database_file_name="async_no_attach_notifications.json"
         )
-        self.service = AsyncIONotificationService(
-            notification_adapters=[self.adapter],
-            notification_backend=self.backend,
+        self.backend.notifications = []
+        self.adapter = FakeAsyncIOEmailAdapter(
+            backend=self.backend, template_renderer=FakeTemplateRenderer()
         )
 
-        # Register context for testing
-        @register_context("async_file_test")
-        def test_context(context_kwargs):
+        @register_context("async_no_attach_context")
+        def async_no_attach_context(context_kwargs):
             return NotificationContextDict(context_kwargs)
 
     async def asyncTearDown(self):
-        # Clear backend
         await self.backend.clear()
 
-    def test_async_read_file_data_with_bytesio(self):
-        """Test async _read_file_data with BytesIO object"""
-        test_data = b"Async BytesIO content"
-        file_obj = io.BytesIO(test_data)
+    async def test_supports_attachments_returns_false(self):
+        assert asyncio_supports_attachments(self.backend) is False
 
-        # Set position to test seek functionality
-        file_obj.seek(3)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == test_data
-
-        # Verify position was restored
-        assert file_obj.tell() == 3
-
-    def test_async_read_file_data_with_stringio(self):
-        """Test async _read_file_data with StringIO object"""
-        test_data = "Async StringIO content"
-        file_obj = io.StringIO(test_data)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == test_data.encode("utf-8")
-
-    def test_async_read_file_data_with_file_path(self):
-        """Test async _read_file_data with file path"""
-        test_data = b"Async file path content"
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(test_data)
-            temp_file_path = temp_file.name
-
-        try:
-            result = self.service._read_file_data(temp_file_path)
-            assert result == test_data
-        finally:
-            os.unlink(temp_file_path)
-
-    def test_async_read_file_data_with_path_object(self):
-        """Test async _read_file_data with pathlib.Path object"""
-        test_data = b"Async Path object content"
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(test_data)
-            temp_file_path = Path(temp_file.name)
-
-        try:
-            result = self.service._read_file_data(temp_file_path)
-            assert result == test_data
-        finally:
-            os.unlink(temp_file_path)
-
-    @patch("requests.get")
-    def test_async_read_file_data_with_url(self, mock_get):
-        """Test async _read_file_data with URL"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.content = b"Mocked async downloaded content"
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        url = "https://example.com/async-test.pdf"
-        result = self.service._read_file_data(url)
-
-        # Should contain the mocked downloaded content
-        assert result == b"Mocked async downloaded content"
-        mock_get.assert_called_once_with(url, timeout=30)
-
-    def test_async_read_file_data_with_unsupported_type(self):
-        """Test async _read_file_data with unsupported file type"""
-        with pytest.raises(ValueError, match="Unsupported file type"):
-            self.service._read_file_data({"not": "supported"})
-
-
-class TestAsyncNotificationServiceUrlHandling(IsolatedAsyncioTestCase):
-    """Test the _download_from_url and _is_url methods in AsyncIONotificationService"""
-
-    async def asyncSetUp(self):
-        self.backend = FakeAsyncIOFileBackend()
-        self.adapter = FakeAsyncIOEmailAdapter(
-            template_renderer=FakeTemplateRenderer(),
-            backend=self.backend,
-        )
-        self.service = AsyncIONotificationService(
+    async def test_service_constructs_and_persists_without_attachments(self):
+        # Even with a manager configured, an attachment-unaware backend is left untouched
+        # and can still create a plain notification.
+        service = AsyncIONotificationService(
             notification_adapters=[self.adapter],
             notification_backend=self.backend,
+            attachment_manager=FakeAsyncIOAttachmentManager(),
         )
 
-    def test_async_is_url_detection(self):
-        """Test async _is_url method with various URL schemes"""
-        test_cases = [
-            ("http://example.com/file.pdf", True),
-            ("https://example.com/file.pdf", True),
-            ("s3://bucket/file.pdf", True),
-            ("gs://bucket/file.pdf", True),
-            ("azure://container/file.pdf", True),
-            ("/local/path/file.pdf", False),
-            ("relative/path/file.pdf", False),
-            ("file.pdf", False),
-        ]
-
-        for url, expected in test_cases:
-            result = self.service._is_url(url)
-            assert result == expected, f"URL: {url}, Expected: {expected}, Got: {result}"
-
-    @patch("requests.get")
-    def test_async_download_from_url_success(self, mock_get):
-        """Test async _download_from_url with successful download"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.content = b"Mocked async document content"
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        url = "https://example.com/async-document.pdf"
-        result = self.service._download_from_url(url)
-
-        assert result == b"Mocked async document content"
-        mock_get.assert_called_once_with(url, timeout=30)
-
-    @patch("builtins.__import__")
-    def test_async_download_from_url_requests_import_error(self, mock_import):
-        """Test async _download_from_url handles missing requests library"""
-
-        # Mock __import__ to raise ImportError for 'requests' module
-        def side_effect(name, *args, **kwargs):
-            if name == "requests":
-                raise ImportError("No module named 'requests'")
-            return __import__(name, *args, **kwargs)
-
-        mock_import.side_effect = side_effect
-
-        url = "https://example.com/test-import.pdf"
-
-        with pytest.raises(ImportError, match="requests library is required"):
-            self.service._download_from_url(url)
-
-    @patch("requests.get")
-    def test_async_download_from_url_different_schemes(self, mock_get):
-        """Test async _download_from_url with different URL schemes"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        urls = [
-            "https://secure.example.com/async-file.pdf",
-            "http://example.com/async-image.png",
-            "https://api.example.com/async-data.json",
-        ]
-
-        for i, url in enumerate(urls):
-            mock_response.content = f"Mocked async content {i}".encode()
-            result = self.service._download_from_url(url)
-            assert result == f"Mocked async content {i}".encode()
-
-        # Verify all calls were made
-        assert mock_get.call_count == len(urls)
-        for url in urls:
-            mock_get.assert_any_call(url, timeout=30)
-
-
-class TestFileHandlingEdgeCases(TestCase):
-    """Test edge cases for file handling methods"""
-
-    def setUp(self):
-        self.backend = FakeFileBackend()
-        self.adapter = FakeEmailAdapter(
-            template_renderer=FakeTemplateRenderer(),
-            backend=self.backend,
-        )
-        self.service = NotificationService(
-            notification_adapters=[self.adapter],
-            notification_backend=self.backend,
+        notification = await service.create_notification(
+            user_id=123,
+            notification_type="email",
+            title="No Attachments",
+            body_template="Hello {{name}}",
+            context_name="async_no_attach_context",
+            context_kwargs=NotificationContextDict({"name": "User"}),
+            subject_template="Subject",
+            preheader_template="Preheader",
         )
 
-    def test_read_file_data_with_empty_bytes(self):
-        """Test _read_file_data with empty bytes should fail (not supported)"""
-        with pytest.raises(ValueError, match="Unsupported file type"):
-            self.service._read_file_data(b"")
-
-    def test_read_file_data_with_empty_stringio(self):
-        """Test _read_file_data with empty StringIO"""
-        file_obj = io.StringIO("")
-        result = self.service._read_file_data(file_obj)
-        assert result == b""
-
-    def test_read_file_data_with_empty_bytesio(self):
-        """Test _read_file_data with empty BytesIO"""
-        file_obj = io.BytesIO(b"")
-        result = self.service._read_file_data(file_obj)
-        assert result == b""
-
-    def test_read_file_data_large_content(self):
-        """Test _read_file_data with large content"""
-        large_data = b"x" * 10000  # 10KB of data
-        file_obj = io.BytesIO(large_data)
-
-        result = self.service._read_file_data(file_obj)
-        assert result == large_data
-        assert len(result) == 10000
-
-    @patch("requests.get")
-    def test_url_handling_with_query_parameters(self, mock_get):
-        """Test URL handling with query parameters and fragments"""
-        # Mock the requests.get response
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_get.return_value = mock_response
-
-        urls_with_params = [
-            "https://example.com/file.pdf?version=1&download=true",
-            "http://example.com/image.png#preview",
-            "https://api.example.com/data.json?format=pdf&size=large",
-        ]
-
-        for i, url in enumerate(urls_with_params):
-            assert self.service._is_url(url) is True
-
-            mock_response.content = f"Param content {i}".encode()
-            result = self.service._download_from_url(url)
-            assert result == f"Param content {i}".encode()
-
-        # Verify all calls were made
-        assert mock_get.call_count == len(urls_with_params)
+        assert notification.attachments == []
+        assert len(self.backend.notifications) == 1

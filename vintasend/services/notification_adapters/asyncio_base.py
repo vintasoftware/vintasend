@@ -1,3 +1,4 @@
+import warnings
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast, overload
 
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
         Notification,
         NotificationContextDict,
         OneOffNotification,
+        StoredAttachment,
     )
 
 
@@ -119,3 +121,28 @@ class AsyncIOBaseNotificationAdapter(Generic[B, T], ABC):
         :param notification: The notification to send.
         :param context: The context to render the notification templates.
         """
+
+    @property
+    def supports_attachments(self) -> bool:
+        """Whether this adapter delivers attachments. Defaults to ``False``.
+
+        An adapter that handles attachments overrides this to return ``True`` and also
+        overrides ``prepare_attachments``.
+        """
+        return False
+
+    def prepare_attachments(self, attachments: "list[StoredAttachment]") -> list:
+        """Turn stored attachments into the adapter's delivery representation.
+
+        Concrete and defaulted so no existing adapter breaks. An adapter that sets
+        ``supports_attachments`` to ``True`` is expected to override this; if it does not,
+        a warning is emitted and the attachments are dropped rather than silently
+        half-handled.
+        """
+        if self.supports_attachments:
+            warnings.warn(
+                f"{type(self).__name__} sets supports_attachments=True but does not "
+                "override prepare_attachments; attachments will be ignored.",
+                stacklevel=2,
+            )
+        return []
