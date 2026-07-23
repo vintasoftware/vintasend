@@ -116,3 +116,12 @@ class BackendNotFoundError(NotificationError):
 
 class DuplicateBackendIdentifierError(NotificationError):
     """Raised when two configured backends resolve to the same identifier."""
+
+
+class NotificationRenderError(NotificationError):
+    """Raised when a notification has no email renderer available to render it: either no
+    adapter is configured for its notification type, or the configured adapter's template
+    renderer is not a BaseTemplatedEmailRenderer.
+
+    Distinct from NotificationTemplateRenderingError, which covers a renderer failing while
+    actually rendering a template it was handed."""

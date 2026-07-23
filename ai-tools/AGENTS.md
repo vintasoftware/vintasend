@@ -310,6 +310,16 @@ linked here as a git submodule so one checkout holds every package that has to s
 
 Run `git submodule update --init` if `implementations/` is empty.
 
+### Creating a new implementation
+
+`templates/vintasend-implementation-template/` is a separate, in-repo skeleton for
+starting a new `vintasend-*` package — not a submodule, and not one of the packages in the
+table above. It ships one `TODO` stub per seam plus a matching scaffold test, and
+`scripts/clone.py` copies and renames it into a new package directory. See that package's
+`README.md` for the workflow and the per-component checklist of abstract methods to
+implement. This repo's lint, type-check, and test commands skip `templates/` the same way
+they skip `implementations/`.
+
 You may edit these packages from this checkout, but **each one is its own git repository with its
 own release cycle**. Rules that follow from that:
 
