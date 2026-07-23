@@ -203,6 +203,27 @@ def _build_notification_sync_report(
 
     field_reports: list[NotificationSyncFieldReport] = []
     all_fields_agree = True
+
+    # Pathological but possible under corrupt replication: two backends hold different
+    # concrete dataclass types (a Notification on one, a OneOffNotification on another) for
+    # what should be the same logical record. `_comparable_fields_for_sync` only looks at the
+    # reference record's type, so without this check the mismatch is invisible and the report
+    # could claim `in_sync=True`. Surface it as a synthetic field entry rather than changing
+    # the public TypedDict shapes.
+    record_types_by_backend = {
+        identifier: type(record).__name__ for identifier, record in records_by_backend.items()
+    }
+    has_heterogeneous_record_types = len(set(record_types_by_backend.values())) > 1
+    if has_heterogeneous_record_types:
+        all_fields_agree = False
+        field_reports.append(
+            {
+                "field": "record_type",
+                "in_agreement": False,
+                "differing_values": record_types_by_backend,
+            }
+        )
+
     for field_name in comparable_fields:
         values_by_backend = {
             identifier: getattr(record, field_name)
@@ -1008,8 +1029,9 @@ class NotificationService(Generic[A, B]):
         This is a read-only diagnostic -- it never writes. Use ``process_replication`` /
         ``replicate_notification`` to reconcile drift this uncovers.
         """
+        all_backend_identifiers = self.get_all_backend_identifiers()
         records_by_backend: dict[str, Notification | OneOffNotification] = {}
-        for identifier in self.get_all_backend_identifiers():
+        for identifier in all_backend_identifiers:
             try:
                 records_by_backend[identifier] = self._backends[identifier].get_notification(
                     notification_id
@@ -1020,7 +1042,7 @@ class NotificationService(Generic[A, B]):
         return _build_notification_sync_report(
             notification_id,
             self._primary_backend_identifier,
-            self.get_all_backend_identifiers(),
+            all_backend_identifiers,
             records_by_backend,
         )
 
@@ -2844,8 +2866,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         This is a read-only diagnostic -- it never writes. Use ``process_replication`` /
         ``replicate_notification`` to reconcile drift this uncovers.
         """
+        all_backend_identifiers = self.get_all_backend_identifiers()
         records_by_backend: dict[str, Notification | OneOffNotification] = {}
-        for identifier in self.get_all_backend_identifiers():
+        for identifier in all_backend_identifiers:
             try:
                 records_by_backend[identifier] = await self._backends[identifier].get_notification(
                     notification_id
@@ -2856,7 +2879,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         return _build_notification_sync_report(
             notification_id,
             self._primary_backend_identifier,
-            self.get_all_backend_identifiers(),
+            all_backend_identifiers,
             records_by_backend,
         )
 

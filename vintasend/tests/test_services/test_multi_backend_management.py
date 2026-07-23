@@ -5,7 +5,10 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 import pytest
 
 from vintasend.constants import NotificationTypes
-from vintasend.services.dataclasses import NotificationContextDict
+from vintasend.services.dataclasses import (
+    NotificationContextDict,
+    OneOffNotification,
+)
 from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
     FakeFileBackend,
@@ -176,6 +179,48 @@ class VerifyNotificationSyncTestCase(TestCase):
         assert report["backends_with_record"] == ["backend-0", "backend-1"]
         assert report["backends_missing_record"] == ["backend-2"]
         assert report["in_sync"] is False
+
+    def test_heterogeneous_record_types_across_backends_reported_as_out_of_sync(self):
+        # Pathological/corrupt-replication scenario: the same id holds a Notification on the
+        # primary but a OneOffNotification on a replica. Without an explicit check this is
+        # invisible to field-by-field comparison (the two types share no useful overlap) and the
+        # report could wrongly claim in_sync=True.
+        service = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        notification = self._create(service)
+
+        self.replica_one.notifications = [
+            n for n in self.replica_one.notifications if str(n.id) != str(notification.id)
+        ]
+        self.replica_one.notifications.append(
+            OneOffNotification(
+                id=notification.id,
+                email_or_phone="corrupt@example.com",
+                first_name="Corrupt",
+                last_name="Replica",
+                notification_type=NotificationTypes.IN_APP.value,
+                title="Original title",
+                body_template="body.html",
+                context_name="multi_backend_management_test_context",
+                context_kwargs={"test": "test"},
+                send_after=_future(),
+                subject_template="subject.txt",
+                preheader_template="preheader.html",
+                status=notification.status,
+            )
+        )
+
+        report = service.verify_notification_sync(notification.id)
+
+        assert report["in_sync"] is False
+        record_type_reports = [f for f in report["fields"] if f["field"] == "record_type"]
+        assert len(record_type_reports) == 1
+        record_type_report = record_type_reports[0]
+        assert record_type_report["in_agreement"] is False
+        assert record_type_report["differing_values"] == {
+            "backend-0": "Notification",
+            "backend-1": "OneOffNotification",
+            "backend-2": "Notification",
+        }
 
 
 # --- sync: get_backend_sync_stats ------------------------------------------------------------
@@ -371,6 +416,46 @@ class AsyncIOVerifyNotificationSyncTestCase(IsolatedAsyncioTestCase):
         assert report["backends_with_record"] == ["backend-0", "backend-1"]
         assert report["backends_missing_record"] == ["backend-2"]
         assert report["in_sync"] is False
+
+    @pytest.mark.asyncio
+    async def test_heterogeneous_record_types_across_backends_reported_as_out_of_sync(self):
+        # AsyncIO twin of the sync test above.
+        service = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        notification = await self._create(service)
+
+        self.replica_one.notifications = [
+            n for n in self.replica_one.notifications if str(n.id) != str(notification.id)
+        ]
+        self.replica_one.notifications.append(
+            OneOffNotification(
+                id=notification.id,
+                email_or_phone="corrupt@example.com",
+                first_name="Corrupt",
+                last_name="Replica",
+                notification_type=NotificationTypes.IN_APP.value,
+                title="Original title",
+                body_template="body.html",
+                context_name="multi_backend_management_test_context",
+                context_kwargs={"test": "test"},
+                send_after=_future(),
+                subject_template="subject.txt",
+                preheader_template="preheader.html",
+                status=notification.status,
+            )
+        )
+
+        report = await service.verify_notification_sync(notification.id)
+
+        assert report["in_sync"] is False
+        record_type_reports = [f for f in report["fields"] if f["field"] == "record_type"]
+        assert len(record_type_reports) == 1
+        record_type_report = record_type_reports[0]
+        assert record_type_report["in_agreement"] is False
+        assert record_type_report["differing_values"] == {
+            "backend-0": "Notification",
+            "backend-1": "OneOffNotification",
+            "backend-2": "Notification",
+        }
 
 
 # --- asyncio: get_backend_sync_stats -----------------------------------------------------------
