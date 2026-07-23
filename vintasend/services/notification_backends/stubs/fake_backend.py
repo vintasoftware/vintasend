@@ -21,6 +21,12 @@ from vintasend.services.dataclasses import (
 )
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_backends.filters import (
+    NotificationFilter,
+    NotificationOrderBy,
+    matches_filter,
+    sort_notifications,
+)
 
 
 class FakeFileAttachmentFile(AttachmentFile):
@@ -159,6 +165,9 @@ class FakeFileBackend(BaseNotificationBackend):
                 "context_used": notification.context_used,
                 "adapter_extra_parameters": notification.adapter_extra_parameters,
                 "is_one_off": True,
+                "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
+                "read_at": notification.read_at.isoformat() if notification.read_at else None,
+                "tenant": notification.tenant,
             }
         else:
             return {
@@ -178,6 +187,9 @@ class FakeFileBackend(BaseNotificationBackend):
                 "context_used": notification.context_used,
                 "adapter_extra_parameters": notification.adapter_extra_parameters,
                 "is_one_off": False,
+                "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
+                "read_at": notification.read_at.isoformat() if notification.read_at else None,
+                "tenant": notification.tenant,
             }
 
     def _convert_json_to_notification(
@@ -205,6 +217,17 @@ class FakeFileBackend(BaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                sent_at=(
+                    datetime.datetime.fromisoformat(notification["sent_at"])
+                    if notification.get("sent_at")
+                    else None
+                ),
+                read_at=(
+                    datetime.datetime.fromisoformat(notification["read_at"])
+                    if notification.get("read_at")
+                    else None
+                ),
+                tenant=notification.get("tenant"),
             )
         else:
             return Notification(
@@ -225,6 +248,17 @@ class FakeFileBackend(BaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                sent_at=(
+                    datetime.datetime.fromisoformat(notification["sent_at"])
+                    if notification.get("sent_at")
+                    else None
+                ),
+                read_at=(
+                    datetime.datetime.fromisoformat(notification["read_at"])
+                    if notification.get("read_at")
+                    else None
+                ),
+                tenant=notification.get("tenant"),
             )
 
     def _store_notifications(self):
@@ -256,6 +290,7 @@ class FakeFileBackend(BaseNotificationBackend):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         stored_attachments = self._store_attachments(attachments or [])
 
@@ -273,6 +308,7 @@ class FakeFileBackend(BaseNotificationBackend):
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
+            tenant=tenant,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -363,6 +399,7 @@ class FakeFileBackend(BaseNotificationBackend):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> OneOffNotification:
         stored_attachments = self._store_attachments(attachments or [])
 
@@ -382,6 +419,7 @@ class FakeFileBackend(BaseNotificationBackend):
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
+            tenant=tenant,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -403,6 +441,7 @@ class FakeFileBackend(BaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
+        notification.sent_at = datetime.datetime.now(tz=datetime.timezone.utc)
         self._store_notifications()
         return notification
 
@@ -419,6 +458,7 @@ class FakeFileBackend(BaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
+        notification.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
         self._store_notifications()
         return notification
 
@@ -487,6 +527,32 @@ class FakeFileBackend(BaseNotificationBackend):
     def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
         return len(self.filter_all_in_app_unread_notifications(user_id))
 
+    def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> list[Notification | OneOffNotification]:
+        # Reference implementation: match every notification against the recursive predicate,
+        # order it stably (id tiebreaker in the primary direction), then paginate. Downstream
+        # backends translate ``matches_filter`` / ``sort_notifications`` into their own query
+        # language; the semantics here are the contract they mirror.
+        matched = [n for n in self.notifications if matches_filter(n, filter)]
+        ordered = sort_notifications(matched, order_by)
+        return cast(
+            list[Notification | OneOffNotification],
+            self.__paginate_notifications(ordered, page, page_size),
+        )
+
+    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        return sum(1 for n in self.notifications if matches_filter(n, filter))
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        # This fake supports the full vocabulary, so it declines nothing: an empty report means
+        # every capability is supported once merged over the all-``True`` default.
+        return {}
+
     def mark_sent_as_read_bulk(
         self,
         notification_ids: Iterable[int | str | uuid.UUID],
@@ -495,6 +561,7 @@ class FakeFileBackend(BaseNotificationBackend):
         ids = {str(i) for i in notification_ids}
         result: list[Notification] = []
         changed = False
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         for n in self.notifications:
             if str(n.id) not in ids or isinstance(n, OneOffNotification):
                 continue
@@ -502,6 +569,7 @@ class FakeFileBackend(BaseNotificationBackend):
                 continue
             if n.status == NotificationStatus.SENT.value:
                 n.status = NotificationStatus.READ.value
+                n.read_at = now
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
@@ -728,6 +796,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             "preheader_template": notification.preheader_template,
             "status": notification.status,
             "context_used": notification.context_used,
+            "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
+            "read_at": notification.read_at.isoformat() if notification.read_at else None,
+            "tenant": notification.tenant,
         }
 
         if isinstance(notification, OneOffNotification):
@@ -768,6 +839,17 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                sent_at=(
+                    datetime.datetime.fromisoformat(notification["sent_at"])
+                    if notification.get("sent_at")
+                    else None
+                ),
+                read_at=(
+                    datetime.datetime.fromisoformat(notification["read_at"])
+                    if notification.get("read_at")
+                    else None
+                ),
+                tenant=notification.get("tenant"),
             )
         else:
             return Notification(
@@ -788,6 +870,17 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                sent_at=(
+                    datetime.datetime.fromisoformat(notification["sent_at"])
+                    if notification.get("sent_at")
+                    else None
+                ),
+                read_at=(
+                    datetime.datetime.fromisoformat(notification["read_at"])
+                    if notification.get("read_at")
+                    else None
+                ),
+                tenant=notification.get("tenant"),
             )
 
     async def _store_notifications(self, lock: asyncio.Lock | None = None):
@@ -823,6 +916,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
         lock: asyncio.Lock | None = None,
     ) -> Notification:
         stored_attachments = self._store_attachments(attachments or [])
@@ -841,6 +935,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
+            tenant=tenant,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -861,6 +956,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
         lock: asyncio.Lock | None = None,
     ) -> OneOffNotification:
         stored_attachments = self._store_attachments(attachments or [])
@@ -881,6 +977,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             status=NotificationStatus.PENDING_SEND.value,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
+            tenant=tenant,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -905,6 +1002,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
+        notification.sent_at = datetime.datetime.now(tz=datetime.timezone.utc)
         await self._store_notifications(lock)
         return notification
 
@@ -921,6 +1019,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
+        notification.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
         await self._store_notifications(lock)
         return notification
 
@@ -988,6 +1087,32 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     async def count_in_app_unread_notifications(self, user_id: int | str | uuid.UUID) -> int:
         return len(await self.filter_all_in_app_unread_notifications(user_id))
 
+    async def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> list[Notification | OneOffNotification]:
+        # Reference implementation: match every notification against the recursive predicate,
+        # order it stably (id tiebreaker in the primary direction), then paginate. Downstream
+        # backends translate ``matches_filter`` / ``sort_notifications`` into their own query
+        # language; the semantics here are the contract they mirror.
+        matched = [n for n in self.notifications if matches_filter(n, filter)]
+        ordered = sort_notifications(matched, order_by)
+        return cast(
+            list[Notification | OneOffNotification],
+            self.__paginate_notifications(ordered, page, page_size),
+        )
+
+    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        return sum(1 for n in self.notifications if matches_filter(n, filter))
+
+    async def get_filter_capabilities(self) -> dict[str, bool]:
+        # This fake supports the full vocabulary, so it declines nothing: an empty report means
+        # every capability is supported once merged over the all-``True`` default.
+        return {}
+
     async def mark_sent_as_read_bulk(
         self,
         notification_ids: Iterable[int | str | uuid.UUID],
@@ -997,6 +1122,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         ids = {str(i) for i in notification_ids}
         result: list[Notification] = []
         changed = False
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         for n in self.notifications:
             if str(n.id) not in ids or isinstance(n, OneOffNotification):
                 continue
@@ -1004,6 +1130,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 continue
             if n.status == NotificationStatus.SENT.value:
                 n.status = NotificationStatus.READ.value
+                n.read_at = now
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)

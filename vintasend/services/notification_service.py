@@ -30,6 +30,7 @@ from vintasend.exceptions import (
     NotificationQueueServiceMissingError,
     NotificationSendError,
     NotificationUpdateError,
+    TenantReassignmentError,
 )
 from vintasend.services.dataclasses import (
     Notification,
@@ -53,6 +54,11 @@ from vintasend.services.notification_adapters.asyncio_background_base import (
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_backends.filters import (
+    DEFAULT_BACKEND_FILTER_CAPABILITIES,
+    NotificationFilter,
+    NotificationOrderBy,
+)
 from vintasend.services.notification_queue_services.asyncio_base import (
     AsyncIOBaseNotificationQueueService,
 )
@@ -424,6 +430,7 @@ class NotificationService(Generic[A, B]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -445,8 +452,14 @@ class NotificationService(Generic[A, B]):
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
             attachments: list[NotificationAttachment] | None - the list of attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = self.notification_backend.persist_notification(
             user_id=user_id,
@@ -460,6 +473,7 @@ class NotificationService(Generic[A, B]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -482,6 +496,7 @@ class NotificationService(Generic[A, B]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> "OneOffNotification":
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -493,9 +508,16 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
+        Parameters:
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
@@ -511,6 +533,7 @@ class NotificationService(Generic[A, B]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -527,6 +550,8 @@ class NotificationService(Generic[A, B]):
         Update a notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * TenantReassignmentError if ``tenant`` is present in kwargs -- a
+              notification's tenant cannot be reassigned after creation.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -536,6 +561,8 @@ class NotificationService(Generic[A, B]):
             notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
+        if "tenant" in kwargs:
+            raise TenantReassignmentError("A notification's tenant cannot be reassigned")
         notification = self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -824,6 +851,66 @@ class NotificationService(Generic[A, B]):
         ):
             raise NotificationError("No in-app notification adapter found")
         return self.notification_backend.count_in_app_unread_notifications(user_id)
+
+    def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        """
+        Query notifications with a composable filter, ordering and pagination.
+
+        The filter supports ``and`` / ``or`` / ``not`` groups, scalar-or-list membership, string
+        lookups and inclusive date ranges. An empty filter (``{}``) matches every notification.
+        Both ``Notification`` and ``OneOffNotification`` are returned. See
+        ``BaseNotificationBackend.filter_notifications`` for the full semantics.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` matches everything)
+            page: int - the 1-indexed page number to get
+            page_size: int - the number of notifications per page
+            order_by: NotificationOrderBy | None - the primary sort field and direction
+
+        Returns:
+            Iterable[Notification | OneOffNotification] - the selected page of matches
+        """
+        return self.notification_backend.filter_notifications(
+            filter, page=page, page_size=page_size, order_by=order_by
+        )
+
+    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        """
+        Count notifications matching ``filter``, ignoring pagination.
+
+        This is the total a dashboard needs to render pagination; ``filter_notifications``
+        returns an ``Iterable`` that cannot be ``len()``-ed.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` counts everything)
+
+        Returns:
+            int - the number of matching notifications
+        """
+        return self.notification_backend.count_notifications(filter)
+
+    def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter capabilities the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER an
+        all-``True`` default, so every capability the backend does not mention comes back
+        ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
+        kept byte-identical to the TypeScript sibling so one dashboard consumes either.
+
+        Returns:
+            dict[str, bool] - the merged capability report
+        """
+        return {
+            **DEFAULT_BACKEND_FILTER_CAPABILITIES,
+            **self.notification_backend.get_filter_capabilities(),
+        }
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -1243,6 +1330,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -1264,8 +1352,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
             attachments: list[NotificationAttachment] | None - the list of attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_notification(
             user_id=user_id,
@@ -1279,6 +1373,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1301,6 +1396,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -1312,9 +1408,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
+        Parameters:
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
@@ -1330,6 +1433,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1346,6 +1450,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Update a notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * TenantReassignmentError if ``tenant`` is present in kwargs -- a
+              notification's tenant cannot be reassigned after creation.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -1355,6 +1461,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
+        if "tenant" in kwargs:
+            raise TenantReassignmentError("A notification's tenant cannot be reassigned")
         notification = await self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -1661,6 +1769,66 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ):
             raise NotificationError("No in-app notification adapter found")
         return await self.notification_backend.count_in_app_unread_notifications(user_id)
+
+    async def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        """
+        Query notifications with a composable filter, ordering and pagination.
+
+        The filter supports ``and`` / ``or`` / ``not`` groups, scalar-or-list membership, string
+        lookups and inclusive date ranges. An empty filter (``{}``) matches every notification.
+        Both ``Notification`` and ``OneOffNotification`` are returned. See
+        ``AsyncIOBaseNotificationBackend.filter_notifications`` for the full semantics.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` matches everything)
+            page: int - the 1-indexed page number to get
+            page_size: int - the number of notifications per page
+            order_by: NotificationOrderBy | None - the primary sort field and direction
+
+        Returns:
+            Iterable[Notification | OneOffNotification] - the selected page of matches
+        """
+        return await self.notification_backend.filter_notifications(
+            filter, page=page, page_size=page_size, order_by=order_by
+        )
+
+    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        """
+        Count notifications matching ``filter``, ignoring pagination.
+
+        This is the total a dashboard needs to render pagination; ``filter_notifications``
+        returns an ``Iterable`` that cannot be ``len()``-ed.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` counts everything)
+
+        Returns:
+            int - the number of matching notifications
+        """
+        return await self.notification_backend.count_notifications(filter)
+
+    async def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter capabilities the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER an
+        all-``True`` default, so every capability the backend does not mention comes back
+        ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
+        kept byte-identical to the TypeScript sibling so one dashboard consumes either.
+
+        Returns:
+            dict[str, bool] - the merged capability report
+        """
+        return {
+            **DEFAULT_BACKEND_FILTER_CAPABILITIES,
+            **await self.notification_backend.get_filter_capabilities(),
+        }
 
     async def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
