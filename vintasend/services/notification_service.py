@@ -296,13 +296,22 @@ class NotificationService(Generic[A, B]):
         self.raise_on_failed_send = raise_on_failed_send
         # An explicit constructor value wins; otherwise fall back to the setting, itself
         # defaulting to "inline". Under a bare-Python host the setting reads as {} (no
-        # framework), which is not "queued", so it correctly resolves to "inline".
-        if replication_mode is not None:
-            self.replication_mode = replication_mode
-        elif app_settings.NOTIFICATION_REPLICATION_MODE == "queued":
-            self.replication_mode = "queued"
-        else:
-            self.replication_mode = "inline"
+        # framework), which is falsy and correctly resolves to "inline". Any other value --
+        # a typo like "queded" from an untyped env var/setting -- must fail loud rather than
+        # silently degrade to inline replication.
+        resolved_replication_mode: Any = (
+            replication_mode
+            if replication_mode is not None
+            else app_settings.NOTIFICATION_REPLICATION_MODE
+        )
+        if not resolved_replication_mode:
+            resolved_replication_mode = "inline"
+        if resolved_replication_mode not in ("inline", "queued"):
+            raise NotificationError(
+                f"Invalid replication_mode {resolved_replication_mode!r}; expected 'inline' or "
+                "'queued'"
+            )
+        self.replication_mode = resolved_replication_mode
 
         if isinstance(notification_queue_service, BaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -2032,13 +2041,22 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         self.raise_on_failed_send = raise_on_failed_send
         # An explicit constructor value wins; otherwise fall back to the setting, itself
         # defaulting to "inline". Under a bare-Python host the setting reads as {} (no
-        # framework), which is not "queued", so it correctly resolves to "inline".
-        if replication_mode is not None:
-            self.replication_mode = replication_mode
-        elif app_settings.NOTIFICATION_REPLICATION_MODE == "queued":
-            self.replication_mode = "queued"
-        else:
-            self.replication_mode = "inline"
+        # framework), which is falsy and correctly resolves to "inline". Any other value --
+        # a typo like "queded" from an untyped env var/setting -- must fail loud rather than
+        # silently degrade to inline replication.
+        resolved_replication_mode: Any = (
+            replication_mode
+            if replication_mode is not None
+            else app_settings.NOTIFICATION_REPLICATION_MODE
+        )
+        if not resolved_replication_mode:
+            resolved_replication_mode = "inline"
+        if resolved_replication_mode not in ("inline", "queued"):
+            raise NotificationError(
+                f"Invalid replication_mode {resolved_replication_mode!r}; expected 'inline' or "
+                "'queued'"
+            )
+        self.replication_mode = resolved_replication_mode
 
         if isinstance(notification_queue_service, AsyncIOBaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service

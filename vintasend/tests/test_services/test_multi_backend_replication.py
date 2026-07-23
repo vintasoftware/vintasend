@@ -1,9 +1,16 @@
 import datetime
+import os
 import tempfile
 from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import patch
 
 from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.exceptions import BackendNotFoundError, NotificationNotFoundError, ReplicationError
+from vintasend.exceptions import (
+    BackendNotFoundError,
+    NotificationError,
+    NotificationNotFoundError,
+    ReplicationError,
+)
 from vintasend.services.dataclasses import NotificationContextDict
 from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
@@ -199,6 +206,31 @@ class QueuedReplicationTestCase(TestCase):
         service = self.build_service(additional_backends=[self.replica_one])
         assert service.replication_mode == "inline"
 
+    def test_replication_mode_resolves_queued_from_settings(self):
+        _reset_notification_settings_singleton(self)
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queued"}):
+                service = self.build_service(additional_backends=[self.replica_one])
+
+        assert service.replication_mode == "queued"
+
+    def test_explicit_replication_mode_wins_over_queued_setting(self):
+        _reset_notification_settings_singleton(self)
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queued"}):
+                service = self.build_service(
+                    additional_backends=[self.replica_one], replication_mode="inline"
+                )
+
+        assert service.replication_mode == "inline"
+
+    def test_invalid_replication_mode_setting_raises(self):
+        _reset_notification_settings_singleton(self)
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queded"}):
+                with self.assertRaises(NotificationError):
+                    self.build_service(additional_backends=[self.replica_one])
+
     def test_register_replication_queue_service_injects_after_construction(self):
         service = self.build_service(
             additional_backends=[self.replica_one], replication_mode="queued"
@@ -339,6 +371,31 @@ class AsyncIOQueuedReplicationTestCase(IsolatedAsyncioTestCase):
     async def test_replication_mode_resolves_from_settings_default_to_inline(self):
         service = self.build_service(additional_backends=[self.replica_one])
         assert service.replication_mode == "inline"
+
+    async def test_replication_mode_resolves_queued_from_settings(self):
+        _reset_notification_settings_singleton(self)
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queued"}):
+                service = self.build_service(additional_backends=[self.replica_one])
+
+        assert service.replication_mode == "queued"
+
+    async def test_explicit_replication_mode_wins_over_queued_setting(self):
+        _reset_notification_settings_singleton(self)
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queued"}):
+                service = self.build_service(
+                    additional_backends=[self.replica_one], replication_mode="inline"
+                )
+
+        assert service.replication_mode == "inline"
+
+    async def test_invalid_replication_mode_setting_raises(self):
+        _reset_notification_settings_singleton(self)
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queded"}):
+                with self.assertRaises(NotificationError):
+                    self.build_service(additional_backends=[self.replica_one])
 
     async def test_register_replication_queue_service_injects_after_construction(self):
         service = self.build_service(
