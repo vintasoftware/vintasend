@@ -523,6 +523,12 @@ class NotificationService(Generic[A, B]):
         when no id resolves (e.g. bulk read-marking) or the record no longer exists on the
         primary (e.g. a cancel that deleted it) -- the caller then relies on ``additional_write``
         instead of snapshot application.
+
+        Runs after the primary write has already committed, so it must never fail the caller:
+        any exception raised by the re-read (not just ``NotificationError``, e.g. a transient
+        connection error from a real backend) is logged and swallowed, degrading this replica
+        pass to the ``additional_write`` fallback rather than failing an already-successful
+        primary write.
         """
         snapshot_id = replication_notification_id
         if snapshot_id is None and isinstance(result, (Notification, OneOffNotification)):
@@ -531,7 +537,13 @@ class NotificationService(Generic[A, B]):
             return None
         try:
             return self.notification_backend.get_notification(snapshot_id)
-        except NotificationError:
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to re-read notification %s to build a replication snapshot; the "
+                "primary write already succeeded and replication will be reconciled later",
+                snapshot_id,
+                exc_info=True,
+            )
             return None
 
     def _replicate_write_to_backend(
@@ -1975,6 +1987,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         when no id resolves (e.g. bulk read-marking) or the record no longer exists on the
         primary (e.g. a cancel that deleted it) -- the caller then relies on ``additional_write``
         instead of snapshot application.
+
+        Runs after the primary write has already committed, so it must never fail the caller:
+        any exception raised by the re-read (not just ``NotificationError``, e.g. a transient
+        connection error from a real backend) is logged and swallowed, degrading this replica
+        pass to the ``additional_write`` fallback rather than failing an already-successful
+        primary write.
         """
         snapshot_id = replication_notification_id
         if snapshot_id is None and isinstance(result, (Notification, OneOffNotification)):
@@ -1983,7 +2001,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             return None
         try:
             return await self.notification_backend.get_notification(snapshot_id)
-        except NotificationError:
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to re-read notification %s to build a replication snapshot; the "
+                "primary write already succeeded and replication will be reconciled later",
+                snapshot_id,
+                exc_info=True,
+            )
             return None
 
     async def _replicate_write_to_backend(

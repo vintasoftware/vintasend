@@ -226,6 +226,33 @@ class MultiBackendWriteFanoutTestCase(TestCase):
 
         assert declining.get_notification(notification.id).title == "updated"
 
+    def test_declining_backend_create_does_not_create_row_inline_and_logs_warning(self):
+        """A CREATE replicated to a declining backend can't be created with the primary's id.
+
+        Unlike the update-fallback test above, this does not pre-seed the replica row: it
+        exercises the real limitation documented on ``_converge_replica_to_snapshot`` -- a
+        backend that declines ``apply_replication_snapshot_if_newer`` has no way to create the
+        row inline, so the create is best-effort skipped and logged for later reconciliation.
+        """
+        declining = NoSnapshotApplyReplica(database_file_name=tempfile.mktemp(suffix=".json"))
+        self._owned_backends.append(declining)
+        service = self.build_service(additional_backends=[declining])
+
+        with self.assertLogs(
+            "vintasend.services.notification_service", level="WARNING"
+        ) as captured:
+            notification = self._create(service, send_after=_future(), title="original")
+
+        # The primary write succeeded and holds the notification.
+        primary = self.primary_backend.get_notification(notification.id)
+        assert primary.id == notification.id
+        # The declining replica never got the row: it cannot create it with the primary's id.
+        with self.assertRaises(NotificationNotFoundError):
+            declining.get_notification(notification.id)
+        assert any(
+            "cannot create it with its primary id inline" in message for message in captured.output
+        )
+
     # --- mark / cancel -----------------------------------------------------------
 
     def test_mark_read_and_cancel_replicate(self):
@@ -404,6 +431,33 @@ class AsyncIOMultiBackendWriteFanoutTestCase(IsolatedAsyncioTestCase):
         await service.update_notification(notification.id, title="updated")
 
         assert (await declining.get_notification(notification.id)).title == "updated"
+
+    async def test_declining_backend_create_does_not_create_row_inline_and_logs_warning(self):
+        """A CREATE replicated to a declining backend can't be created with the primary's id.
+
+        Unlike the update-fallback test above, this does not pre-seed the replica row: it
+        exercises the real limitation documented on ``_converge_replica_to_snapshot`` -- a
+        backend that declines ``apply_replication_snapshot_if_newer`` has no way to create the
+        row inline, so the create is best-effort skipped and logged for later reconciliation.
+        """
+        declining = AsyncIONoSnapshotApplyReplica(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self._owned_backends.append(declining)
+        service = self.build_service(additional_backends=[declining])
+
+        with self.assertLogs(
+            "vintasend.services.notification_service", level="WARNING"
+        ) as captured:
+            notification = await self._create(service, send_after=_future(), title="original")
+
+        primary = await self.primary_backend.get_notification(notification.id)
+        assert primary.id == notification.id
+        with self.assertRaises(NotificationNotFoundError):
+            await declining.get_notification(notification.id)
+        assert any(
+            "cannot create it with its primary id inline" in message for message in captured.output
+        )
 
     async def test_mark_read_and_cancel_replicate(self):
         service = self.build_service(additional_backends=[self.replica_one, self.replica_two])
