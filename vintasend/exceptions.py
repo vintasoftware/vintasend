@@ -112,3 +112,7 @@ class GitCommitShaReassignmentError(NotificationError):
 class BackendNotFoundError(NotificationError):
     """Raised when a multi-backend read or operation names a ``backend_identifier`` that
     is not registered on the service -- neither the primary nor any additional backend."""
+
+
+class DuplicateBackendIdentifierError(NotificationError):
+    """Raised when two configured backends resolve to the same identifier."""

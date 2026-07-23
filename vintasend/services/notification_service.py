@@ -23,6 +23,7 @@ else:
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     BackendNotFoundError,
+    DuplicateBackendIdentifierError,
     DuplicateNotificationAdapterError,
     GitCommitShaReassignmentError,
     NotificationContextGenerationError,
@@ -216,6 +217,9 @@ class NotificationService(Generic[A, B]):
             backends, starting at 1 (the primary is position 0). Absent
             `additional_backends`, the service behaves exactly as a single-backend 2.0
             deployment.
+        :raises DuplicateBackendIdentifierError: if an additional backend's resolved
+            identifier collides with an already-registered backend's identifier --
+            including the primary's.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
@@ -271,6 +275,11 @@ class NotificationService(Generic[A, B]):
                 additional_backend_identifier = (
                     resolved_additional_backend.get_backend_identifier() or f"backend-{index}"
                 )
+                if additional_backend_identifier in self._backends:
+                    raise DuplicateBackendIdentifierError(
+                        f"Two configured backends resolve to the same identifier "
+                        f"'{additional_backend_identifier}'"
+                    )
                 self._backends[additional_backend_identifier] = resolved_additional_backend
 
         # Resolve the attachment manager (instance, dotted path, or the
@@ -1397,6 +1406,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             backends, starting at 1 (the primary is position 0). Absent
             `additional_backends`, the service behaves exactly as a single-backend 2.0
             deployment.
+        :raises DuplicateBackendIdentifierError: if an additional backend's resolved
+            identifier collides with an already-registered backend's identifier --
+            including the primary's.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
@@ -1455,6 +1467,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 additional_backend_identifier = (
                     resolved_additional_backend.get_backend_identifier() or f"backend-{index}"
                 )
+                if additional_backend_identifier in self._backends:
+                    raise DuplicateBackendIdentifierError(
+                        f"Two configured backends resolve to the same identifier "
+                        f"'{additional_backend_identifier}'"
+                    )
                 self._backends[additional_backend_identifier] = resolved_additional_backend
 
         # Resolve the attachment manager (instance, dotted path, or the

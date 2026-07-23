@@ -4,7 +4,11 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 import pytest
 
 from vintasend.constants import NotificationTypes
-from vintasend.exceptions import BackendNotFoundError, NotificationNotFoundError
+from vintasend.exceptions import (
+    BackendNotFoundError,
+    DuplicateBackendIdentifierError,
+    NotificationNotFoundError,
+)
 from vintasend.services.dataclasses import NotificationContextDict
 from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
@@ -125,6 +129,34 @@ class MultiBackendReadRoutingTestCase(TestCase):
         assert service.has_backend("backend-1") is True
         assert service.has_backend("backend-2") is True
         assert service.has_backend("backend-3") is False
+
+    # --- registry: duplicate identifiers ----------------------------------------
+
+    def test_duplicate_identifier_between_additional_backends_raises(self):
+        first_custom = BackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        second_custom = BackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self._owned_backends.extend([first_custom, second_custom])
+
+        with pytest.raises(DuplicateBackendIdentifierError):
+            self.build_service(additional_backends=[first_custom, second_custom])
+
+    def test_duplicate_identifier_with_primary_raises(self):
+        primary = BackendWithCustomIdentifier(database_file_name=tempfile.mktemp(suffix=".json"))
+        colliding_additional = BackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self._owned_backends.extend([primary, colliding_additional])
+
+        with pytest.raises(DuplicateBackendIdentifierError):
+            NotificationService(
+                notification_adapters=[IN_APP_ADAPTER],
+                notification_backend=primary,
+                additional_backends=[colliding_additional],
+            )
 
     # --- read routing ------------------------------------------------------------
 
@@ -341,6 +373,38 @@ class AsyncIOMultiBackendReadRoutingTestCase(IsolatedAsyncioTestCase):
         assert service.has_backend("backend-1") is True
         assert service.has_backend("backend-2") is True
         assert service.has_backend("backend-3") is False
+
+    # --- registry: duplicate identifiers ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_duplicate_identifier_between_additional_backends_raises(self):
+        first_custom = AsyncIOBackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        second_custom = AsyncIOBackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self._owned_backends.extend([first_custom, second_custom])
+
+        with pytest.raises(DuplicateBackendIdentifierError):
+            self.build_service(additional_backends=[first_custom, second_custom])
+
+    @pytest.mark.asyncio
+    async def test_duplicate_identifier_with_primary_raises(self):
+        primary = AsyncIOBackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        colliding_additional = AsyncIOBackendWithCustomIdentifier(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self._owned_backends.extend([primary, colliding_additional])
+
+        with pytest.raises(DuplicateBackendIdentifierError):
+            AsyncIONotificationService(
+                notification_adapters=[ASYNCIO_IN_APP_ADAPTER],
+                notification_backend=primary,
+                additional_backends=[colliding_additional],
+            )
 
     # --- read routing ------------------------------------------------------------
 
