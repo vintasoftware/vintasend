@@ -129,6 +129,15 @@ class ReplicationError(NotificationError):
     it cannot act on."""
 
 
+class BackendMigrationError(NotificationError):
+    """Raised for a migration-level misuse of ``NotificationService.migrate_to_backend`` --
+    for example the destination backend named is the same as the source backend.
+
+    Distinct from a single record's destination-write failure during migration: those are
+    captured in the returned ``BackendMigrationResult.failures`` rather than raised, so one bad
+    record does not abort the whole migration."""
+
+
 class NotificationRenderError(NotificationError):
     """Raised when a notification has no email renderer available to render it: either no
     adapter is configured for its notification type, or the configured adapter's template
