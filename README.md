@@ -717,6 +717,21 @@ push there as usual. This repo's lint, type-check, and test commands deliberatel
 its own CI. Committing here only records which commit of each implementation this repo
 points at.
 
+#### Creating a new implementation
+
+If none of the packages above cover what you need, don't start from a blank directory.
+`templates/vintasend-implementation-template/` is a ready-to-clone skeleton with one `TODO`
+stub per seam (backend, adapter, template renderer, queue service, attachment manager) and a
+matching test for each, so your clone installs and passes its test suite before you write any
+real logic:
+
+```bash
+python templates/vintasend-implementation-template/scripts/clone.py /path/to/vintasend-your-integration --package-name vintasend-your-integration
+```
+
+See that package's `README.md` for the full clone-and-rename workflow and a per-component
+checklist of exactly which methods to implement.
+
 
 ## Advanced Usage
 
