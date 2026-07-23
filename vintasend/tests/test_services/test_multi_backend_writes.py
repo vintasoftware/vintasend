@@ -270,6 +270,21 @@ class MultiBackendWriteFanoutTestCase(TestCase):
             with self.assertRaises(NotificationNotFoundError):
                 replica.get_notification(notification.id)
 
+    def test_mark_read_bulk_fans_out_to_all_backends(self):
+        service = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+
+        notifications = [self._create(service, title=f"n{i}") for i in range(3)]
+        ids = [notification.id for notification in notifications]
+
+        read_notifications = service.mark_read_bulk(ids, user_id=1)
+
+        assert {str(n.id) for n in read_notifications} == {str(i) for i in ids}
+        for backend in (self.primary_backend, self.replica_one, self.replica_two):
+            for notification_id in ids:
+                assert backend.get_notification(notification_id).status == (
+                    NotificationStatus.READ.value
+                )
+
     def test_update_replicates(self):
         service = self.build_service(additional_backends=[self.replica_one])
         notification = self._create(service, send_after=_future())
@@ -473,6 +488,21 @@ class AsyncIOMultiBackendWriteFanoutTestCase(IsolatedAsyncioTestCase):
         for replica in (self.replica_one, self.replica_two):
             with self.assertRaises(NotificationNotFoundError):
                 await replica.get_notification(notification.id)
+
+    async def test_mark_read_bulk_fans_out_to_all_backends(self):
+        service = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+
+        notifications = [await self._create(service, title=f"n{i}") for i in range(3)]
+        ids = [notification.id for notification in notifications]
+
+        read_notifications = await service.mark_read_bulk(ids, user_id=1)
+
+        assert {str(n.id) for n in read_notifications} == {str(i) for i in ids}
+        for backend in (self.primary_backend, self.replica_one, self.replica_two):
+            for notification_id in ids:
+                assert (await backend.get_notification(notification_id)).status == (
+                    NotificationStatus.READ.value
+                )
 
     async def test_single_backend_takes_no_replication_path(self):
         service = self.build_service()
