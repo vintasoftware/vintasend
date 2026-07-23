@@ -107,3 +107,12 @@ class GitCommitShaReassignmentError(NotificationError):
     """Raised when an update attempts to set a notification's git_commit_sha. The field is
     system-managed -- only NotificationService writes it, at send time, through
     store_git_commit_sha."""
+
+
+class NotificationRenderError(NotificationError):
+    """Raised when a notification has no email renderer available to render it: either no
+    adapter is configured for its notification type, or the configured adapter's template
+    renderer is not a BaseTemplatedEmailRenderer.
+
+    Distinct from NotificationTemplateRenderingError, which covers a renderer failing while
+    actually rendering a template it was handed."""

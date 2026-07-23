@@ -29,6 +29,7 @@ from vintasend.exceptions import (
     NotificationMarkFailedError,
     NotificationMarkSentError,
     NotificationQueueServiceMissingError,
+    NotificationRenderError,
     NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
@@ -81,6 +82,11 @@ from vintasend.services.notification_queue_services.asyncio_base import (
     AsyncIOBaseNotificationQueueService,
 )
 from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
+from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
+    BaseTemplatedEmailRenderer,
+    EmailTemplateContent,
+    TemplatedEmail,
+)
 from vintasend.services.service_utils import (
     is_asyncio_context_function,
     is_sync_context_function,
@@ -1090,6 +1096,48 @@ class NotificationService(Generic[A, B]):
         ):
             self.send(clone, context=reused_context)
         return clone
+
+    def render_email_template_from_content(
+        self,
+        notification: Notification | OneOffNotification,
+        template_content: EmailTemplateContent,
+        context: NotificationContextDict,
+    ) -> TemplatedEmail:
+        """
+        Render an email notification from supplied historical template content instead of its
+        stored template reference, returning the rendered subject and body. This is a
+        read-shaped preview/audit operation: it performs no I/O, generates no context, and
+        never sends or persists anything.
+
+        Parameters:
+            notification: Notification | OneOffNotification - the notification to render on
+                behalf of. Its own subject_template / body_template / preheader_template are
+                ignored in favor of template_content.
+            template_content: EmailTemplateContent - the historical subject/body (and optional
+                preheader) template content to render.
+            context: NotificationContextDict - the context to render with, verbatim. Typically
+                a notification's stored context_used, to reproduce a past render. No context
+                generation happens here.
+
+        Returns:
+            TemplatedEmail - the rendered subject and body.
+
+        Raises:
+            NotificationRenderError: if no adapter is configured for the notification's type,
+                or its template renderer is not a BaseTemplatedEmailRenderer.
+        """
+        for adapter in self.notification_adapters:
+            if adapter.notification_type.value != notification.notification_type:
+                continue
+            renderer = adapter.template_renderer
+            if not isinstance(renderer, BaseTemplatedEmailRenderer):
+                continue
+            return renderer.render_from_template_content(notification, template_content, context)
+
+        raise NotificationRenderError(
+            "No email renderer is configured for notification type "
+            f"{notification.notification_type!r}"
+        )
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -2190,6 +2238,48 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ):
             await self.send(clone, context=reused_context)
         return clone
+
+    async def render_email_template_from_content(
+        self,
+        notification: Notification | OneOffNotification,
+        template_content: EmailTemplateContent,
+        context: NotificationContextDict,
+    ) -> TemplatedEmail:
+        """
+        Render an email notification from supplied historical template content instead of its
+        stored template reference, returning the rendered subject and body. This is a
+        read-shaped preview/audit operation: it performs no I/O, generates no context, and
+        never sends or persists anything.
+
+        Parameters:
+            notification: Notification | OneOffNotification - the notification to render on
+                behalf of. Its own subject_template / body_template / preheader_template are
+                ignored in favor of template_content.
+            template_content: EmailTemplateContent - the historical subject/body (and optional
+                preheader) template content to render.
+            context: NotificationContextDict - the context to render with, verbatim. Typically
+                a notification's stored context_used, to reproduce a past render. No context
+                generation happens here.
+
+        Returns:
+            TemplatedEmail - the rendered subject and body.
+
+        Raises:
+            NotificationRenderError: if no adapter is configured for the notification's type,
+                or its template renderer is not a BaseTemplatedEmailRenderer.
+        """
+        for adapter in self.notification_adapters:
+            if adapter.notification_type.value != notification.notification_type:
+                continue
+            renderer = adapter.template_renderer
+            if not isinstance(renderer, BaseTemplatedEmailRenderer):
+                continue
+            return renderer.render_from_template_content(notification, template_content, context)
+
+        raise NotificationRenderError(
+            "No email renderer is configured for notification type "
+            f"{notification.notification_type!r}"
+        )
 
     async def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
