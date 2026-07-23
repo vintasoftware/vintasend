@@ -1,52 +1,5 @@
 # Release Notes
 
-## Version 2.0.0 (2026-07-22)
-
-### Features
-
-* **Background notification sending via queue service:** Adapters now opt in to background delivery by subclassing `BackgroundNotificationAdapter` (sync) or `AsyncIOBackgroundNotificationAdapter` (AsyncIO). When a background-capable adapter is used, `send()` enqueues the notification id to the configured queue service and returns immediately; a worker calls the service's `delayed_send(notification_id)` to actually deliver it. This decouples web request latency from notification delivery.
-* **ID-only queue payloads:** The queue now carries only the notification id, not serialized notification data. The worker reloads the notification from the backend, which means context is generated at delivery time (not at enqueue time) and attachments work on the background path for the first time.
-* **Context generation in the worker:** Scheduled notifications render against current data when delivered, not against data from the enqueueing process, which is more accurate.
-* **Service factory for worker processes:** `NOTIFICATION_SERVICE_FACTORY` points to a callable that returns a ready `NotificationService` or `AsyncIONotificationService` for the worker. The factory runs once per process and the result is cached, enabling ORM sessions scoped to the worker rather than rebuilt per task.
-* **AsyncIO background sending:** `AsyncIONotificationService` now supports background sending via `AsyncIOBackgroundNotificationAdapter` and `AsyncIOBaseNotificationQueueService`.
-
-### Bug Fixes
-
-None — this is a new feature set.
-
-### Breaking Changes
-
-1. **`raise_on_failed_send` defaults to `False`.** In 1.x, send failures raised `NotificationSendError` and similar exceptions. In 2.0, they are logged but not raised by default. Applications that catch these exceptions should pass `raise_on_failed_send=True` to `NotificationService` / `AsyncIONotificationService` to restore 1.x behavior.
-
-2. **Background adapter `delayed_send` signature changed:** The adapter marker method now takes only `notification_id`, not `(notification_dict, context_dict)`. Core never calls this method; delivery happens via the adapter's `send()` method after the worker loads the notification. Adapter authors must move background delivery logic from `delayed_send` to `send()`.
-
-3. **Deleted serialization hooks and types:** The eight abstract methods `serialize_config`, `restore_config`, and six others on `AsyncNotificationProtocol`, plus the types `NotificationDict` and `OneOffNotificationDict`, are deleted. No serialization is needed with id-only payloads.
-
-4. **`NOTIFICATION_SERVICE_FACTORY` is required for background sending:** The worker needs a factory callable to rebuild the service in its own process. Without it, background-capable adapters work in the web process but enqueue with no queue service, which logs an error or raises (depending on `raise_on_failed_send`).
-
-5. **Worker and web must share `NOTIFICATION_BACKEND` settings:** A worker with a different backend silently fails to find notifications.
-
-6. **Adapter rename:** `AsyncBaseNotificationAdapter` is renamed to `BackgroundNotificationAdapter`; the old name is kept as a silent alias for compatibility. New AsyncIO background adapters subclass `AsyncIOBackgroundNotificationAdapter`.
-
-### Backwards Compatibility
-
-* **Seam changes:** No new abstract methods were added; only `delayed_send` on background adapters was reshaped. Custom backends and adapters need code changes only if they implement background sending.
-* **`AsyncBaseNotificationAdapter` is now an alias.** Existing imports continue to work, but `BackgroundNotificationAdapter` is the recommended name for new code.
-* **`raise_on_failed_send` silent behavior change:** Existing code that does not catch send exceptions sees the same behavior (failures logged). Code that catches `NotificationSendError` will stop seeing it and must pass `raise_on_failed_send=True` to restore 1.x semantics.
-* **Downstream impact:** `vintasend-celery` is significantly affected and requires a 2.0 release of its own (separate repository). `vintasend-django` and `vintasend-sqlalchemy` are unaffected unless they implement background adapters. See `MIGRATION_TO_2.0.0.md` for detailed guidance on the `NOTIFICATION_SERVICE_FACTORY` pattern.
-
-### Operational Requirements
-
-* **Drain or dual-register the Celery queue before deploying:** Tasks queued under 1.x carry a different payload format and will fail against 2.0. Either drain the queue before deploying the 2.0 worker or register the new entrypoint under a new task name and run both workers until the old queue empties.
-
-### Upgrade Path
-
-1. Start by reading `MIGRATION_TO_2.0.0.md` for the six breaking changes and the deploy procedure.
-2. If you use background sending, set up `NOTIFICATION_SERVICE_FACTORY` pointing to a factory that returns a ready service.
-3. If you maintain an adapter, update it to the new `BackgroundNotificationAdapter` / `AsyncIOBackgroundNotificationAdapter` base and move `delayed_send` logic to `send()`.
-4. Test end-to-end, including attachments in background sends (now supported).
-5. Drain the queue and deploy the 2.0 worker.
-
 ## Version 1.4.0 (2026-07-22)
 
 ### Bug Fixes
