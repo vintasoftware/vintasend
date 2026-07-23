@@ -3,7 +3,7 @@ import tempfile
 from unittest import IsolatedAsyncioTestCase, TestCase
 
 from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.exceptions import NotificationNotFoundError
+from vintasend.exceptions import BackendNotFoundError, NotificationNotFoundError, ReplicationError
 from vintasend.services.dataclasses import NotificationContextDict
 from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
@@ -355,3 +355,215 @@ class AsyncIOQueuedReplicationTestCase(IsolatedAsyncioTestCase):
         assert isinstance(
             service.replication_queue_service, AsyncIOBaseNotificationReplicationQueueService
         )
+
+
+class ProcessReplicationTestCase(TestCase):
+    """Sync ``process_replication`` worker entrypoint (Phase 3)."""
+
+    def setUp(self):
+        register_context("multi_backend_replication_test_context")(_build_context)
+        self.primary_backend = FakeFileBackend(database_file_name=tempfile.mktemp(suffix=".json"))
+        self.replica_one = FakeFileBackend(database_file_name=tempfile.mktemp(suffix=".json"))
+        self.replica_two = FakeFileBackend(database_file_name=tempfile.mktemp(suffix=".json"))
+        self.queue = FakeReplicationQueueService()
+        self._owned_backends = [self.primary_backend, self.replica_one, self.replica_two]
+
+    def tearDown(self):
+        for backend in self._owned_backends:
+            backend.clear()
+
+    def build_service(self, **kwargs) -> NotificationService:
+        kwargs.setdefault("notification_adapters", [IN_APP_ADAPTER])
+        kwargs.setdefault("notification_backend", self.primary_backend)
+        return NotificationService(**kwargs)
+
+    def _create(self, service: NotificationService, send_after=None, title="Notification"):
+        return service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.IN_APP.value,
+            title=title,
+            body_template="body.html",
+            context_name="multi_backend_replication_test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=send_after,
+            subject_template="subject.txt",
+            preheader_template="preheader.html",
+        )
+
+    def test_process_replication_applies_snapshot_to_all_targets(self):
+        # Create on the primary only, then replicate to two empty replicas.
+        primary_only = self.build_service()
+        notification = self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        result = worker.process_replication(notification.id)
+
+        assert result == {"successes": ["backend-1", "backend-2"], "failures": []}
+        for replica in (self.replica_one, self.replica_two):
+            assert replica.get_notification(notification.id).title == notification.title
+
+    def test_process_replication_applies_snapshot_to_a_single_named_target(self):
+        primary_only = self.build_service()
+        notification = self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        result = worker.process_replication(notification.id, "backend-2")
+
+        assert result == {"successes": ["backend-2"], "failures": []}
+        assert self.replica_two.get_notification(notification.id).id == notification.id
+        # The other replica was not targeted.
+        with self.assertRaises(NotificationNotFoundError):
+            self.replica_one.get_notification(notification.id)
+
+    def test_process_replication_unknown_target_raises(self):
+        primary_only = self.build_service()
+        notification = self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(BackendNotFoundError):
+            worker.process_replication(notification.id, "backend-does-not-exist")
+
+    def test_process_replication_missing_on_primary_raises_replication_error(self):
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(ReplicationError):
+            worker.process_replication("no-such-id")
+
+    def test_replicate_notification_is_the_no_target_alias(self):
+        primary_only = self.build_service()
+        notification = self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        result = worker.replicate_notification(notification.id)
+
+        assert result == {"successes": ["backend-1", "backend-2"], "failures": []}
+        for replica in (self.replica_one, self.replica_two):
+            assert replica.get_notification(notification.id).id == notification.id
+
+    def test_web_enqueue_then_worker_drain_converges_replica(self):
+        # Web path: create under queued mode, enqueuing one task per replica.
+        web = self.build_service(
+            additional_backends=[self.replica_one, self.replica_two],
+            replication_mode="queued",
+            replication_queue_service=self.queue,
+        )
+        notification = self._create(web, send_after=_future())
+        assert self.queue.enqueued_replications == [
+            (notification.id, "backend-1"),
+            (notification.id, "backend-2"),
+        ]
+
+        # Worker path: drain each enqueued task through process_replication.
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        for notification_id, backend_identifier in self.queue.enqueued_replications:
+            worker.process_replication(notification_id, backend_identifier)
+
+        for backend in (self.primary_backend, self.replica_one, self.replica_two):
+            assert backend.get_notification(notification.id).title == notification.title
+
+
+class AsyncIOProcessReplicationTestCase(IsolatedAsyncioTestCase):
+    """AsyncIO ``process_replication`` worker entrypoint (Phase 3)."""
+
+    def setUp(self):
+        register_context("multi_backend_replication_test_context")(_build_context)
+        self.primary_backend = FakeAsyncIOFileBackend(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self.replica_one = FakeAsyncIOFileBackend(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self.replica_two = FakeAsyncIOFileBackend(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self.queue = FakeAsyncIOReplicationQueueService()
+        self._owned_backends = [self.primary_backend, self.replica_one, self.replica_two]
+
+    async def asyncTearDown(self):
+        for backend in self._owned_backends:
+            await backend.clear()
+
+    def build_service(self, **kwargs) -> AsyncIONotificationService:
+        kwargs.setdefault("notification_adapters", [ASYNCIO_IN_APP_ADAPTER])
+        kwargs.setdefault("notification_backend", self.primary_backend)
+        return AsyncIONotificationService(**kwargs)
+
+    async def _create(
+        self, service: AsyncIONotificationService, send_after=None, title="Notification"
+    ):
+        return await service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.IN_APP.value,
+            title=title,
+            body_template="body.html",
+            context_name="multi_backend_replication_test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=send_after,
+            subject_template="subject.txt",
+            preheader_template="preheader.html",
+        )
+
+    async def test_process_replication_applies_snapshot_to_all_targets(self):
+        primary_only = self.build_service()
+        notification = await self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        result = await worker.process_replication(notification.id)
+
+        assert result == {"successes": ["backend-1", "backend-2"], "failures": []}
+        for replica in (self.replica_one, self.replica_two):
+            assert (await replica.get_notification(notification.id)).title == notification.title
+
+    async def test_process_replication_applies_snapshot_to_a_single_named_target(self):
+        primary_only = self.build_service()
+        notification = await self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        result = await worker.process_replication(notification.id, "backend-2")
+
+        assert result == {"successes": ["backend-2"], "failures": []}
+        assert (await self.replica_two.get_notification(notification.id)).id == notification.id
+        with self.assertRaises(NotificationNotFoundError):
+            await self.replica_one.get_notification(notification.id)
+
+    async def test_process_replication_unknown_target_raises(self):
+        primary_only = self.build_service()
+        notification = await self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(BackendNotFoundError):
+            await worker.process_replication(notification.id, "backend-does-not-exist")
+
+    async def test_process_replication_missing_on_primary_raises_replication_error(self):
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(ReplicationError):
+            await worker.process_replication("no-such-id")
+
+    async def test_replicate_notification_is_the_no_target_alias(self):
+        primary_only = self.build_service()
+        notification = await self._create(primary_only, send_after=_future())
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        result = await worker.replicate_notification(notification.id)
+
+        assert result == {"successes": ["backend-1", "backend-2"], "failures": []}
+        for replica in (self.replica_one, self.replica_two):
+            assert (await replica.get_notification(notification.id)).id == notification.id
+
+    async def test_web_enqueue_then_worker_drain_converges_replica(self):
+        web = self.build_service(
+            additional_backends=[self.replica_one, self.replica_two],
+            replication_mode="queued",
+            replication_queue_service=self.queue,
+        )
+        notification = await self._create(web, send_after=_future())
+        assert self.queue.enqueued_replications == [
+            (notification.id, "backend-1"),
+            (notification.id, "backend-2"),
+        ]
+
+        worker = self.build_service(additional_backends=[self.replica_one, self.replica_two])
+        for notification_id, backend_identifier in self.queue.enqueued_replications:
+            await worker.process_replication(notification_id, backend_identifier)
+
+        for backend in (self.primary_backend, self.replica_one, self.replica_two):
+            assert (await backend.get_notification(notification.id)).title == notification.title

@@ -36,6 +36,7 @@ from vintasend.exceptions import (
     NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
+    ReplicationError,
     TenantReassignmentError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
@@ -820,6 +821,73 @@ class NotificationService(Generic[A, B]):
             self._replicate_snapshot_fallback,
             replication_notification_id=notification_id,
         )
+
+    def process_replication(
+        self,
+        notification_id: int | str | uuid.UUID,
+        target_backend_identifier: str | None = None,
+    ) -> dict[str, list]:
+        """Worker entrypoint: converge one or more replicas to the primary's snapshot.
+
+        This is what a queued-replication worker calls to drain a task enqueued by
+        ``enqueue_replication``. It reads the authoritative record from the primary backend and
+        converges each target to it, preferring the target's ``apply_replication_snapshot_if_newer``
+        and falling back to read-then-write with the duplicate-conflict retry -- the same Phase 2
+        convergence path inline replication uses.
+
+        ``target_backend_identifier`` names a single backend to replicate to; when omitted, every
+        additional backend is targeted. An unknown identifier raises ``BackendNotFoundError``.
+
+        The notification must resolve on the primary: it is the source of truth, and the worker
+        was told to replicate a specific id, so a missing record is a ``ReplicationError`` rather
+        than a silent no-op. A per-target failure is captured, not raised, so one bad replica does
+        not abort the others.
+
+        Returns ``{"successes": [<identifier>, ...], "failures": [{"backend_identifier": ...,
+        "error": ...}, ...]}``.
+        """
+        if target_backend_identifier is not None and not self.has_backend(
+            target_backend_identifier
+        ):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{target_backend_identifier}'"
+            )
+
+        try:
+            snapshot = self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError as exc:
+            raise ReplicationError(
+                f"Cannot replicate notification {notification_id}: it does not exist on the "
+                "primary backend"
+            ) from exc
+
+        if target_backend_identifier is not None:
+            targets = [target_backend_identifier]
+        else:
+            targets = self.get_additional_backend_identifiers()
+
+        successes: list[str] = []
+        failures: list[dict[str, str]] = []
+        for identifier in targets:
+            target = self._backends[identifier]
+            try:
+                self._replicate_write_to_backend(
+                    target, snapshot, self._replicate_snapshot_fallback
+                )
+                successes.append(identifier)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to replicate notification %s to backend %s during process_replication",
+                    notification_id,
+                    identifier,
+                )
+                failures.append({"backend_identifier": identifier, "error": str(exc)})
+        return {"successes": successes, "failures": failures}
+
+    def replicate_notification(self, notification_id: int | str | uuid.UUID) -> dict[str, list]:
+        """Replicate a notification to every additional backend -- the no-target alias for
+        ``process_replication(notification_id, None)``."""
+        return self.process_replication(notification_id, None)
 
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
@@ -2496,6 +2564,75 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             self._replicate_snapshot_fallback,
             replication_notification_id=notification_id,
         )
+
+    async def process_replication(
+        self,
+        notification_id: int | str | uuid.UUID,
+        target_backend_identifier: str | None = None,
+    ) -> dict[str, list]:
+        """Worker entrypoint: converge one or more replicas to the primary's snapshot.
+
+        This is what a queued-replication worker calls to drain a task enqueued by
+        ``enqueue_replication``. It reads the authoritative record from the primary backend and
+        converges each target to it, preferring the target's ``apply_replication_snapshot_if_newer``
+        and falling back to read-then-write with the duplicate-conflict retry -- the same Phase 2
+        convergence path inline replication uses.
+
+        ``target_backend_identifier`` names a single backend to replicate to; when omitted, every
+        additional backend is targeted. An unknown identifier raises ``BackendNotFoundError``.
+
+        The notification must resolve on the primary: it is the source of truth, and the worker
+        was told to replicate a specific id, so a missing record is a ``ReplicationError`` rather
+        than a silent no-op. A per-target failure is captured, not raised, so one bad replica does
+        not abort the others.
+
+        Returns ``{"successes": [<identifier>, ...], "failures": [{"backend_identifier": ...,
+        "error": ...}, ...]}``.
+        """
+        if target_backend_identifier is not None and not self.has_backend(
+            target_backend_identifier
+        ):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{target_backend_identifier}'"
+            )
+
+        try:
+            snapshot = await self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError as exc:
+            raise ReplicationError(
+                f"Cannot replicate notification {notification_id}: it does not exist on the "
+                "primary backend"
+            ) from exc
+
+        if target_backend_identifier is not None:
+            targets = [target_backend_identifier]
+        else:
+            targets = self.get_additional_backend_identifiers()
+
+        successes: list[str] = []
+        failures: list[dict[str, str]] = []
+        for identifier in targets:
+            target = self._backends[identifier]
+            try:
+                await self._replicate_write_to_backend(
+                    target, snapshot, self._replicate_snapshot_fallback
+                )
+                successes.append(identifier)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to replicate notification %s to backend %s during process_replication",
+                    notification_id,
+                    identifier,
+                )
+                failures.append({"backend_identifier": identifier, "error": str(exc)})
+        return {"successes": successes, "failures": failures}
+
+    async def replicate_notification(
+        self, notification_id: int | str | uuid.UUID
+    ) -> dict[str, list]:
+        """Replicate a notification to every additional backend -- the no-target alias for
+        ``process_replication(notification_id, None)``."""
+        return await self.process_replication(notification_id, None)
 
     async def _resolve_and_persist_git_commit_sha(
         self,
