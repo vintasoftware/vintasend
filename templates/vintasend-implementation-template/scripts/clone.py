@@ -67,6 +67,9 @@ def _rewrite_files_in_place(root: Path, old: str, new: str) -> None:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or any(part in SKIP_DIR_NAMES for part in path.parts):
             continue
+        # scripts/ (including this very clone.py) isn't part of the renamed package -- leave it alone.
+        if "scripts" in path.parts:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:

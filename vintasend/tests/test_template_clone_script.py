@@ -48,6 +48,10 @@ class CloneScriptTestCase(TestCase):
         for path in self.target.rglob("*"):
             if not path.is_file() or any(part in _SKIP_DIR_NAMES for part in path.parts):
                 continue
+            # scripts/clone.py legitimately names the template itself (docstring, SOURCE_*
+            # constants) and is deliberately left unrewritten by the clone script -- skip it.
+            if "scripts" in path.parts:
+                continue
             try:
                 yield path, path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
