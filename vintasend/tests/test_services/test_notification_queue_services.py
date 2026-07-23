@@ -11,7 +11,9 @@ from vintasend.exceptions import (
 )
 from vintasend.services.helpers import (
     get_asyncio_notification_queue_service,
+    get_asyncio_notification_replication_queue_service,
     get_notification_queue_service,
+    get_notification_replication_queue_service,
 )
 from vintasend.services.notification_queue_services.asyncio_base import (
     AsyncIOBaseNotificationQueueService,
@@ -281,3 +283,77 @@ class GetAsyncioNotificationQueueServiceTestCase(TestCase):
 
         with pytest.raises(NotificationQueueServiceMissingError):
             get_asyncio_notification_queue_service(None)
+
+
+class GetNotificationReplicationQueueServiceTestCase(TestCase):
+    def test_resolves_a_valid_import_string(self):
+        replication_queue_service = get_notification_replication_queue_service(
+            "vintasend.services.notification_queue_services.stubs.fake_replication_queue_service.FakeReplicationQueueService"
+        )
+
+        assert isinstance(replication_queue_service, FakeReplicationQueueService)
+
+    def test_raises_typed_error_on_a_bad_import_string(self):
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_notification_replication_queue_service("vintasend.does.not.exist.NotReal")
+
+    def test_raises_typed_error_when_resolved_class_is_not_a_replication_queue_service(self):
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_notification_replication_queue_service("builtins.object")
+
+    def test_raises_typed_error_when_resolved_class_is_the_asyncio_service(self):
+        """A host wiring the AsyncIO replication queue service into the sync resolver is a real
+        misconfiguration. This is the only assertion that pins which ABC this resolver checks
+        against, since `builtins.object` alone would pass even if it checked the wrong ABC.
+        """
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_notification_replication_queue_service(
+                "vintasend.services.notification_queue_services.stubs.fake_replication_queue_service.FakeAsyncIOReplicationQueueService"
+            )
+
+    def test_raises_typed_error_when_no_import_string_and_no_framework_detected(self):
+        """With no import string and no framework detected,
+        NOTIFICATION_REPLICATION_QUEUE_SERVICE resolves to `{}` rather than `None`, so the guard
+        must treat any non-`str` value as "not configured" instead of only checking for `None`.
+        """
+        _reset_notification_settings_singleton(self)
+
+        with pytest.raises(NotificationQueueServiceMissingError):
+            get_notification_replication_queue_service(None)
+
+
+class GetAsyncioNotificationReplicationQueueServiceTestCase(TestCase):
+    def test_resolves_a_valid_import_string(self):
+        replication_queue_service = get_asyncio_notification_replication_queue_service(
+            "vintasend.services.notification_queue_services.stubs.fake_replication_queue_service.FakeAsyncIOReplicationQueueService"
+        )
+
+        assert isinstance(replication_queue_service, FakeAsyncIOReplicationQueueService)
+
+    def test_raises_typed_error_on_a_bad_import_string(self):
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_asyncio_notification_replication_queue_service("vintasend.does.not.exist.NotReal")
+
+    def test_raises_typed_error_when_resolved_class_is_not_a_replication_queue_service(self):
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_asyncio_notification_replication_queue_service("builtins.object")
+
+    def test_raises_typed_error_when_resolved_class_is_the_sync_service(self):
+        """A host wiring the sync replication queue service into the AsyncIO resolver is a real
+        misconfiguration. This is the only assertion that pins which ABC this resolver checks
+        against, since `builtins.object` alone would pass even if it checked the wrong ABC.
+        """
+        with pytest.raises(NotificationQueueServiceResolutionError):
+            get_asyncio_notification_replication_queue_service(
+                "vintasend.services.notification_queue_services.stubs.fake_replication_queue_service.FakeReplicationQueueService"
+            )
+
+    def test_raises_typed_error_when_no_import_string_and_no_framework_detected(self):
+        """With no import string and no framework detected,
+        NOTIFICATION_REPLICATION_QUEUE_SERVICE resolves to `{}` rather than `None`, so the guard
+        must treat any non-`str` value as "not configured" instead of only checking for `None`.
+        """
+        _reset_notification_settings_singleton(self)
+
+        with pytest.raises(NotificationQueueServiceMissingError):
+            get_asyncio_notification_replication_queue_service(None)

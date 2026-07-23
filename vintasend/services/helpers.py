@@ -19,7 +19,13 @@ from vintasend.services.notification_backends.base import BaseNotificationBacken
 from vintasend.services.notification_queue_services.asyncio_base import (
     AsyncIOBaseNotificationQueueService,
 )
+from vintasend.services.notification_queue_services.asyncio_replication_base import (
+    AsyncIOBaseNotificationReplicationQueueService,
+)
 from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
+from vintasend.services.notification_queue_services.replication_base import (
+    BaseNotificationReplicationQueueService,
+)
 from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
 
 
@@ -308,6 +314,94 @@ def get_asyncio_notification_queue_service(
             f"Notifications Queue Service Error: {queue_service_import_str_with_fallback} is not a valid AsyncIO notification queue service"
         )
     return cast(AsyncIOBaseNotificationQueueService, queue_service)
+
+
+def get_notification_replication_queue_service(
+    replication_queue_service_import_str: str | None,
+    replication_queue_service_kwargs: dict | None = None,
+    config: Any = None,
+) -> BaseNotificationReplicationQueueService:
+    app_settings = NotificationSettings(config)
+    import_str_with_fallback = (
+        replication_queue_service_import_str
+        if replication_queue_service_import_str is not None
+        else app_settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE
+    )
+
+    if not isinstance(import_str_with_fallback, str) or not import_str_with_fallback:
+        raise NotificationQueueServiceMissingError(
+            "Notifications Replication Queue Service Error: no replication queue service import "
+            "string was provided and NOTIFICATION_REPLICATION_QUEUE_SERVICE is not set"
+        )
+
+    try:
+        replication_queue_service_cls = _import_class(import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise NotificationQueueServiceResolutionError(
+            f"Notifications Replication Queue Service Error: Could not import {import_str_with_fallback}"
+        ) from e
+
+    try:
+        replication_queue_service = (
+            replication_queue_service_cls(**replication_queue_service_kwargs)
+            if replication_queue_service_kwargs
+            else replication_queue_service_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise NotificationQueueServiceResolutionError(
+            f"Notifications Replication Queue Service Error: Could not instantiate {import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(replication_queue_service, BaseNotificationReplicationQueueService):
+        raise NotificationQueueServiceResolutionError(
+            f"Notifications Replication Queue Service Error: {import_str_with_fallback} is not a "
+            "valid notification replication queue service"
+        )
+    return cast(BaseNotificationReplicationQueueService, replication_queue_service)
+
+
+def get_asyncio_notification_replication_queue_service(
+    replication_queue_service_import_str: str | None,
+    replication_queue_service_kwargs: dict | None = None,
+    config: Any = None,
+) -> AsyncIOBaseNotificationReplicationQueueService:
+    app_settings = NotificationSettings(config)
+    import_str_with_fallback = (
+        replication_queue_service_import_str
+        if replication_queue_service_import_str is not None
+        else app_settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE
+    )
+
+    if not isinstance(import_str_with_fallback, str) or not import_str_with_fallback:
+        raise NotificationQueueServiceMissingError(
+            "Notifications Replication Queue Service Error: no replication queue service import "
+            "string was provided and NOTIFICATION_REPLICATION_QUEUE_SERVICE is not set"
+        )
+
+    try:
+        replication_queue_service_cls = _import_class(import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise NotificationQueueServiceResolutionError(
+            f"Notifications Replication Queue Service Error: Could not import {import_str_with_fallback}"
+        ) from e
+
+    try:
+        replication_queue_service = (
+            replication_queue_service_cls(**replication_queue_service_kwargs)
+            if replication_queue_service_kwargs
+            else replication_queue_service_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise NotificationQueueServiceResolutionError(
+            f"Notifications Replication Queue Service Error: Could not instantiate {import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(replication_queue_service, AsyncIOBaseNotificationReplicationQueueService):
+        raise NotificationQueueServiceResolutionError(
+            f"Notifications Replication Queue Service Error: {import_str_with_fallback} is not a "
+            "valid AsyncIO notification replication queue service"
+        )
+    return cast(AsyncIOBaseNotificationReplicationQueueService, replication_queue_service)
 
 
 def get_template_renderer(
