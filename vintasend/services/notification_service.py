@@ -57,11 +57,13 @@ from vintasend.services.helpers import (
     get_asyncio_notification_adapters,
     get_asyncio_notification_backend,
     get_asyncio_notification_queue_service,
+    get_asyncio_notification_replication_queue_service,
     get_attachment_manager,
     get_git_commit_sha_provider,
     get_notification_adapters,
     get_notification_backend,
     get_notification_queue_service,
+    get_notification_replication_queue_service,
 )
 from vintasend.services.notification_adapters.async_base import BackgroundNotificationAdapter
 from vintasend.services.notification_adapters.asyncio_background_base import (
@@ -84,7 +86,13 @@ from vintasend.services.notification_backends.filters import (
 from vintasend.services.notification_queue_services.asyncio_base import (
     AsyncIOBaseNotificationQueueService,
 )
+from vintasend.services.notification_queue_services.asyncio_replication_base import (
+    AsyncIOBaseNotificationReplicationQueueService,
+)
 from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
+from vintasend.services.notification_queue_services.replication_base import (
+    BaseNotificationReplicationQueueService,
+)
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     BaseTemplatedEmailRenderer,
     EmailTemplateContent,
@@ -218,6 +226,7 @@ class NotificationService(Generic[A, B]):
     notification_adapters: Iterable[A]
     notification_backend: B
     notification_queue_service: BaseNotificationQueueService | None
+    replication_queue_service: BaseNotificationReplicationQueueService | None
     raise_on_failed_send: bool
     replication_mode: Literal["inline", "queued"]
     _backends: dict[str, B]
@@ -236,7 +245,8 @@ class NotificationService(Generic[A, B]):
         git_commit_sha_provider: BaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
         additional_backends: Iterable[B | str] | None = None,
-        replication_mode: Literal["inline", "queued"] = "inline",
+        replication_queue_service: BaseNotificationReplicationQueueService | str | None = None,
+        replication_mode: Literal["inline", "queued"] | None = None,
     ):
         """
         Build a notification service.
@@ -264,21 +274,34 @@ class NotificationService(Generic[A, B]):
             backends, starting at 1 (the primary is position 0). Absent
             `additional_backends`, the service behaves exactly as a single-backend 2.0
             deployment.
+        :param replication_queue_service: the queue service used to push replica writes off
+            the request path when ``replication_mode`` is ``"queued"``. Accepts an instance or
+            an import string; when it is None, `NOTIFICATION_REPLICATION_QUEUE_SERVICE` is
+            used, and queued replication simply falls back to inline if that is unset too.
         :param replication_mode: how writes fan out to the additional backends. ``"inline"``
-            (the default) replicates on the request path, right after the primary write.
-            ``"queued"`` is accepted now for forward compatibility but only wired in a later
-            phase; until then it behaves as ``"inline"``. Ignored entirely by a single-backend
-            service, which never replicates.
+            replicates on the request path, right after the primary write. ``"queued"`` enqueues
+            one replication task per destination backend via ``replication_queue_service``,
+            falling back to inline when the queue is missing or an enqueue fails. When None (the
+            default), `NOTIFICATION_REPLICATION_MODE` is used, itself defaulting to ``"inline"``.
+            Ignored entirely by a single-backend service, which never replicates.
         :raises DuplicateBackendIdentifierError: if an additional backend's resolved
             identifier collides with an already-registered backend's identifier --
             including the primary's.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
-        NotificationSettings(config)
+        app_settings = NotificationSettings(config)
 
         self.raise_on_failed_send = raise_on_failed_send
-        self.replication_mode = replication_mode
+        # An explicit constructor value wins; otherwise fall back to the setting, itself
+        # defaulting to "inline". Under a bare-Python host the setting reads as {} (no
+        # framework), which is not "queued", so it correctly resolves to "inline".
+        if replication_mode is not None:
+            self.replication_mode = replication_mode
+        elif app_settings.NOTIFICATION_REPLICATION_MODE == "queued":
+            self.replication_mode = "queued"
+        else:
+            self.replication_mode = "inline"
 
         if isinstance(notification_queue_service, BaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -294,6 +317,19 @@ class NotificationService(Generic[A, B]):
                 # typo'd import string -- deliberately propagates instead: swallowing it
                 # would read as "no queue configured" and silently never deliver.
                 self.notification_queue_service = None
+
+        if isinstance(replication_queue_service, BaseNotificationReplicationQueueService):
+            self.replication_queue_service = replication_queue_service
+        else:
+            try:
+                self.replication_queue_service = get_notification_replication_queue_service(
+                    replication_queue_service, None, config
+                )
+            except NotificationQueueServiceMissingError:
+                # Nothing configured: queued replication has no queue and falls back to inline
+                # per backend (see _execute_multi_backend_write). A resolution error -- a
+                # configured but unusable import string -- deliberately propagates instead.
+                self.replication_queue_service = None
 
         if isinstance(notification_backend, BaseNotificationBackend):
             self.notification_backend = cast(B, notification_backend)
@@ -436,6 +472,22 @@ class NotificationService(Generic[A, B]):
         """
         self.notification_queue_service = queue_service
 
+    def register_replication_queue_service(
+        self, replication_queue_service: BaseNotificationReplicationQueueService
+    ) -> None:
+        """
+        Inject the replication queue service after construction.
+
+        Useful when the queue service cannot exist yet at construction time -- a broker
+        connection built during application startup, for example. Once set, ``"queued"``
+        replication enqueues one task per destination backend instead of replicating inline.
+
+        Parameters:
+            replication_queue_service: BaseNotificationReplicationQueueService - the queue
+                service to use for queued replication from now on
+        """
+        self.replication_queue_service = replication_queue_service
+
     def get_primary_backend_identifier(self) -> str:
         """Return the primary backend's identifier."""
         return self._primary_backend_identifier
@@ -496,6 +548,10 @@ class NotificationService(Generic[A, B]):
         to snapshot, e.g. bulk read-marking or a cancel that deleted the row).
         ``replication_notification_id`` names the record to snapshot when the primary write does
         not itself return one.
+
+        In ``"queued"`` mode the replica writes are enqueued (one task per destination backend)
+        instead of running inline, degrading to inline per backend when the queue is missing or
+        an enqueue fails -- see ``_replicate_queued``.
         """
         result = primary_write(self.notification_backend)
 
@@ -503,19 +559,108 @@ class NotificationService(Generic[A, B]):
         if not additional_backend_identifiers:
             return result
 
+        if self.replication_mode == "queued":
+            self._replicate_queued(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        else:
+            self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        return result
+
+    def _replicate_inline_all(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Read the primary snapshot once and replicate it inline to every named backend."""
         snapshot = self._read_replication_snapshot(replication_notification_id, result)
         for backend_identifier in additional_backend_identifiers:
-            replica = self._backends[backend_identifier]
+            self._replicate_inline_one(backend_identifier, snapshot, additional_write)
+
+    def _replicate_inline_one(
+        self,
+        backend_identifier: str,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Replicate one write to one backend inline, logging and swallowing any failure.
+
+        A rejecting replica never fails the user's operation -- it is reconciled by a later
+        write or by ``process_replication``.
+        """
+        replica = self._backends[backend_identifier]
+        try:
+            self._replicate_write_to_backend(replica, snapshot, additional_write)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to replicate a write to backend %s (notification %s); the primary "
+                "write succeeded and the replica will be reconciled by a later write",
+                backend_identifier,
+                getattr(snapshot, "id", None),
+            )
+
+    def _replicate_queued(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Enqueue one replication task per destination backend, degrading to inline.
+
+        When there is no replication queue service, or the notification id cannot be resolved,
+        every backend is replicated inline and a warning is logged -- a broken or absent queue
+        must never silently drop replication. When a single backend's ``enqueue_replication``
+        raises, only that backend is replicated inline; the ones already enqueued are left for
+        the worker. Nothing here may fail the user's already-successful primary write.
+        """
+        queued_id = replication_notification_id
+        if queued_id is None and isinstance(result, (Notification, OneOffNotification)):
+            queued_id = result.id
+
+        if self.replication_queue_service is None or queued_id is None:
+            logger.warning(
+                "Queued replication requested but %s; falling back to inline replication for "
+                "notification %s",
+                "no replication queue service is configured"
+                if self.replication_queue_service is None
+                else "the notification id could not be resolved",
+                queued_id if queued_id is not None else replication_notification_id,
+            )
+            self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+            return
+
+        snapshot: Notification | OneOffNotification | None = None
+        snapshot_read = False
+        for backend_identifier in additional_backend_identifiers:
             try:
-                self._replicate_write_to_backend(replica, snapshot, additional_write)
+                self.replication_queue_service.enqueue_replication(queued_id, backend_identifier)
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "Failed to replicate a write to backend %s (notification %s); the primary "
-                    "write succeeded and the replica will be reconciled by a later write",
+                    "Failed to enqueue replication of notification %s to backend %s; "
+                    "replicating it inline instead",
+                    queued_id,
                     backend_identifier,
-                    getattr(snapshot, "id", replication_notification_id),
                 )
-        return result
+                if not snapshot_read:
+                    snapshot = self._read_replication_snapshot(replication_notification_id, result)
+                    snapshot_read = True
+                self._replicate_inline_one(backend_identifier, snapshot, additional_write)
 
     def _read_replication_snapshot(
         self,
@@ -1727,6 +1872,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     notification_adapters: Iterable[AAIO]
     notification_backend: BAIO
     notification_queue_service: AsyncIOBaseNotificationQueueService | None
+    replication_queue_service: AsyncIOBaseNotificationReplicationQueueService | None
     raise_on_failed_send: bool
     replication_mode: Literal["inline", "queued"]
     _backends: dict[str, BAIO]
@@ -1745,7 +1891,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
         additional_backends: Iterable[BAIO | str] | None = None,
-        replication_mode: Literal["inline", "queued"] = "inline",
+        replication_queue_service: AsyncIOBaseNotificationReplicationQueueService
+        | str
+        | None = None,
+        replication_mode: Literal["inline", "queued"] | None = None,
     ):
         """
         Build an AsyncIO notification service.
@@ -1773,21 +1922,34 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             backends, starting at 1 (the primary is position 0). Absent
             `additional_backends`, the service behaves exactly as a single-backend 2.0
             deployment.
+        :param replication_queue_service: the queue service used to push replica writes off
+            the request path when ``replication_mode`` is ``"queued"``. Accepts an instance or
+            an import string; when it is None, `NOTIFICATION_REPLICATION_QUEUE_SERVICE` is
+            used, and queued replication simply falls back to inline if that is unset too.
         :param replication_mode: how writes fan out to the additional backends. ``"inline"``
-            (the default) replicates on the request path, right after the primary write.
-            ``"queued"`` is accepted now for forward compatibility but only wired in a later
-            phase; until then it behaves as ``"inline"``. Ignored entirely by a single-backend
-            service, which never replicates.
+            replicates on the request path, right after the primary write. ``"queued"`` enqueues
+            one replication task per destination backend via ``replication_queue_service``,
+            falling back to inline when the queue is missing or an enqueue fails. When None (the
+            default), `NOTIFICATION_REPLICATION_MODE` is used, itself defaulting to ``"inline"``.
+            Ignored entirely by a single-backend service, which never replicates.
         :raises DuplicateBackendIdentifierError: if an additional backend's resolved
             identifier collides with an already-registered backend's identifier --
             including the primary's.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
-        NotificationSettings(config)
+        app_settings = NotificationSettings(config)
 
         self.raise_on_failed_send = raise_on_failed_send
-        self.replication_mode = replication_mode
+        # An explicit constructor value wins; otherwise fall back to the setting, itself
+        # defaulting to "inline". Under a bare-Python host the setting reads as {} (no
+        # framework), which is not "queued", so it correctly resolves to "inline".
+        if replication_mode is not None:
+            self.replication_mode = replication_mode
+        elif app_settings.NOTIFICATION_REPLICATION_MODE == "queued":
+            self.replication_mode = "queued"
+        else:
+            self.replication_mode = "inline"
 
         if isinstance(notification_queue_service, AsyncIOBaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -1803,6 +1965,19 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 # typo'd import string -- deliberately propagates instead: swallowing it
                 # would read as "no queue configured" and silently never deliver.
                 self.notification_queue_service = None
+
+        if isinstance(replication_queue_service, AsyncIOBaseNotificationReplicationQueueService):
+            self.replication_queue_service = replication_queue_service
+        else:
+            try:
+                self.replication_queue_service = get_asyncio_notification_replication_queue_service(
+                    replication_queue_service, None, config
+                )
+            except NotificationQueueServiceMissingError:
+                # Nothing configured: queued replication has no queue and falls back to inline
+                # per backend (see _execute_multi_backend_write). A resolution error -- a
+                # configured but unusable import string -- deliberately propagates instead.
+                self.replication_queue_service = None
 
         if isinstance(notification_backend, AsyncIOBaseNotificationBackend):
             self.notification_backend = cast(BAIO, notification_backend)
@@ -1956,6 +2131,22 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         self.notification_queue_service = queue_service
 
+    async def register_replication_queue_service(
+        self, replication_queue_service: AsyncIOBaseNotificationReplicationQueueService
+    ) -> None:
+        """
+        Inject the replication queue service after construction.
+
+        Useful when the queue service cannot exist yet at construction time -- a broker
+        connection built during application startup, for example. Once set, ``"queued"``
+        replication enqueues one task per destination backend instead of replicating inline.
+
+        Parameters:
+            replication_queue_service: AsyncIOBaseNotificationReplicationQueueService - the
+                queue service to use for queued replication from now on
+        """
+        self.replication_queue_service = replication_queue_service
+
     def get_primary_backend_identifier(self) -> str:
         """Return the primary backend's identifier."""
         return self._primary_backend_identifier
@@ -2018,6 +2209,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         to snapshot, e.g. bulk read-marking or a cancel that deleted the row).
         ``replication_notification_id`` names the record to snapshot when the primary write does
         not itself return one.
+
+        In ``"queued"`` mode the replica writes are enqueued (one task per destination backend)
+        instead of running inline, degrading to inline per backend when the queue is missing or
+        an enqueue fails -- see ``_replicate_queued``.
         """
         result = await primary_write(self.notification_backend)
 
@@ -2025,19 +2220,118 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if not additional_backend_identifiers:
             return result
 
+        if self.replication_mode == "queued":
+            await self._replicate_queued(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        else:
+            await self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        return result
+
+    async def _replicate_inline_all(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Read the primary snapshot once and replicate it inline to every named backend."""
         snapshot = await self._read_replication_snapshot(replication_notification_id, result)
         for backend_identifier in additional_backend_identifiers:
-            replica = self._backends[backend_identifier]
+            await self._replicate_inline_one(backend_identifier, snapshot, additional_write)
+
+    async def _replicate_inline_one(
+        self,
+        backend_identifier: str,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Replicate one write to one backend inline, logging and swallowing any failure.
+
+        A rejecting replica never fails the user's operation -- it is reconciled by a later
+        write or by ``process_replication``.
+        """
+        replica = self._backends[backend_identifier]
+        try:
+            await self._replicate_write_to_backend(replica, snapshot, additional_write)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to replicate a write to backend %s (notification %s); the primary "
+                "write succeeded and the replica will be reconciled by a later write",
+                backend_identifier,
+                getattr(snapshot, "id", None),
+            )
+
+    async def _replicate_queued(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Enqueue one replication task per destination backend, degrading to inline.
+
+        When there is no replication queue service, or the notification id cannot be resolved,
+        every backend is replicated inline and a warning is logged -- a broken or absent queue
+        must never silently drop replication. When a single backend's ``enqueue_replication``
+        raises, only that backend is replicated inline; the ones already enqueued are left for
+        the worker. Nothing here may fail the user's already-successful primary write.
+        """
+        queued_id = replication_notification_id
+        if queued_id is None and isinstance(result, (Notification, OneOffNotification)):
+            queued_id = result.id
+
+        if self.replication_queue_service is None or queued_id is None:
+            logger.warning(
+                "Queued replication requested but %s; falling back to inline replication for "
+                "notification %s",
+                "no replication queue service is configured"
+                if self.replication_queue_service is None
+                else "the notification id could not be resolved",
+                queued_id if queued_id is not None else replication_notification_id,
+            )
+            await self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+            return
+
+        snapshot: Notification | OneOffNotification | None = None
+        snapshot_read = False
+        for backend_identifier in additional_backend_identifiers:
             try:
-                await self._replicate_write_to_backend(replica, snapshot, additional_write)
+                await self.replication_queue_service.enqueue_replication(
+                    queued_id, backend_identifier
+                )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "Failed to replicate a write to backend %s (notification %s); the primary "
-                    "write succeeded and the replica will be reconciled by a later write",
+                    "Failed to enqueue replication of notification %s to backend %s; "
+                    "replicating it inline instead",
+                    queued_id,
                     backend_identifier,
-                    getattr(snapshot, "id", replication_notification_id),
                 )
-        return result
+                if not snapshot_read:
+                    snapshot = await self._read_replication_snapshot(
+                        replication_notification_id, result
+                    )
+                    snapshot_read = True
+                await self._replicate_inline_one(backend_identifier, snapshot, additional_write)
 
     async def _read_replication_snapshot(
         self,
