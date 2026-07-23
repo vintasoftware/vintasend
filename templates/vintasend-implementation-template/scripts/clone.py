@@ -103,7 +103,7 @@ def clone(source: Path, target: Path, package_name: str) -> Path:
     return new_package_dir
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Clone the vintasend implementation template into a new, renamed package."
     )
@@ -127,12 +127,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path(__file__).resolve().parent.parent,
         help="Template directory to copy from. Defaults to this template.",
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _build_parser().parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    package_name = validate_package_name(args.package_name or args.target.name)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        package_name = validate_package_name(args.package_name or args.target.name)
+    except argparse.ArgumentTypeError as exc:
+        # Same clean "error: ..." + exit(2) behavior argparse gives for --package-name failures.
+        parser.error(str(exc))
 
     clone(args.source, args.target, package_name)
 
