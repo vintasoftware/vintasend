@@ -180,6 +180,8 @@ class FakeFileBackend(BaseNotificationBackend):
                 "context_used": notification.context_used,
                 "adapter_extra_parameters": notification.adapter_extra_parameters,
                 "is_one_off": True,
+                "created": notification.created.isoformat() if notification.created else None,
+                "modified": notification.modified.isoformat() if notification.modified else None,
                 "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
                 "read_at": notification.read_at.isoformat() if notification.read_at else None,
                 "tenant": notification.tenant,
@@ -202,6 +204,8 @@ class FakeFileBackend(BaseNotificationBackend):
                 "context_used": notification.context_used,
                 "adapter_extra_parameters": notification.adapter_extra_parameters,
                 "is_one_off": False,
+                "created": notification.created.isoformat() if notification.created else None,
+                "modified": notification.modified.isoformat() if notification.modified else None,
                 "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
                 "read_at": notification.read_at.isoformat() if notification.read_at else None,
                 "tenant": notification.tenant,
@@ -232,6 +236,16 @@ class FakeFileBackend(BaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                created=(
+                    datetime.datetime.fromisoformat(notification["created"])
+                    if notification.get("created")
+                    else None
+                ),
+                modified=(
+                    datetime.datetime.fromisoformat(notification["modified"])
+                    if notification.get("modified")
+                    else None
+                ),
                 sent_at=(
                     datetime.datetime.fromisoformat(notification["sent_at"])
                     if notification.get("sent_at")
@@ -263,6 +277,16 @@ class FakeFileBackend(BaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                created=(
+                    datetime.datetime.fromisoformat(notification["created"])
+                    if notification.get("created")
+                    else None
+                ),
+                modified=(
+                    datetime.datetime.fromisoformat(notification["modified"])
+                    if notification.get("modified")
+                    else None
+                ),
                 sent_at=(
                     datetime.datetime.fromisoformat(notification["sent_at"])
                     if notification.get("sent_at")
@@ -310,6 +334,7 @@ class FakeFileBackend(BaseNotificationBackend):
         notification_id = str(uuid.uuid4())
         stored_attachments = self._store_attachments(attachments or [], notification_id)
 
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         notification = Notification(
             id=notification_id,
             user_id=user_id,
@@ -325,6 +350,8 @@ class FakeFileBackend(BaseNotificationBackend):
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
             tenant=tenant,
+            created=now,
+            modified=now,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -522,6 +549,7 @@ class FakeFileBackend(BaseNotificationBackend):
         notification_id = uuid.uuid4()
         stored_attachments = self._store_attachments(attachments or [], notification_id)
 
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         notification = OneOffNotification(
             id=notification_id,
             email_or_phone=email_or_phone,
@@ -539,6 +567,8 @@ class FakeFileBackend(BaseNotificationBackend):
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
             tenant=tenant,
+            created=now,
+            modified=now,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -552,6 +582,7 @@ class FakeFileBackend(BaseNotificationBackend):
         for key, value in update_data.items():
             setattr(notification, key, value)
 
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         self._store_notifications()
         return notification
 
@@ -561,6 +592,7 @@ class FakeFileBackend(BaseNotificationBackend):
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         notification.sent_at = datetime.datetime.now(tz=datetime.timezone.utc)
+        notification.modified = notification.sent_at
         self._store_notifications()
         return notification
 
@@ -569,6 +601,7 @@ class FakeFileBackend(BaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         self._store_notifications()
         return notification
 
@@ -578,6 +611,7 @@ class FakeFileBackend(BaseNotificationBackend):
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         notification.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
+        notification.modified = notification.read_at
         self._store_notifications()
         return notification
 
@@ -697,6 +731,7 @@ class FakeFileBackend(BaseNotificationBackend):
             if n.status == NotificationStatus.SENT.value:
                 n.status = NotificationStatus.READ.value
                 n.read_at = now
+                n.modified = now
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
@@ -1044,6 +1079,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             "preheader_template": notification.preheader_template,
             "status": notification.status,
             "context_used": notification.context_used,
+            "created": notification.created.isoformat() if notification.created else None,
+            "modified": notification.modified.isoformat() if notification.modified else None,
             "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
             "read_at": notification.read_at.isoformat() if notification.read_at else None,
             "tenant": notification.tenant,
@@ -1087,6 +1124,16 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                created=(
+                    datetime.datetime.fromisoformat(notification["created"])
+                    if notification.get("created")
+                    else None
+                ),
+                modified=(
+                    datetime.datetime.fromisoformat(notification["modified"])
+                    if notification.get("modified")
+                    else None
+                ),
                 sent_at=(
                     datetime.datetime.fromisoformat(notification["sent_at"])
                     if notification.get("sent_at")
@@ -1118,6 +1165,16 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 status=notification["status"],
                 context_used=notification.get("context_used"),
                 adapter_extra_parameters=notification.get("adapter_extra_parameters"),
+                created=(
+                    datetime.datetime.fromisoformat(notification["created"])
+                    if notification.get("created")
+                    else None
+                ),
+                modified=(
+                    datetime.datetime.fromisoformat(notification["modified"])
+                    if notification.get("modified")
+                    else None
+                ),
                 sent_at=(
                     datetime.datetime.fromisoformat(notification["sent_at"])
                     if notification.get("sent_at")
@@ -1170,6 +1227,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id = str(uuid.uuid4())
         stored_attachments = await self._store_attachments(attachments or [], notification_id, lock)
 
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         notification = Notification(
             id=notification_id,
             user_id=user_id,
@@ -1185,6 +1243,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
             tenant=tenant,
+            created=now,
+            modified=now,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -1211,6 +1271,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id = uuid.uuid4()
         stored_attachments = await self._store_attachments(attachments or [], notification_id, lock)
 
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
         notification = OneOffNotification(
             id=notification_id,
             email_or_phone=email_or_phone,
@@ -1228,6 +1289,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=stored_attachments,
             tenant=tenant,
+            created=now,
+            modified=now,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -1244,6 +1307,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         for key, value in update_data.items():
             setattr(notification, key, value)
 
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         await self._store_notifications(lock)
         return notification
 
@@ -1253,6 +1317,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         notification.sent_at = datetime.datetime.now(tz=datetime.timezone.utc)
+        notification.modified = notification.sent_at
         await self._store_notifications(lock)
         return notification
 
@@ -1261,6 +1326,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         await self._store_notifications(lock)
         return notification
 
@@ -1270,6 +1336,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         notification.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
+        notification.modified = notification.read_at
         await self._store_notifications(lock)
         return notification
 
@@ -1389,6 +1456,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             if n.status == NotificationStatus.SENT.value:
                 n.status = NotificationStatus.READ.value
                 n.read_at = now
+                n.modified = now
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
