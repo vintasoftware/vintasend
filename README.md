@@ -620,6 +620,39 @@ class CeleryEmailAdapter(BackgroundNotificationAdapter):
 
 File attachments now work on the background path because the worker reloads the real notification from the backend, not from a serialized payload.
 
+## Queued Replication
+
+When a service is configured with additional backends, every write is replicated to them. By default this happens **inline** -- on the request path, right after the primary write. Hosts already running the background worker can move replica writes off the request path by switching to **queued** replication, which enqueues one task per destination backend:
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=primary_backend,
+    additional_backends=[replica_backend],
+    replication_mode="queued",
+    replication_queue_service=MyReplicationQueueService(),  # or an import string
+)
+```
+
+Or via environment variables:
+
+```bash
+export NOTIFICATION_REPLICATION_MODE="queued"
+export NOTIFICATION_REPLICATION_QUEUE_SERVICE="myapp.queue_services.MyReplicationQueueService"
+```
+
+`NOTIFICATION_REPLICATION_MODE` defaults to `"inline"`; `NOTIFICATION_REPLICATION_QUEUE_SERVICE` defaults to unset. As with every setting, an environment variable overrides the framework config value, and an instance or import string passed to the constructor overrides both.
+
+A replication queue service implements `BaseNotificationReplicationQueueService` (sync) or `AsyncIOBaseNotificationReplicationQueueService` (AsyncIO) -- a single method, `enqueue_replication(notification_id, backend_identifier)`. The worker drains the queue by calling `service.process_replication(notification_id, backend_identifier)`, which converges that replica to the primary's current snapshot.
+
+Key semantics:
+
+* **A broken queue never silently drops replication.** If no replication queue service is configured, or the record's id cannot be resolved, queued mode logs a warning and falls back to inline replication for every backend. If enqueueing a single backend raises, only that backend is replicated inline; the ones that enqueued successfully are left to the worker.
+* **Single-backend services never replicate**, regardless of `replication_mode`.
+* **The worker and web process must share settings** -- the same `NOTIFICATION_BACKEND`, `NOTIFICATION_REPLICATION_QUEUE_SERVICE`, and `NOTIFICATION_SERVICE_FACTORY`, exactly as background sending requires.
+
 ## Git Commit SHA Tracking
 
 Every notification can record which source-code revision rendered and sent it. This is opt-in: with no provider configured, nothing changes -- no SHA is ever resolved or written, and `git_commit_sha` stays `None` on every notification.

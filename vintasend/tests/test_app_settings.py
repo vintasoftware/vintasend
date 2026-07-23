@@ -203,6 +203,143 @@ class NotificationQueueServiceSettingTestCase(TestCase):
         assert settings.NOTIFICATION_QUEUE_SERVICE is None
 
 
+class ReplicationQueueServiceSettingDictTestCase(TestCase):
+    """Static checks that don't require framework detection at all."""
+
+    def test_new_setting_key_is_declared_on_the_typed_dict(self):
+        assert "NOTIFICATION_REPLICATION_QUEUE_SERVICE" in NotificationSettingsDict.__annotations__
+
+    def test_default_settings_has_no_replication_queue_service(self):
+        assert DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_QUEUE_SERVICE"] is None
+
+    def test_framework_defaults_do_not_override_the_shared_default(self):
+        # No replication queue service ships in core, and the correct default doesn't differ
+        # per framework, so none of the three dicts should override DEFAULT_SETTINGS here.
+        assert DJANGO_DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_QUEUE_SERVICE"] is None
+        assert FLASK_DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_QUEUE_SERVICE"] is None
+        assert FASTAPI_DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_QUEUE_SERVICE"] is None
+
+
+class ReplicationQueueServiceSettingTestCase(TestCase):
+    def setUp(self):
+        _reset_notification_settings_singleton(self)
+
+    def test_unset_reads_as_empty_dict_when_no_framework_is_detected(self):
+        """`get_config` returns `{}`, not `None`, when no framework is detected."""
+        with patch("vintasend.app_settings.detect_framework", return_value="Unknown"):
+            settings = NotificationSettings()
+
+        assert settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE == {}
+
+    def test_resolves_from_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_REPLICATION_QUEUE_SERVICE = "myapp.queue.MyReplicationQueueService"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(config)
+
+        assert (
+            settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE
+            == "myapp.queue.MyReplicationQueueService"
+        )
+
+    def test_resolves_from_env_var_when_framework_config_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ,
+                {"NOTIFICATION_REPLICATION_QUEUE_SERVICE": "env.queue.EnvReplicationQueueService"},
+            ):
+                settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert (
+            settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE
+            == "env.queue.EnvReplicationQueueService"
+        )
+
+    def test_env_var_wins_over_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_REPLICATION_QUEUE_SERVICE = "myapp.queue.MyReplicationQueueService"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ,
+                {"NOTIFICATION_REPLICATION_QUEUE_SERVICE": "env.queue.EnvReplicationQueueService"},
+            ):
+                settings = NotificationSettings(config)
+
+        assert (
+            settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE
+            == "env.queue.EnvReplicationQueueService"
+        )
+
+    def test_defaults_to_none_when_framework_detected_but_setting_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_REPLICATION_QUEUE_SERVICE is None
+
+
+class ReplicationModeSettingDictTestCase(TestCase):
+    """Static checks that don't require framework detection at all."""
+
+    def test_new_setting_key_is_declared_on_the_typed_dict(self):
+        assert "NOTIFICATION_REPLICATION_MODE" in NotificationSettingsDict.__annotations__
+
+    def test_default_settings_replication_mode_is_inline(self):
+        assert DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_MODE"] == "inline"
+
+    def test_framework_defaults_do_not_override_the_shared_default(self):
+        # "inline" is the right default for every framework, so none of the three dicts should
+        # override DEFAULT_SETTINGS here.
+        assert DJANGO_DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_MODE"] == "inline"
+        assert FLASK_DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_MODE"] == "inline"
+        assert FASTAPI_DEFAULT_SETTINGS["NOTIFICATION_REPLICATION_MODE"] == "inline"
+
+
+class ReplicationModeSettingTestCase(TestCase):
+    def setUp(self):
+        _reset_notification_settings_singleton(self)
+
+    def test_unset_reads_as_empty_dict_when_no_framework_is_detected(self):
+        """`get_config` returns `{}`, not `None`, when no framework is detected."""
+        with patch("vintasend.app_settings.detect_framework", return_value="Unknown"):
+            settings = NotificationSettings()
+
+        assert settings.NOTIFICATION_REPLICATION_MODE == {}
+
+    def test_resolves_from_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_REPLICATION_MODE = "queued"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_REPLICATION_MODE == "queued"
+
+    def test_resolves_from_env_var_when_framework_config_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queued"}):
+                settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_REPLICATION_MODE == "queued"
+
+    def test_env_var_wins_over_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_REPLICATION_MODE = "inline"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(os.environ, {"NOTIFICATION_REPLICATION_MODE": "queued"}):
+                settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_REPLICATION_MODE == "queued"
+
+    def test_defaults_to_inline_when_framework_detected_but_setting_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_REPLICATION_MODE == "inline"
+
+
 class NotificationServiceFactorySettingTestCase(TestCase):
     def setUp(self):
         _reset_notification_settings_singleton(self)

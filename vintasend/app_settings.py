@@ -14,6 +14,8 @@ class NotificationSettingsDict(TypedDict):
     NOTIFICATION_DEFAULT_FROM_EMAIL: str
     NOTIFICATION_ATTACHMENT_MANAGER: str | None
     NOTIFICATION_QUEUE_SERVICE: str | None
+    NOTIFICATION_REPLICATION_QUEUE_SERVICE: str | None
+    NOTIFICATION_REPLICATION_MODE: str
     NOTIFICATION_SERVICE_FACTORY: str | None
     NOTIFICATION_GIT_COMMIT_SHA_PROVIDER: str | None
 
@@ -30,6 +32,13 @@ DEFAULT_SETTINGS: NotificationSettingsDict = {
     # exactly like NOTIFICATION_BACKEND. Unset means attachments are unsupported.
     "NOTIFICATION_ATTACHMENT_MANAGER": None,
     "NOTIFICATION_QUEUE_SERVICE": None,
+    # No replication queue service ships in core -- host applications supply their own. Unset
+    # means queued replication has no queue and falls back to inline (see
+    # NotificationService._execute_multi_backend_write).
+    "NOTIFICATION_REPLICATION_QUEUE_SERVICE": None,
+    # Replication fans writes out to the additional backends on the request path ("inline") by
+    # default. "queued" pushes replica writes onto NOTIFICATION_REPLICATION_QUEUE_SERVICE.
+    "NOTIFICATION_REPLICATION_MODE": "inline",
     "NOTIFICATION_SERVICE_FACTORY": None,
     # No default git commit SHA provider ships in core -- host applications supply their
     # own. Unset means the feature is off: no SHA is ever resolved or written.
@@ -166,6 +175,8 @@ class NotificationSettings(metaclass=SingletonMeta):
     NOTIFICATION_DEFAULT_FROM_EMAIL: str
     NOTIFICATION_ATTACHMENT_MANAGER: str | None
     NOTIFICATION_QUEUE_SERVICE: str | None
+    NOTIFICATION_REPLICATION_QUEUE_SERVICE: str | None
+    NOTIFICATION_REPLICATION_MODE: str
     NOTIFICATION_SERVICE_FACTORY: str | None
     NOTIFICATION_GIT_COMMIT_SHA_PROVIDER: str | None
 
@@ -192,6 +203,12 @@ class NotificationSettings(metaclass=SingletonMeta):
         )
         self.NOTIFICATION_QUEUE_SERVICE = cast(
             str | None, get_config("NOTIFICATION_QUEUE_SERVICE", config)
+        )
+        self.NOTIFICATION_REPLICATION_QUEUE_SERVICE = cast(
+            str | None, get_config("NOTIFICATION_REPLICATION_QUEUE_SERVICE", config)
+        )
+        self.NOTIFICATION_REPLICATION_MODE = cast(
+            str, get_config("NOTIFICATION_REPLICATION_MODE", config)
         )
         self.NOTIFICATION_SERVICE_FACTORY = cast(
             str | None, get_config("NOTIFICATION_SERVICE_FACTORY", config)
