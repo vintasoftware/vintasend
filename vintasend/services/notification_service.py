@@ -22,6 +22,7 @@ else:
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
+    BackendNotFoundError,
     DuplicateNotificationAdapterError,
     GitCommitShaReassignmentError,
     NotificationContextGenerationError,
@@ -172,6 +173,8 @@ class NotificationService(Generic[A, B]):
     notification_backend: B
     notification_queue_service: BaseNotificationQueueService | None
     raise_on_failed_send: bool
+    _backends: dict[str, B]
+    _primary_backend_identifier: str
 
     def __init__(
         self,
@@ -185,6 +188,7 @@ class NotificationService(Generic[A, B]):
         attachment_manager: BaseAttachmentManager | str | None = None,
         git_commit_sha_provider: BaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
+        additional_backends: Iterable[B | str] | None = None,
     ):
         """
         Build a notification service.
@@ -204,6 +208,14 @@ class NotificationService(Generic[A, B]):
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
+        :param additional_backends: extra backends replicated reads (and, from a later
+            phase, writes) can be routed to. Each entry is a backend instance or its import
+            string, resolved the same way as `notification_backend`. A backend is
+            addressed by its `get_backend_identifier()` when it declares one, or by
+            `backend-{n}` otherwise -- `n` is the backend's position among the additional
+            backends, starting at 1 (the primary is position 0). Absent
+            `additional_backends`, the service behaves exactly as a single-backend 2.0
+            deployment.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
@@ -234,6 +246,32 @@ class NotificationService(Generic[A, B]):
                 get_notification_backend(notification_backend, notification_backend_kwargs, config),
             )
         self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        # Build the ordered backend registry: the primary first, then every additional
+        # backend in the order given. A backend's identifier is whatever
+        # `get_backend_identifier()` reports, or `backend-{n}` (n = its position among the
+        # additional backends, 1-indexed; the primary falls back to `backend-0`) when it
+        # does not declare one. Absent `additional_backends`, this is just `{primary: ...}`
+        # and every read below resolves to the primary exactly as in a single-backend 2.0
+        # deployment.
+        primary_backend_identifier = self.notification_backend.get_backend_identifier() or (
+            "backend-0"
+        )
+        self._backends = {primary_backend_identifier: self.notification_backend}
+        self._primary_backend_identifier = primary_backend_identifier
+
+        if additional_backends is not None:
+            for index, additional_backend in enumerate(additional_backends, start=1):
+                if isinstance(additional_backend, BaseNotificationBackend):
+                    resolved_additional_backend = cast(B, additional_backend)
+                else:
+                    resolved_additional_backend = cast(
+                        B, get_notification_backend(additional_backend, None, config)
+                    )
+                additional_backend_identifier = (
+                    resolved_additional_backend.get_backend_identifier() or f"backend-{index}"
+                )
+                self._backends[additional_backend_identifier] = resolved_additional_backend
 
         # Resolve the attachment manager (instance, dotted path, or the
         # NOTIFICATION_ATTACHMENT_MANAGER setting) and inject it into the backend when the
@@ -335,6 +373,43 @@ class NotificationService(Generic[A, B]):
                 background sends from now on
         """
         self.notification_queue_service = queue_service
+
+    def get_primary_backend_identifier(self) -> str:
+        """Return the primary backend's identifier."""
+        return self._primary_backend_identifier
+
+    def get_all_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier, primary first, in the order the
+        backends were configured."""
+        return list(self._backends.keys())
+
+    def get_additional_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier except the primary's, in the order
+        the additional backends were configured."""
+        return [
+            identifier
+            for identifier in self._backends
+            if identifier != self._primary_backend_identifier
+        ]
+
+    def has_backend(self, backend_identifier: str) -> bool:
+        """Whether `backend_identifier` names a registered backend (primary or additional)."""
+        return backend_identifier in self._backends
+
+    def _get_backend(self, backend_identifier: str | None = None) -> B:
+        """Resolve a backend by identifier for read routing.
+
+        `None` resolves to the primary backend, preserving every existing call site's
+        behaviour. An identifier that names no registered backend raises
+        `BackendNotFoundError` rather than silently falling back to the primary.
+        """
+        if backend_identifier is None:
+            return self._backends[self._primary_backend_identifier]
+        if backend_identifier not in self._backends:
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{backend_identifier}'"
+            )
+        return self._backends[backend_identifier]
 
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
@@ -675,31 +750,43 @@ class NotificationService(Generic[A, B]):
             self.send(notification)
         return notification
 
-    def get_all_future_notifications(self) -> Iterable[Notification | OneOffNotification]:
+    def get_all_future_notifications(
+        self, backend_identifier: str | None = None
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
+
+        Parameters:
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return self.notification_backend.get_all_future_notifications()
+        return self._get_backend(backend_identifier).get_all_future_notifications()
 
     def get_all_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
         Parameters:
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications from the user
         """
-        return self.notification_backend.get_all_future_notifications_from_user(user_id)
+        return self._get_backend(backend_identifier).get_all_future_notifications_from_user(user_id)
 
     def get_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int,
+        page_size: int,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -708,16 +795,18 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of the future notifications from the user
         """
-        return self.notification_backend.get_future_notifications_from_user(
+        return self._get_backend(backend_identifier).get_future_notifications_from_user(
             user_id, page, page_size
         )
 
     def get_future_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -726,11 +815,13 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return self.notification_backend.get_future_notifications(page, page_size)
+        return self._get_backend(backend_identifier).get_future_notifications(page, page_size)
 
     def _is_asyncio_context_function(
         self,
@@ -805,7 +896,7 @@ class NotificationService(Generic[A, B]):
         logger.info("Failed to send %s notifications", notifications_failed)
 
     def get_pending_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
@@ -813,25 +904,29 @@ class NotificationService(Generic[A, B]):
         Parameters:
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the pending notifications
         """
-        return self.notification_backend.get_pending_notifications(page, page_size)
+        return self._get_backend(backend_identifier).get_pending_notifications(page, page_size)
 
     def get_notification(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to get
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Notification | OneOffNotification - the notification
         """
-        return self.notification_backend.get_notification(notification_id)
+        return self._get_backend(backend_identifier).get_notification(notification_id)
 
     def mark_read(
         self, notification_id: int | str | uuid.UUID
@@ -877,6 +972,7 @@ class NotificationService(Generic[A, B]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get unread in-app notifications for a user.
@@ -888,6 +984,8 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the unread in-app notifications
@@ -896,7 +994,7 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.filter_in_app_unread_notifications(
+        return self._get_backend(backend_identifier).filter_in_app_unread_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
@@ -905,6 +1003,7 @@ class NotificationService(Generic[A, B]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get all in-app notifications (read + unread) for a user, paginated.
@@ -916,6 +1015,8 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the in-app notifications
@@ -924,11 +1025,13 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.filter_in_app_notifications(
+        return self._get_backend(backend_identifier).filter_in_app_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
-    def get_in_app_notifications_count(self, user_id: int | str | uuid.UUID) -> int:
+    def get_in_app_notifications_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of in-app notifications (read + unread) for a user.
 
@@ -939,9 +1042,11 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.count_in_app_notifications(user_id)
+        return self._get_backend(backend_identifier).count_in_app_notifications(user_id)
 
-    def get_in_app_unread_count(self, user_id: int | str | uuid.UUID) -> int:
+    def get_in_app_unread_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of unread in-app notifications for a user.
 
@@ -952,7 +1057,7 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.count_in_app_unread_notifications(user_id)
+        return self._get_backend(backend_identifier).count_in_app_unread_notifications(user_id)
 
     def filter_notifications(
         self,
@@ -960,6 +1065,7 @@ class NotificationService(Generic[A, B]):
         page: int,
         page_size: int,
         order_by: NotificationOrderBy | None = None,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Query notifications with a composable filter, ordering and pagination.
@@ -974,15 +1080,21 @@ class NotificationService(Generic[A, B]):
             page: int - the 1-indexed page number to get
             page_size: int - the number of notifications per page
             order_by: NotificationOrderBy | None - the primary sort field and direction
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of matches
         """
-        return self.notification_backend.filter_notifications(
+        return self._get_backend(backend_identifier).filter_notifications(
             filter, page=page, page_size=page_size, order_by=order_by
         )
 
-    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+    def count_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        backend_identifier: str | None = None,
+    ) -> int:
         """
         Count notifications matching ``filter``, ignoring pagination.
 
@@ -991,13 +1103,17 @@ class NotificationService(Generic[A, B]):
 
         Parameters:
             filter: NotificationFilter - the composable filter (``{}`` counts everything)
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             int - the number of matching notifications
         """
-        return self.notification_backend.count_notifications(filter)
+        return self._get_backend(backend_identifier).count_notifications(filter)
 
-    def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+    def get_backend_supported_filter_capabilities(
+        self, backend_identifier: str | None = None
+    ) -> dict[str, bool]:
         """
         Report which filter capabilities the configured backend supports.
 
@@ -1006,12 +1122,16 @@ class NotificationService(Generic[A, B]):
         ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
         kept byte-identical to the TypeScript sibling so one dashboard consumes either.
 
+        Parameters:
+            backend_identifier: str | None - which registered backend to report on; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
+
         Returns:
             dict[str, bool] - the merged capability report
         """
         return {
             **DEFAULT_BACKEND_FILTER_CAPABILITIES,
-            **self.notification_backend.get_filter_capabilities(),
+            **self._get_backend(backend_identifier).get_filter_capabilities(),
         }
 
     def resend_notification(
@@ -1234,6 +1354,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     notification_backend: BAIO
     notification_queue_service: AsyncIOBaseNotificationQueueService | None
     raise_on_failed_send: bool
+    _backends: dict[str, BAIO]
+    _primary_backend_identifier: str
 
     def __init__(
         self,
@@ -1247,6 +1369,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         attachment_manager: AsyncIOBaseAttachmentManager | str | None = None,
         git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
+        additional_backends: Iterable[BAIO | str] | None = None,
     ):
         """
         Build an AsyncIO notification service.
@@ -1266,6 +1389,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
+        :param additional_backends: extra backends replicated reads (and, from a later
+            phase, writes) can be routed to. Each entry is a backend instance or its import
+            string, resolved the same way as `notification_backend`. A backend is
+            addressed by its `get_backend_identifier()` when it declares one, or by
+            `backend-{n}` otherwise -- `n` is the backend's position among the additional
+            backends, starting at 1 (the primary is position 0). Absent
+            `additional_backends`, the service behaves exactly as a single-backend 2.0
+            deployment.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
@@ -1298,6 +1429,33 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 ),
             )
         self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        # Build the ordered backend registry: the primary first, then every additional
+        # backend in the order given. A backend's identifier is whatever
+        # `get_backend_identifier()` reports, or `backend-{n}` (n = its position among the
+        # additional backends, 1-indexed; the primary falls back to `backend-0`) when it
+        # does not declare one. Absent `additional_backends`, this is just `{primary: ...}`
+        # and every read below resolves to the primary exactly as in a single-backend 2.0
+        # deployment. `get_backend_identifier` is sync even here, since it needs no I/O and
+        # this constructor cannot await.
+        primary_backend_identifier = self.notification_backend.get_backend_identifier() or (
+            "backend-0"
+        )
+        self._backends = {primary_backend_identifier: self.notification_backend}
+        self._primary_backend_identifier = primary_backend_identifier
+
+        if additional_backends is not None:
+            for index, additional_backend in enumerate(additional_backends, start=1):
+                if isinstance(additional_backend, AsyncIOBaseNotificationBackend):
+                    resolved_additional_backend = cast(BAIO, additional_backend)
+                else:
+                    resolved_additional_backend = cast(
+                        BAIO, get_asyncio_notification_backend(additional_backend, None, config)
+                    )
+                additional_backend_identifier = (
+                    resolved_additional_backend.get_backend_identifier() or f"backend-{index}"
+                )
+                self._backends[additional_backend_identifier] = resolved_additional_backend
 
         # Resolve the attachment manager (instance, dotted path, or the
         # NOTIFICATION_ATTACHMENT_MANAGER setting) and inject it into the backend when the
@@ -1407,6 +1565,43 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 background sends from now on
         """
         self.notification_queue_service = queue_service
+
+    def get_primary_backend_identifier(self) -> str:
+        """Return the primary backend's identifier."""
+        return self._primary_backend_identifier
+
+    def get_all_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier, primary first, in the order the
+        backends were configured."""
+        return list(self._backends.keys())
+
+    def get_additional_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier except the primary's, in the order
+        the additional backends were configured."""
+        return [
+            identifier
+            for identifier in self._backends
+            if identifier != self._primary_backend_identifier
+        ]
+
+    def has_backend(self, backend_identifier: str) -> bool:
+        """Whether `backend_identifier` names a registered backend (primary or additional)."""
+        return backend_identifier in self._backends
+
+    def _get_backend(self, backend_identifier: str | None = None) -> BAIO:
+        """Resolve a backend by identifier for read routing.
+
+        `None` resolves to the primary backend, preserving every existing call site's
+        behaviour. An identifier that names no registered backend raises
+        `BackendNotFoundError` rather than silently falling back to the primary.
+        """
+        if backend_identifier is None:
+            return self._backends[self._primary_backend_identifier]
+        if backend_identifier not in self._backends:
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{backend_identifier}'"
+            )
+        return self._backends[backend_identifier]
 
     async def _resolve_and_persist_git_commit_sha(
         self,
@@ -1757,31 +1952,45 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             await self.send(notification)
         return notification
 
-    async def get_all_future_notifications(self) -> Iterable[Notification | OneOffNotification]:
+    async def get_all_future_notifications(
+        self, backend_identifier: str | None = None
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
+
+        Parameters:
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return await self.notification_backend.get_all_future_notifications()
+        return await self._get_backend(backend_identifier).get_all_future_notifications()
 
     async def get_all_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
         Parameters:
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications from the user
         """
-        return await self.notification_backend.get_all_future_notifications_from_user(user_id)
+        return await self._get_backend(backend_identifier).get_all_future_notifications_from_user(
+            user_id
+        )
 
     async def get_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int,
+        page_size: int,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -1790,16 +1999,18 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of the future notifications from the user
         """
-        return await self.notification_backend.get_future_notifications_from_user(
+        return await self._get_backend(backend_identifier).get_future_notifications_from_user(
             user_id, page, page_size
         )
 
     async def get_future_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -1808,11 +2019,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return await self.notification_backend.get_future_notifications(page, page_size)
+        return await self._get_backend(backend_identifier).get_future_notifications(page, page_size)
 
     async def get_notification_context(
         self, notification: Notification | OneOffNotification
@@ -1903,7 +2116,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         logger.info("Failed to send %s notifications", notifications_failed)
 
     async def get_pending_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
@@ -1911,25 +2124,31 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Parameters:
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the pending notifications
         """
-        return await self.notification_backend.get_pending_notifications(page, page_size)
+        return await self._get_backend(backend_identifier).get_pending_notifications(
+            page, page_size
+        )
 
     async def get_notification(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to get
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Notification | OneOffNotification - the notification
         """
-        return await self.notification_backend.get_notification(notification_id)
+        return await self._get_backend(backend_identifier).get_notification(notification_id)
 
     async def mark_read(
         self, notification_id: int | str | uuid.UUID
@@ -1977,6 +2196,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get unread in-app notifications for a user.
@@ -1988,6 +2208,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the unread in-app notifications
@@ -1996,7 +2218,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.filter_in_app_unread_notifications(
+        return await self._get_backend(backend_identifier).filter_in_app_unread_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
@@ -2005,6 +2227,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get all in-app notifications (read + unread) for a user, paginated.
@@ -2016,6 +2239,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the in-app notifications
@@ -2024,11 +2249,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.filter_in_app_notifications(
+        return await self._get_backend(backend_identifier).filter_in_app_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
-    async def get_in_app_notifications_count(self, user_id: int | str | uuid.UUID) -> int:
+    async def get_in_app_notifications_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of in-app notifications (read + unread) for a user.
 
@@ -2039,9 +2266,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.count_in_app_notifications(user_id)
+        return await self._get_backend(backend_identifier).count_in_app_notifications(user_id)
 
-    async def get_in_app_unread_count(self, user_id: int | str | uuid.UUID) -> int:
+    async def get_in_app_unread_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of unread in-app notifications for a user.
 
@@ -2052,7 +2281,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.count_in_app_unread_notifications(user_id)
+        return await self._get_backend(backend_identifier).count_in_app_unread_notifications(
+            user_id
+        )
 
     async def filter_notifications(
         self,
@@ -2060,6 +2291,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         page: int,
         page_size: int,
         order_by: NotificationOrderBy | None = None,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Query notifications with a composable filter, ordering and pagination.
@@ -2074,15 +2306,21 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             page: int - the 1-indexed page number to get
             page_size: int - the number of notifications per page
             order_by: NotificationOrderBy | None - the primary sort field and direction
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of matches
         """
-        return await self.notification_backend.filter_notifications(
+        return await self._get_backend(backend_identifier).filter_notifications(
             filter, page=page, page_size=page_size, order_by=order_by
         )
 
-    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+    async def count_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        backend_identifier: str | None = None,
+    ) -> int:
         """
         Count notifications matching ``filter``, ignoring pagination.
 
@@ -2091,13 +2329,17 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         Parameters:
             filter: NotificationFilter - the composable filter (``{}`` counts everything)
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             int - the number of matching notifications
         """
-        return await self.notification_backend.count_notifications(filter)
+        return await self._get_backend(backend_identifier).count_notifications(filter)
 
-    async def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+    async def get_backend_supported_filter_capabilities(
+        self, backend_identifier: str | None = None
+    ) -> dict[str, bool]:
         """
         Report which filter capabilities the configured backend supports.
 
@@ -2106,12 +2348,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
         kept byte-identical to the TypeScript sibling so one dashboard consumes either.
 
+        Parameters:
+            backend_identifier: str | None - which registered backend to report on; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
+
         Returns:
             dict[str, bool] - the merged capability report
         """
         return {
             **DEFAULT_BACKEND_FILTER_CAPABILITIES,
-            **await self.notification_backend.get_filter_capabilities(),
+            **await self._get_backend(backend_identifier).get_filter_capabilities(),
         }
 
     async def resend_notification(
