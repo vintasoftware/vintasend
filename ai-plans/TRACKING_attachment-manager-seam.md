@@ -52,13 +52,45 @@ commit was carried into the worktree; Phases 2–4 run there. The main checkout 
   added).
 - **Gate**: ruff clean, mypy clean (47 files), pytest 222 passed / 2 skipped.
 
+### Phase 2 — Wire the manager into the service and backend seam ✅
+
+- **Status**: DONE — reviewed (3 layers) + integrated.
+- **Implementer model**: claude-opus-4-8 (Tier 4). **Reviewer**: claude-opus-4-8 (Tier 4).
+  **Fixer**: claude-sonnet-5 (Tier 3).
+- **Branch**: `plan/attachment-manager-seam/phase-2` (remote) at `7a3945a`.
+  **Base**: `plan/attachment-manager-seam/phase-1`.
+- **PR**: https://github.com/vintasoftware/vintasend/pull/14
+- **Summary**: Seven new `@abstractmethod`s on both backend ABCs (breaks downstream backends at
+  instantiation — the accepted cost). Non-abstract `inject_attachment_manager` + module-level
+  `supports_attachments` (hasattr guard) → duck-typed, optional injection. Both services accept an
+  `attachment_manager` param, resolve + inject it. File I/O removed from both services
+  (`_read_file_data`/`_is_url`/`_download_from_url` deleted); `_validate_attachments` given a real
+  body. `create_*` omit the `attachments=` kwarg when empty (fixes the `TypeError` vs
+  attachment-unaware backends). Fake backend delegates bytes to the injected manager and implements
+  all seven methods with real in-memory bodies; its private read/download helpers deleted. Adapter
+  bases get defaulted `supports_attachments` (`False`) + concrete `prepare_attachments` (warns).
+- **Review findings fixed**: 2 SHOULD-FIX — documented the deliberate decision to keep
+  `UpdateNotificationKwargs.attachments` as `StoredAttachment` (naive widening would corrupt state,
+  no update-side upload path); added async injection + async duck-typed-optional tests (async path
+  had zero coverage). 1 NIT (bare `NotificationError` in `validate_attachments`) deferred to Phase 3
+  when the typed attachment exceptions land.
+- **Gate**: ruff clean, mypy clean, pytest 207 passed / 2 skipped.
+
+## Carry-forward for Phase 4 (release notes)
+
+- Name all seven new abstract methods (`store_attachment_file_record`, `get_attachment_file_record`,
+  `find_attachment_file_by_checksum`, `delete_attachment_file`, `get_orphaned_attachment_files`,
+  `get_attachments`, `delete_notification_attachment`) and both ABC classes in the
+  `### Backwards compatibility` note.
+- Note that `UpdateNotificationKwargs.attachments` intentionally stays `StoredAttachment` (diverges
+  from the Open Questions default) because `persist_notification_update` has no upload path.
+
 ## Current phase
 
-Phase 2 — Wire the manager into the service and backend seam (starting).
+Phase 3 — File records, checksum dedup, and references (starting).
 
 ## Remaining phases
 
-- Phase 2 — Wire the manager into the service and backend seam.
 - Phase 3 — File records, checksum dedup, and references.
 - Phase 4 — Documentation.
 
