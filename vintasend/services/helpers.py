@@ -6,6 +6,8 @@ from vintasend.exceptions import (
     NotificationQueueServiceMissingError,
     NotificationQueueServiceResolutionError,
 )
+from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
+from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -331,3 +333,83 @@ def get_template_renderer(
         )
 
     return cast(BaseNotificationTemplateRenderer, template_renderer)
+
+
+def get_attachment_manager(
+    attachment_manager_import_str: str | None,
+    attachment_manager_kwargs: dict | None = None,
+    config: Any = None,
+) -> BaseAttachmentManager | None:
+    app_settings = NotificationSettings(config)
+    import_str_with_fallback = (
+        attachment_manager_import_str
+        if attachment_manager_import_str is not None
+        else app_settings.NOTIFICATION_ATTACHMENT_MANAGER
+    )
+
+    if not import_str_with_fallback:
+        return None
+
+    try:
+        attachment_manager_cls = _import_class(import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise ValueError(
+            f"Notifications Attachment Manager Error: Could not import {import_str_with_fallback}"
+        ) from e
+
+    try:
+        attachment_manager = (
+            attachment_manager_cls(**attachment_manager_kwargs)
+            if attachment_manager_kwargs
+            else attachment_manager_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(
+            f"Notifications Attachment Manager Error: Could not instantiate {import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(attachment_manager, BaseAttachmentManager):
+        raise ValueError(
+            f"Notifications Attachment Manager Error: {import_str_with_fallback} is not a valid attachment manager"
+        )
+    return cast(BaseAttachmentManager, attachment_manager)
+
+
+def get_asyncio_attachment_manager(
+    attachment_manager_import_str: str | None,
+    attachment_manager_kwargs: dict | None = None,
+    config: Any = None,
+) -> AsyncIOBaseAttachmentManager | None:
+    app_settings = NotificationSettings(config)
+    import_str_with_fallback = (
+        attachment_manager_import_str
+        if attachment_manager_import_str is not None
+        else app_settings.NOTIFICATION_ATTACHMENT_MANAGER
+    )
+
+    if not import_str_with_fallback:
+        return None
+
+    try:
+        attachment_manager_cls = _import_class(import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise ValueError(
+            f"Notifications Attachment Manager Error: Could not import {import_str_with_fallback}"
+        ) from e
+
+    try:
+        attachment_manager = (
+            attachment_manager_cls(**attachment_manager_kwargs)
+            if attachment_manager_kwargs
+            else attachment_manager_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(
+            f"Notifications Attachment Manager Error: Could not instantiate {import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(attachment_manager, AsyncIOBaseAttachmentManager):
+        raise ValueError(
+            f"Notifications Attachment Manager Error: {import_str_with_fallback} is not a valid AsyncIO attachment manager"
+        )
+    return cast(AsyncIOBaseAttachmentManager, attachment_manager)

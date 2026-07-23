@@ -146,13 +146,60 @@ string ids the tests use; worth knowing when Phase 3b writes the Django translat
 Gates: `ruff check` clean, `ruff format --check` clean, `mypy` clean (42 source files),
 `pytest` **260 passed** (211 baseline + 49 new), `tox` **green on py310-py314** (260 each).
 
+### Phase 3 — Counts, retry, and stable ordering ✅
+
+- **Status**: complete
+- **Model**: claude-sonnet-5 (plan suggested Tier 3)
+- **Branch**: `plan/notification-filtering-api/phase-3` (stacked on phase-2)
+- **Base**: `plan/notification-filtering-api/phase-2`
+- **Commits**:
+  - `c091391 Add resend_notification with typed refusal errors`
+  - `dd12165 Test resend_notification and pin pagination tiebreaker contracts`
+- **Review**: reviewer claude-opus-4-8 (project default Tier 4). **Clean** — no findings. Verified by
+  execution: original-untouched-after-resend, all three context-reuse cases, both refusal paths
+  creating no row, tenant + attachments carried onto the clone without tripping the guards, and
+  count == exhaustive-sweep length.
+
+Summary:
+
+- `resend_notification(notification_id, use_stored_context_if_available=False)` on both services:
+  re-reads the source, refuses one-offs and future-scheduled notifications with the new
+  `NotificationResendError`, clones into a brand-new PENDING row via `persist_notification` (leaving
+  the original untouched), and sends the clone immediately. `send_after` is deliberately `None` on
+  the clone — resend means "send now", matching the plan's copy-field list which omits it.
+- **Context reuse** is threaded by widening `send(notification, context=None, ...)` with an optional
+  trailing `context` param rather than inventing a parallel path. Every existing caller passes no
+  context and is byte-identical to before; when `use_stored_context_if_available=True` and the source
+  has a stored `context_used`, the clone sends with exactly that object, bypassing
+  `get_notification_context`.
+- **Tenant** is carried onto the clone via `persist_notification`'s conditional-forward (the Phase-1
+  pattern), never through `update_notification`, so the `TenantReassignmentError` guard is not tripped.
+  **Attachments** (flat `StoredAttachment` rows — the attachment-manager plan has not merged, so this
+  is the plan's sanctioned fallback) are copied via the backend's `persist_notification_update`, also
+  bypassing the service-level tenant guard.
+- `NotificationResendError(NotificationError)` added to `exceptions.py`.
+- `count_notifications` efficiency override was already added to both fakes in Phase 2
+  (`sum(1 for n ... if matches_filter(...))`); Phase 3 verified it and added filter→count→exhaustive-
+  paginate union tests. The base ABC's paging default is untouched.
+- Stable-ordering tiebreaker now asserted in both directions on both fakes (Phase 2 only swept the
+  sync fake ascending).
+
+**For Phase 4 README awareness** (non-defect, consistent with existing convention): the object
+`resend_notification` returns reflects SENT status only because the fake mutates the same object in
+place — identical to the long-standing `create_notification` return convention. A backend returning a
+detached instance would report the clone as PENDING even though it was sent. The README should not
+over-promise the returned object's freshness.
+
+Gates: `ruff check` clean, `ruff format --check` clean, `mypy` clean (42 source files),
+`pytest` **281 passed** (260 baseline + 21 new). tox not run — no version-sensitive typing
+constructs introduced.
+
 ## Current phase
 
-Phase 3 — Counts, retry, and stable ordering (not started).
+Phase 4 — Documentation (not started).
 
 ## Remaining phases
 
-- **Phase 3** — Counts, retry, and stable ordering (Tier 3).
 - **Phase 4** — Documentation (Tier 2).
 
 ## Deferred phases
