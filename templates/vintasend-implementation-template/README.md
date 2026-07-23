@@ -18,6 +18,7 @@ implementation.
 | `vintasend_implementation_template/template_renderer.py` | Rendering | `BaseNotificationTemplateRenderer`, `BaseTemplatedEmailRenderer`, `BaseTemplatedSMSRenderer` |
 | `vintasend_implementation_template/queue_service.py` | Background send | `BaseNotificationQueueService`, `AsyncIOBaseNotificationQueueService` |
 | `vintasend_implementation_template/attachment_manager.py` | Attachment storage | `BaseAttachmentManager`, `AsyncIOBaseAttachmentManager` |
+| `vintasend_implementation_template/replication_queue_service.py` | Queued multi-backend replication (optional) | `BaseNotificationReplicationQueueService`, `AsyncIOBaseNotificationReplicationQueueService` |
 
 Each module has a matching `tests/test_*.py` asserting the stub is importable, subclasses the
 right ABC, and has no leftover abstract methods.
@@ -52,6 +53,8 @@ add a `logger.py` stub and matching test alongside that work.
    4. Attachment manager — only if your integration supports attachments.
    5. Queue service — only if delivery should happen in a background worker rather than the
       calling process.
+   6. Replication queue service — only if a host using your backend wants queued multi-backend
+      replication (`replication_mode="queued"`) rather than the default inline replication.
 
    Work through the checklist below one seam at a time. Each entry names the exact abstract
    methods and points at the fake in `vintasend`'s own `stubs/` package as a working reference.
@@ -209,6 +212,28 @@ AsyncIOBaseNotificationQueueService.enqueue_notification
 
 Connected through the `NOTIFICATION_QUEUE_SERVICE` setting (a dotted import path). Unset means
 background sending is unsupported and `NotificationService` calls adapters directly instead.
+
+### Replication queue service (optional multi-backend seam)
+
+Implement `vintasend_implementation_template/replication_queue_service.py`. Only needed for
+**queued** multi-backend replication (`replication_mode="queued"`) -- this is a separate,
+optional seam from the backend and adapter above, and a host can use multiple backends with
+plain inline replication (the default) without ever touching it. When configured, this queue
+service is how a `(notification_id, backend_identifier)` pair gets from
+`NotificationService`'s write path to your worker; the worker then calls
+`NotificationService.process_replication(notification_id, backend_identifier)`, which converges
+that replica to the primary's current snapshot. Reference:
+`vintasend/services/notification_queue_services/stubs/fake_replication_queue_service.py`
+(`FakeReplicationQueueService`, `FakeAsyncIOReplicationQueueService`).
+
+```checklist
+BaseNotificationReplicationQueueService.enqueue_replication
+AsyncIOBaseNotificationReplicationQueueService.enqueue_replication
+```
+
+Connected through the `NOTIFICATION_REPLICATION_QUEUE_SERVICE` setting (a dotted import path).
+Unset with `replication_mode="queued"` falls back to inline replication (with a warning logged)
+rather than dropping replication silently.
 
 ### Attachment manager (attachment storage)
 
