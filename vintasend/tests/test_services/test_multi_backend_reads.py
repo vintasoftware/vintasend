@@ -285,6 +285,33 @@ class MultiBackendBackendDefaultsTestCase(TestCase):
             "Notification 2",
         }
 
+    def test_get_all_notifications_default_paginates_past_the_hardcoded_page_size(self):
+        # The concrete default pages internally at page_size 100; persisting more than that
+        # exercises the multi-page advance and cross-page termination, which a 3-record
+        # fixture never reaches.
+        record_count = 105
+        created_ids = {
+            self.backend.persist_notification(
+                user_id=1,
+                notification_type=NotificationTypes.IN_APP.value,
+                title=f"Notification {i}",
+                body_template="body.html",
+                context_name="multi_backend_reads_test_context",
+                context_kwargs={"test": "test"},
+                send_after=None,
+                subject_template="subject.txt",
+                preheader_template="preheader.html",
+            ).id
+            for i in range(record_count)
+        }
+
+        all_notifications = list(self.backend.get_all_notifications())
+        returned_ids = [n.id for n in all_notifications]
+
+        assert len(returned_ids) == record_count
+        assert set(returned_ids) == created_ids
+        assert len(set(returned_ids)) == len(returned_ids)
+
 
 class AsyncIOMultiBackendReadRoutingTestCase(IsolatedAsyncioTestCase):
     """AsyncIO twin of ``MultiBackendReadRoutingTestCase``."""
@@ -548,3 +575,31 @@ class AsyncIOMultiBackendBackendDefaultsTestCase(IsolatedAsyncioTestCase):
             "Notification 1",
             "Notification 2",
         }
+
+    @pytest.mark.asyncio
+    async def test_get_all_notifications_default_paginates_past_the_hardcoded_page_size(self):
+        # The concrete default pages internally at page_size 100; persisting more than that
+        # exercises the multi-page advance and cross-page termination, which a 3-record
+        # fixture never reaches.
+        record_count = 105
+        created_ids = set()
+        for i in range(record_count):
+            notification = await self.backend.persist_notification(
+                user_id=1,
+                notification_type=NotificationTypes.IN_APP.value,
+                title=f"Notification {i}",
+                body_template="body.html",
+                context_name="multi_backend_reads_test_context",
+                context_kwargs={"test": "test"},
+                send_after=None,
+                subject_template="subject.txt",
+                preheader_template="preheader.html",
+            )
+            created_ids.add(notification.id)
+
+        all_notifications = list(await self.backend.get_all_notifications())
+        returned_ids = [n.id for n in all_notifications]
+
+        assert len(returned_ids) == record_count
+        assert set(returned_ids) == created_ids
+        assert len(set(returned_ids)) == len(returned_ids)

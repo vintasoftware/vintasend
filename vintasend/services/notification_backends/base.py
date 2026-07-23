@@ -331,6 +331,8 @@ class BaseNotificationBackend(ABC):
         page_size = 100
         while True:
             batch = list(self.filter_notifications({}, page=page, page_size=page_size))
+            if not batch:
+                return results
             results.extend(batch)
             if len(batch) < page_size:
                 return results
