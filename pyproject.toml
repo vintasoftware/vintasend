@@ -48,7 +48,11 @@ build-backend = "poetry.core.masonry.api"
 # `implementations/` holds the officially supported companion packages as git
 # submodules. Each has its own ruff config and its own CI - linting them from here
 # would apply this repo's rules to code this repo does not release.
-extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts", "implementations"]
+# `templates/` holds the in-repo implementation-template package: it has its own
+# pyproject.toml, its own ruff config, and its own release cadence (none - it's
+# copied, not published) - linting it from here would apply this repo's rules to
+# a package this repo does not release either.
+extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts", "implementations", "templates"]
 line-length = 100
 indent-width = 4
 # Must track the MINIMUM Python in [tool.poetry.dependencies]. Setting this higher
@@ -194,4 +198,12 @@ ignore_missing_imports = true
 # dependencies, so they are absent in a clean checkout and in CI.
 [[tool.mypy.overrides]]
 module = ["django.*", "flask.*", "fastapi.*"]
+ignore_missing_imports = true
+
+# `tomli` is the sys.version_info < (3, 11) branch of the stdlib `tomllib` split in
+# test_template_exclusion.py. It is only ever installed as a transitive dependency of
+# mypy itself on py310, so it is absent from whichever interpreter happens to run mypy
+# here; treat it as untyped rather than erroring on the import.
+[[tool.mypy.overrides]]
+module = ["tomli"]
 ignore_missing_imports = true
