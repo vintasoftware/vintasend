@@ -262,6 +262,17 @@ class ImplementationTemplateBackend(BaseNotificationBackend):
             "vintasend/services/notification_backends/base.py for the contract"
         )
 
+    def store_git_commit_sha(
+        self,
+        notification_id: int | str | uuid.UUID,
+        git_commit_sha: str,
+    ) -> None:
+        """TODO: implement store_git_commit_sha — see vintasend/services/notification_backends/base.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement store_git_commit_sha — see "
+            "vintasend/services/notification_backends/base.py for the contract"
+        )
+
     def store_attachment_file_record(
         self, record: "AttachmentFileRecord"
     ) -> "AttachmentFileRecord":
@@ -556,6 +567,18 @@ class ImplementationTemplateAsyncIOBackend(AsyncIOBaseNotificationBackend):
         """TODO: implement store_context_used — see vintasend/services/notification_backends/asyncio_base.py for the contract."""
         raise NotImplementedError(
             "TODO: implement store_context_used — see "
+            "vintasend/services/notification_backends/asyncio_base.py for the contract"
+        )
+
+    async def store_git_commit_sha(
+        self,
+        notification_id: int | str | uuid.UUID,
+        git_commit_sha: str,
+        lock: "asyncio.Lock | None" = None,
+    ) -> None:
+        """TODO: implement store_git_commit_sha — see vintasend/services/notification_backends/asyncio_base.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement store_git_commit_sha — see "
             "vintasend/services/notification_backends/asyncio_base.py for the contract"
         )
 

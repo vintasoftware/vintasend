@@ -14,6 +14,7 @@ from vintasend.services.notification_template_renderers.base import (
 )
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     BaseTemplatedEmailRenderer,
+    EmailTemplateContent,
     TemplatedEmail,
 )
 from vintasend.services.notification_template_renderers.base_templated_sms_renderer import (
@@ -55,6 +56,20 @@ class ImplementationTemplateEmailRenderer(BaseTemplatedEmailRenderer):
         """TODO: implement render — see vintasend/services/notification_template_renderers/base_templated_email_renderer.py for the contract."""
         raise NotImplementedError(
             "TODO: implement render — see "
+            "vintasend/services/notification_template_renderers/base_templated_email_renderer.py "
+            "for the contract"
+        )
+
+    def render_from_template_content(
+        self,
+        notification: "Notification | OneOffNotification",
+        template_content: EmailTemplateContent,
+        context: "NotificationContextDict",
+        **kwargs,
+    ) -> TemplatedEmail:
+        """TODO: implement render_from_template_content — see vintasend/services/notification_template_renderers/base_templated_email_renderer.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement render_from_template_content — see "
             "vintasend/services/notification_template_renderers/base_templated_email_renderer.py "
             "for the contract"
         )
