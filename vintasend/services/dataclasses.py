@@ -345,6 +345,32 @@ class BackendSyncStats(_BackendSyncStatsRequired, total=False):
     error: str
 
 
+class BackendMigrationFailure(TypedDict):
+    """One record's destination-write failure during
+    ``NotificationService.migrate_to_backend``, part of ``BackendMigrationResult``.
+
+    Captured rather than raised so one bad record does not abort the rest of the migration --
+    the caller decides whether to retry the failed ids, re-run the whole migration (idempotent
+    via the duplicate-conflict retry), or investigate.
+    """
+
+    notification_id: int | str | uuid.UUID
+    error: str
+
+
+class BackendMigrationResult(TypedDict):
+    """Return type of ``NotificationService.migrate_to_backend`` / its AsyncIO twin.
+
+    ``migrated`` counts records confirmed present on the destination after being written --
+    whether via the destination's ``apply_replication_snapshot_if_newer`` or the read-then-write
+    fallback. ``failures`` lists every source record that did not land on the destination,
+    without aborting the rest of the migration.
+    """
+
+    migrated: int
+    failures: list[BackendMigrationFailure]
+
+
 @dataclass(frozen=True)
 class ApplyResult:
     """Outcome of a backend's ``apply_replication_snapshot_if_newer`` call.

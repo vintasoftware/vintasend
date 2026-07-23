@@ -22,6 +22,7 @@ else:
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
+    BackendMigrationError,
     BackendNotFoundError,
     DuplicateBackendIdentifierError,
     DuplicateNotificationAdapterError,
@@ -45,6 +46,8 @@ from vintasend.services.dataclasses import (
     NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     AnyNotificationAttachment,
+    BackendMigrationFailure,
+    BackendMigrationResult,
     BackendSyncStats,
     Notification,
     NotificationContextDict,
@@ -1074,6 +1077,104 @@ class NotificationService(Generic[A, B]):
                 continue
             stats[identifier] = {"total_notifications": total_notifications, "status": "healthy"}
         return stats
+
+    def migrate_to_backend(
+        self,
+        destination_backend_identifier: str,
+        batch_size: int,
+        source_backend_identifier: str | None = None,
+    ) -> BackendMigrationResult:
+        """Copy every notification from one backend to another, in pages.
+
+        For onboarding a new replica or retiring an old backend. Pages through the source
+        (the primary when ``source_backend_identifier`` is omitted) via ``filter_notifications``,
+        ``batch_size`` rows at a time, writing each record into the destination through the same
+        snapshot-apply / read-then-write convergence path inline and queued replication use
+        (``_replicate_write_to_backend``): a destination implementing
+        ``apply_replication_snapshot_if_newer`` gets an id-preserving upsert in one call; one that
+        does not falls back to converging an existing row and, like ``process_replication``,
+        cannot create a row it lacks -- that is reported as a failure, not a silent success.
+
+        Copies only -- it never deletes from the source. Retiring the source is a separate,
+        operational decision made after verifying the destination, so migrating twice (or
+        migrating, verifying, then retiring) is the intended workflow.
+
+        Idempotent by re-running: a record already on the destination is converged (or upserted
+        newer-wins), never duplicated, via the same duplicate-conflict retry inline replication
+        relies on. A single record's destination-write failure is captured in the returned
+        ``failures`` list and does not abort the rest of the migration.
+
+        Raises ``BackendNotFoundError`` if either the source or the destination names an
+        unregistered backend, and ``BackendMigrationError`` if they name the same one --
+        migrating a backend onto itself is a caller mistake, not a partial no-op worth silently
+        accepting.
+        """
+        if not self.has_backend(destination_backend_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{destination_backend_identifier}'"
+            )
+        resolved_source_identifier = (
+            source_backend_identifier
+            if source_backend_identifier is not None
+            else self._primary_backend_identifier
+        )
+        if not self.has_backend(resolved_source_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{resolved_source_identifier}'"
+            )
+        if resolved_source_identifier == destination_backend_identifier:
+            raise BackendMigrationError(
+                "Cannot migrate a backend onto itself: source and destination are both "
+                f"'{resolved_source_identifier}'"
+            )
+
+        source = self._backends[resolved_source_identifier]
+        destination = self._backends[destination_backend_identifier]
+
+        migrated = 0
+        failures: list[BackendMigrationFailure] = []
+        page = 1
+        while True:
+            batch = list(source.filter_notifications({}, page=page, page_size=batch_size))
+            if not batch:
+                break
+            for record in batch:
+                try:
+                    self._replicate_write_to_backend(
+                        destination, record, self._replicate_snapshot_fallback
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to migrate notification %s from backend %s to backend %s",
+                        record.id,
+                        resolved_source_identifier,
+                        destination_backend_identifier,
+                    )
+                    failures.append({"notification_id": record.id, "error": str(exc)})
+                    continue
+                # As in `process_replication`, `_replicate_write_to_backend` returns normally
+                # when the destination declines snapshot application and lacks the row -- it
+                # cannot be created inline without `apply_replication_snapshot_if_newer` support.
+                # That must be reported as a migration failure, not counted as migrated.
+                try:
+                    destination.get_notification(record.id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "notification_id": record.id,
+                            "error": (
+                                "destination lacks apply_replication_snapshot_if_newer and "
+                                "could not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    migrated += 1
+            if len(batch) < batch_size:
+                break
+            page += 1
+
+        return {"migrated": migrated, "failures": failures}
 
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
@@ -2911,6 +3012,101 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 continue
             stats[identifier] = {"total_notifications": total_notifications, "status": "healthy"}
         return stats
+
+    async def migrate_to_backend(
+        self,
+        destination_backend_identifier: str,
+        batch_size: int,
+        source_backend_identifier: str | None = None,
+    ) -> BackendMigrationResult:
+        """AsyncIO twin of ``NotificationService.migrate_to_backend``.
+
+        Copy every notification from one backend to another, in pages. Pages through the source
+        (the primary when ``source_backend_identifier`` is omitted) via ``filter_notifications``,
+        ``batch_size`` rows at a time, writing each record into the destination through the same
+        snapshot-apply / read-then-write convergence path inline and queued replication use
+        (``_replicate_write_to_backend``): a destination implementing
+        ``apply_replication_snapshot_if_newer`` gets an id-preserving upsert in one call; one that
+        does not falls back to converging an existing row and, like ``process_replication``,
+        cannot create a row it lacks -- that is reported as a failure, not a silent success.
+
+        Copies only -- it never deletes from the source. Retiring the source is a separate,
+        operational decision made after verifying the destination.
+
+        Idempotent by re-running: a record already on the destination is converged (or upserted
+        newer-wins), never duplicated, via the same duplicate-conflict retry inline replication
+        relies on. A single record's destination-write failure is captured in the returned
+        ``failures`` list and does not abort the rest of the migration.
+
+        Raises ``BackendNotFoundError`` if either the source or the destination names an
+        unregistered backend, and ``BackendMigrationError`` if they name the same one.
+        """
+        if not self.has_backend(destination_backend_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{destination_backend_identifier}'"
+            )
+        resolved_source_identifier = (
+            source_backend_identifier
+            if source_backend_identifier is not None
+            else self._primary_backend_identifier
+        )
+        if not self.has_backend(resolved_source_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{resolved_source_identifier}'"
+            )
+        if resolved_source_identifier == destination_backend_identifier:
+            raise BackendMigrationError(
+                "Cannot migrate a backend onto itself: source and destination are both "
+                f"'{resolved_source_identifier}'"
+            )
+
+        source = self._backends[resolved_source_identifier]
+        destination = self._backends[destination_backend_identifier]
+
+        migrated = 0
+        failures: list[BackendMigrationFailure] = []
+        page = 1
+        while True:
+            batch = list(await source.filter_notifications({}, page=page, page_size=batch_size))
+            if not batch:
+                break
+            for record in batch:
+                try:
+                    await self._replicate_write_to_backend(
+                        destination, record, self._replicate_snapshot_fallback
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to migrate notification %s from backend %s to backend %s",
+                        record.id,
+                        resolved_source_identifier,
+                        destination_backend_identifier,
+                    )
+                    failures.append({"notification_id": record.id, "error": str(exc)})
+                    continue
+                # As in `process_replication`, `_replicate_write_to_backend` returns normally
+                # when the destination declines snapshot application and lacks the row -- it
+                # cannot be created inline without `apply_replication_snapshot_if_newer` support.
+                # That must be reported as a migration failure, not counted as migrated.
+                try:
+                    await destination.get_notification(record.id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "notification_id": record.id,
+                            "error": (
+                                "destination lacks apply_replication_snapshot_if_newer and "
+                                "could not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    migrated += 1
+            if len(batch) < batch_size:
+                break
+            page += 1
+
+        return {"migrated": migrated, "failures": failures}
 
     async def _resolve_and_persist_git_commit_sha(
         self,
