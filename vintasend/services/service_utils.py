@@ -7,14 +7,7 @@ from vintasend.exceptions import InvalidOneOffNotificationRecipientError
 
 
 if TYPE_CHECKING:
-    import io
-    from pathlib import Path
-    from typing import BinaryIO
-
     from vintasend.services.dataclasses import NotificationAttachment, NotificationContextDict
-
-    # Everything FileAttachment allows except `bytes`, which read_file_data rejects.
-    ReadableFileAttachment = BinaryIO | io.BytesIO | io.StringIO | Path | str
 
 
 # These mirror the TS patterns `^.+@.+\..+$` and `^\+?[0-9]{10,15}$`, but unanchored: matching
@@ -49,50 +42,6 @@ def validate_attachments(
             pass
 
     return attachments
-
-
-def read_file_data(file: "ReadableFileAttachment") -> bytes:
-    """Read file data from a path, URL, `Path` object, or file-like object."""
-    from pathlib import Path
-
-    if isinstance(file, str):
-        if is_url(file):
-            return download_from_url(file)
-        else:
-            with open(file, "rb") as f:
-                return f.read()
-    elif isinstance(file, Path):
-        with open(file, "rb") as f:
-            return f.read()
-    elif hasattr(file, "read"):
-        current_pos = file.tell() if hasattr(file, "tell") else 0
-        if hasattr(file, "seek"):
-            file.seek(0)
-        data = file.read()
-        if hasattr(file, "seek"):
-            file.seek(current_pos)
-        if isinstance(data, str):
-            return data.encode("utf-8")
-        return data
-    else:
-        raise ValueError(f"Unsupported file type: {type(file)}")
-
-
-def is_url(file_str: str) -> bool:
-    """Check whether a string is a URL rather than a local file path."""
-    return file_str.startswith(("http://", "https://", "s3://", "gs://", "azure://"))
-
-
-def download_from_url(url: str) -> bytes:
-    """Download file content from a URL."""
-    try:
-        import requests
-    except ImportError as e:
-        raise ImportError("requests library is required to download files from URLs") from e
-
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return response.content
 
 
 def is_asyncio_context_function(
