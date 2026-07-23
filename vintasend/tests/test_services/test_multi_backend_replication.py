@@ -182,6 +182,31 @@ class QueuedReplicationTestCase(TestCase):
             self.replica_one.get_notification(notification.id)
         assert self.replica_two.get_notification(notification.id).id == notification.id
 
+    def test_enqueue_error_on_middle_backend_still_enqueues_the_one_after_it(self):
+        replica_three = FakeFileBackend(database_file_name=tempfile.mktemp(suffix=".json"))
+        self._owned_backends.append(replica_three)
+        queue = _RaisingForBackendQueueService(failing_backend_identifier="backend-2")
+        service = self.build_service(
+            additional_backends=[self.replica_one, self.replica_two, replica_three],
+            replication_mode="queued",
+            replication_queue_service=queue,
+        )
+
+        notification = self._create(service, send_after=_future())
+
+        # backend-1 and backend-3 enqueued cleanly; backend-2's enqueue raised (and was
+        # replicated inline instead), proving a failing middle backend does not stop the loop
+        # from reaching the backend after it.
+        assert queue.enqueued_replications == [
+            (notification.id, "backend-1"),
+            (notification.id, "backend-3"),
+        ]
+        with self.assertRaises(NotificationNotFoundError):
+            self.replica_one.get_notification(notification.id)
+        assert self.replica_two.get_notification(notification.id).id == notification.id
+        with self.assertRaises(NotificationNotFoundError):
+            replica_three.get_notification(notification.id)
+
     def test_no_queue_service_falls_back_to_inline_and_warns(self):
         service = self.build_service(
             additional_backends=[self.replica_one, self.replica_two],
@@ -349,6 +374,31 @@ class AsyncIOQueuedReplicationTestCase(IsolatedAsyncioTestCase):
         with self.assertRaises(NotificationNotFoundError):
             await self.replica_one.get_notification(notification.id)
         assert (await self.replica_two.get_notification(notification.id)).id == notification.id
+
+    async def test_enqueue_error_on_middle_backend_still_enqueues_the_one_after_it(self):
+        replica_three = FakeAsyncIOFileBackend(database_file_name=tempfile.mktemp(suffix=".json"))
+        self._owned_backends.append(replica_three)
+        queue = _AsyncIORaisingForBackendQueueService(failing_backend_identifier="backend-2")
+        service = self.build_service(
+            additional_backends=[self.replica_one, self.replica_two, replica_three],
+            replication_mode="queued",
+            replication_queue_service=queue,
+        )
+
+        notification = await self._create(service, send_after=_future())
+
+        # backend-1 and backend-3 enqueued cleanly; backend-2's enqueue raised (and was
+        # replicated inline instead), proving a failing middle backend does not stop the loop
+        # from reaching the backend after it.
+        assert queue.enqueued_replications == [
+            (notification.id, "backend-1"),
+            (notification.id, "backend-3"),
+        ]
+        with self.assertRaises(NotificationNotFoundError):
+            await self.replica_one.get_notification(notification.id)
+        assert (await self.replica_two.get_notification(notification.id)).id == notification.id
+        with self.assertRaises(NotificationNotFoundError):
+            await replica_three.get_notification(notification.id)
 
     async def test_no_queue_service_falls_back_to_inline_and_warns(self):
         service = self.build_service(
