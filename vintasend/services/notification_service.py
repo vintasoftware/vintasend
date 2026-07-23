@@ -874,7 +874,28 @@ class NotificationService(Generic[A, B]):
                 self._replicate_write_to_backend(
                     target, snapshot, self._replicate_snapshot_fallback
                 )
-                successes.append(identifier)
+                # `_replicate_write_to_backend` returns normally when a target declines
+                # snapshot application (`apply_replication_snapshot_if_newer` -> applied=False)
+                # and `_converge_replica_to_snapshot` then logs-and-skips because the row is
+                # absent -- it cannot create a row with the primary's id without snapshot-apply
+                # support. That is a legitimate best-effort outcome for the inline path, but
+                # `process_replication` has an explicit success/failure contract a queued worker
+                # relies on, so a target left without the row must be reported as a failure, not
+                # a success.
+                try:
+                    target.get_notification(notification_id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "backend_identifier": identifier,
+                            "error": (
+                                "replica lacks apply_replication_snapshot_if_newer and could "
+                                "not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    successes.append(identifier)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "Failed to replicate notification %s to backend %s during process_replication",
@@ -2617,7 +2638,28 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 await self._replicate_write_to_backend(
                     target, snapshot, self._replicate_snapshot_fallback
                 )
-                successes.append(identifier)
+                # `_replicate_write_to_backend` returns normally when a target declines
+                # snapshot application (`apply_replication_snapshot_if_newer` -> applied=False)
+                # and `_converge_replica_to_snapshot` then logs-and-skips because the row is
+                # absent -- it cannot create a row with the primary's id without snapshot-apply
+                # support. That is a legitimate best-effort outcome for the inline path, but
+                # `process_replication` has an explicit success/failure contract a queued worker
+                # relies on, so a target left without the row must be reported as a failure, not
+                # a success.
+                try:
+                    await target.get_notification(notification_id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "backend_identifier": identifier,
+                            "error": (
+                                "replica lacks apply_replication_snapshot_if_newer and could "
+                                "not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    successes.append(identifier)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "Failed to replicate notification %s to backend %s during process_replication",

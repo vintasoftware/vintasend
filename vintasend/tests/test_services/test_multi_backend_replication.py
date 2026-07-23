@@ -24,6 +24,11 @@ from vintasend.services.notification_service import (
     NotificationService,
     register_context,
 )
+from vintasend.tests.test_services.test_multi_backend_writes import (
+    AsyncIONoSnapshotApplyReplica,
+    NoSnapshotApplyReplica,
+)
+from vintasend.tests.utils import _reset_notification_settings_singleton
 
 
 IN_APP_ADAPTER = (
@@ -415,6 +420,34 @@ class ProcessReplicationTestCase(TestCase):
         with self.assertRaises(NotificationNotFoundError):
             self.replica_one.get_notification(notification.id)
 
+    def test_process_replication_reports_failure_for_declining_backend_without_the_row(self):
+        # A backend that declines snapshot application (apply_replication_snapshot_if_newer ->
+        # applied=False) and lacks the row cannot be created inline with the primary's id: the
+        # convergence path logs-and-skips instead of raising, so process_replication must still
+        # classify it as a failure rather than reporting a false success.
+        primary_only = self.build_service()
+        notification = self._create(primary_only, send_after=_future())
+
+        declining = NoSnapshotApplyReplica(database_file_name=tempfile.mktemp(suffix=".json"))
+        self._owned_backends.append(declining)
+
+        worker = self.build_service(additional_backends=[self.replica_one, declining])
+        result = worker.process_replication(notification.id)
+
+        assert result["successes"] == ["backend-1"]
+        assert result["failures"] == [
+            {
+                "backend_identifier": "backend-2",
+                "error": (
+                    "replica lacks apply_replication_snapshot_if_newer and could not be "
+                    "populated with the primary id"
+                ),
+            }
+        ]
+        assert self.replica_one.get_notification(notification.id).id == notification.id
+        with self.assertRaises(NotificationNotFoundError):
+            declining.get_notification(notification.id)
+
     def test_process_replication_unknown_target_raises(self):
         primary_only = self.build_service()
         notification = self._create(primary_only, send_after=_future())
@@ -524,6 +557,32 @@ class AsyncIOProcessReplicationTestCase(IsolatedAsyncioTestCase):
         assert (await self.replica_two.get_notification(notification.id)).id == notification.id
         with self.assertRaises(NotificationNotFoundError):
             await self.replica_one.get_notification(notification.id)
+
+    async def test_process_replication_reports_failure_for_declining_backend_without_the_row(self):
+        primary_only = self.build_service()
+        notification = await self._create(primary_only, send_after=_future())
+
+        declining = AsyncIONoSnapshotApplyReplica(
+            database_file_name=tempfile.mktemp(suffix=".json")
+        )
+        self._owned_backends.append(declining)
+
+        worker = self.build_service(additional_backends=[self.replica_one, declining])
+        result = await worker.process_replication(notification.id)
+
+        assert result["successes"] == ["backend-1"]
+        assert result["failures"] == [
+            {
+                "backend_identifier": "backend-2",
+                "error": (
+                    "replica lacks apply_replication_snapshot_if_newer and could not be "
+                    "populated with the primary id"
+                ),
+            }
+        ]
+        assert (await self.replica_one.get_notification(notification.id)).id == notification.id
+        with self.assertRaises(NotificationNotFoundError):
+            await declining.get_notification(notification.id)
 
     async def test_process_replication_unknown_target_raises(self):
         primary_only = self.build_service()
