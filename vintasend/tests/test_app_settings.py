@@ -1,6 +1,5 @@
 import importlib.util
 import os
-from types import MappingProxyType
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -24,7 +23,6 @@ _FLASK_INSTALLED = importlib.util.find_spec("flask") is not None
 
 class _FakeFastAPIConfig:
     """Stands in for a FastAPI config object: `get_fastapi_setting` only calls `getattr`."""
-
 
 
 class NotificationSettingsDictTestCase(TestCase):

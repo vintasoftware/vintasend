@@ -184,6 +184,7 @@ class NotificationSettings(metaclass=SingletonMeta):
         )
         self.NOTIFICATION_ATTACHMENT_MANAGER = cast(
             str | None, get_config("NOTIFICATION_ATTACHMENT_MANAGER", config)
+        )
         self.NOTIFICATION_QUEUE_SERVICE = cast(
             str | None, get_config("NOTIFICATION_QUEUE_SERVICE", config)
         )

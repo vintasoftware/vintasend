@@ -2,12 +2,12 @@ from collections.abc import Iterable
 from typing import Any, cast
 
 from vintasend.app_settings import NotificationSettings
-from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
-from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.exceptions import (
     NotificationQueueServiceMissingError,
     NotificationQueueServiceResolutionError,
 )
+from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
+from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
