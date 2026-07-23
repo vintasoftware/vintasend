@@ -3,7 +3,7 @@
 - **Feature**: Multi-Backend Replication
 - **Plan**: `ai-plans/2026-07-23-MULTI_BACKEND_REPLICATION_IMPLEMENTATION_PLAN.md`
 - **Started**: 2026-07-23
-- **Last updated**: 2026-07-23 (Phase 4 complete)
+- **Last updated**: 2026-07-23 (Phase 5 complete)
 - **Feature flag**: none (inert unless a host passes `additional_backends`)
 
 ## Run options
@@ -65,14 +65,22 @@
 - **Review**: 0 BLOCKER, 2 SHOULD-FIX (field-derivation safety net; heterogeneous-type under-reporting) + 1 NIT (double call) — all fixed in-phase.
 - **Gate**: ruff clean; mypy clean (75 files); full suite 626 passed, 2 skipped, 1 failed (clone-test artifact only).
 
+### Phase 5 — Backend migration ✅
+
+- **Implementer model**: claude-sonnet-5 (Tier 3) · **Reviewer**: claude-opus-4-8 (Tier 4) · **Fixer**: claude-sonnet-5 (Tier 3)
+- **Commits**: `Add BackendMigrationError exception`; `Add migrate_to_backend to notification services`; + fix commit `Validate migrate_to_backend batch_size`
+- **Files**: `exceptions.py` (`BackendMigrationError`), `dataclasses.py` (`BackendMigrationResult`/`BackendMigrationFailure` TypedDicts), `notification_service.py` (`migrate_to_backend` on both services), `tests/test_services/test_backend_migration.py`
+- **Summary**: `migrate_to_backend(destination, batch_size, source=None)` pages the source (default primary) via `filter_notifications({})` and writes each record into the destination through the SHARED convergence primitive `_replicate_write_to_backend` (same path as inline/queued/process_replication) — snapshot-apply destinations get an id-preserving upsert; non-snapshot-apply destinations converge an existing row. COPY only (never deletes source). Idempotent on re-run (duplicate-conflict retry / newer-wins upsert — tests assert row count unchanged on 2nd run). Per-record failures captured in `{migrated, failures}` without aborting; an uncreatable destination record is classified a failure (mirrors Phase 3). Unknown source/destination → `BackendNotFoundError`; source==destination or `batch_size<=0` → `BackendMigrationError`. Docstring notes migration assumes a quiescent source.
+- **Review**: 0 BLOCKER, 1 SHOULD-FIX (unvalidated batch_size → silent no-op) + 2 NIT (redundant read left per reviewer; quiescent-source doc added) — SHOULD-FIX + doc NIT fixed in-phase.
+- **Gate**: ruff clean; mypy clean (76 files); full suite 646 passed, 2 skipped, 1 failed (clone-test artifact only).
+
 ## Current phase
 
-- Phase 5 — Backend migration
+- Phase 6 — Documentation
 
 ## Remaining phases
 
-- Phase 5 — Backend migration (Tier 3)
-- Phase 6 — Documentation (Tier 2)
+- Phase 6 — Documentation (Tier 2) — fold into unreleased 2.0.0 notes; VERIFY pyproject=2.0.0 (already corrected by the merge); template-README note
 
 ## Deferred phases
 
