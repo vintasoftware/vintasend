@@ -440,6 +440,18 @@ class GitCommitShaAsyncServiceTestCase(IsolatedAsyncioTestCase):
         ).git_commit_sha == FAKE_GIT_COMMIT_SHA
 
     @pytest.mark.asyncio
+    async def test_provider_instance_and_import_string_are_both_accepted(self):
+        notification = await self._seed(_build_notification("import-string-provider"))
+        service = self.build_service(
+            git_commit_sha_provider="vintasend.services.git_commit_sha_providers.stubs."
+            "fake_git_commit_sha_provider.FakeAsyncIOGitCommitShaProvider",
+        )
+
+        await service.send(notification)
+
+        assert notification.git_commit_sha == FAKE_GIT_COMMIT_SHA
+
+    @pytest.mark.asyncio
     async def test_second_send_on_same_object_with_same_sha_does_not_restore(self):
         notification = await self._seed(_build_notification("no-restore"))
         service = self.build_service(git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider())
@@ -534,6 +546,24 @@ class GitCommitShaAsyncServiceTestCase(IsolatedAsyncioTestCase):
         ).git_commit_sha == FAKE_GIT_COMMIT_SHA
 
     @pytest.mark.asyncio
+    async def test_create_notification_with_no_provider_leaves_git_commit_sha_none(self):
+        service = self.build_service()
+
+        notification = await service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="git_sha_test_context",
+            context_kwargs=NotificationContextDict({}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert notification.git_commit_sha is None
+
+    @pytest.mark.asyncio
     async def test_delayed_send_records_the_workers_git_commit_sha(self):
         queue_service = FakeAsyncIOQueueService()
         background_adapter = (
@@ -570,6 +600,51 @@ class GitCommitShaAsyncServiceTestCase(IsolatedAsyncioTestCase):
         stored = await worker_service.get_notification(notification.id)
         assert stored.git_commit_sha == FAKE_GIT_COMMIT_SHA
         assert stored.status == NotificationStatus.SENT.value
+
+    @pytest.mark.asyncio
+    async def test_delayed_send_does_not_touch_git_commit_sha_of_an_already_delivered_notification(
+        self,
+    ):
+        """Redelivery (at-least-once) of an already-sent row must not overwrite its SHA
+        with an unrelated, later revision -- the notification was not actually re-sent."""
+        queue_service = FakeAsyncIOQueueService()
+        background_adapter = (
+            "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOBackgroundEmailAdapter",
+            "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+        )
+        service = self.build_service(
+            notification_adapters=[background_adapter],
+            notification_queue_service=queue_service,
+            git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider(),
+        )
+        notification = await service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="git_sha_test_context",
+            context_kwargs=NotificationContextDict({}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+        await service.delayed_send(queue_service.enqueued_notification_ids[0])
+        assert (await service.get_notification(notification.id)).git_commit_sha == (
+            FAKE_GIT_COMMIT_SHA
+        )
+
+        # Simulate redelivery under a different revision after the notification was
+        # already marked SENT.
+        service.git_commit_sha_provider = FakeAsyncIOGitCommitShaProvider(sha=OTHER_SHA)
+        with patch.object(
+            self.backend, "store_git_commit_sha", wraps=self.backend.store_git_commit_sha
+        ) as spy:
+            await service.delayed_send(notification.id)
+
+        spy.assert_not_called()
+        assert (
+            await service.get_notification(notification.id)
+        ).git_commit_sha == FAKE_GIT_COMMIT_SHA
 
     @pytest.mark.asyncio
     async def test_update_notification_with_git_commit_sha_raises(self):
