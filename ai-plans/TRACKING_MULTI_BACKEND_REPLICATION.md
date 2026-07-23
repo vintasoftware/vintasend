@@ -3,7 +3,7 @@
 - **Feature**: Multi-Backend Replication
 - **Plan**: `ai-plans/2026-07-23-MULTI_BACKEND_REPLICATION_IMPLEMENTATION_PLAN.md`
 - **Started**: 2026-07-23
-- **Last updated**: 2026-07-23 (Phase 3 complete)
+- **Last updated**: 2026-07-23 (Phase 4 complete)
 - **Feature flag**: none (inert unless a host passes `additional_backends`)
 
 ## Run options
@@ -56,13 +56,21 @@
 - **Env-var-in-worktree caveat**: `test_clone_produces_an_immediately_green_test_suite` fails ONLY in this worktree (effective `poetry run` venv is the main checkout's, whose editable `vintasend` lacks the unmerged modules; the clone subprocess resolves that stale source). Proven benign — the template suite passes 62/62 when `vintasend` resolves to the worktree source, and it passes in CI/single-checkout. Every phase's gate verifies this is the SOLE failure.
 - **Gate**: ruff clean; mypy clean (74 files); full suite 607 passed, 2 skipped, 1 failed (the clone-test artifact above only).
 
+### Phase 4 — Sync verification and health stats ✅
+
+- **Implementer model**: claude-sonnet-5 (Tier 3) · **Reviewer**: claude-opus-4-8 (Tier 4) · **Fixer**: claude-sonnet-5 (Tier 3)
+- **Commits**: `Add verify_notification_sync to notification services`; `Add get_backend_sync_stats to notification services`; + fix commits `Flag heterogeneous record types in sync verification`, `Pin the sync-comparable field lists with a review-gate test`
+- **Files**: `dataclasses.py` (report TypedDicts + comparable-field constants), `notification_service.py` (both methods + shared `_build_notification_sync_report`), `tests/test_services/test_multi_backend_management.py`
+- **Summary**: `verify_notification_sync(id)` reads the record from every registered backend, reports `backends_with_record`/`backends_missing_record` and per-field cross-backend agreement (`NotificationSyncReport` / `NotificationSyncFieldReport` TypedDicts). Comparable fields derived from the dataclass minus a documented volatile set (`created`/`modified`/`attachments`), pinned by a review-gate test so a new dataclass field forces a conscious comparable-vs-volatile decision. Heterogeneous record types (Notification vs OneOffNotification for one id) are flagged not-in-sync via a synthetic `record_type` field entry. `get_backend_sync_stats()` returns per-backend `{total_notifications, status, error?}` driven by `count_notifications({})`, isolating a raising backend as `status='error'` without propagating. Pure service orchestration — no seam/ABC change.
+- **Review**: 0 BLOCKER, 2 SHOULD-FIX (field-derivation safety net; heterogeneous-type under-reporting) + 1 NIT (double call) — all fixed in-phase.
+- **Gate**: ruff clean; mypy clean (75 files); full suite 626 passed, 2 skipped, 1 failed (clone-test artifact only).
+
 ## Current phase
 
-- Phase 4 — Sync verification and health stats
+- Phase 5 — Backend migration
 
 ## Remaining phases
 
-- Phase 4 — Sync verification and health stats (Tier 3)
 - Phase 5 — Backend migration (Tier 3)
 - Phase 6 — Documentation (Tier 2)
 
