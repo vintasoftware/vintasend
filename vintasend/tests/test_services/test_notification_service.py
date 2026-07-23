@@ -125,29 +125,6 @@ class PreTenantFakeAsyncIOFileBackend(FakeAsyncIOFileBackend):
         )
 
 
-def notification_to_dict(notification: "Notification") -> NotificationDict:
-    return NotificationDict(
-        id=notification.id if not isinstance(notification.id, uuid.UUID) else str(notification.id),
-        user_id=notification.user_id
-        if not isinstance(notification.user_id, uuid.UUID)
-        else str(notification.user_id),
-        notification_type=notification.notification_type,
-        title=notification.title,
-        body_template=notification.body_template,
-        context_name=notification.context_name,
-        context_kwargs={
-            k: v if not isinstance(v, uuid.UUID) else str(v)
-            for k, v in notification.context_kwargs.items()
-        },
-        send_after=notification.send_after.isoformat() if notification.send_after else None,
-        subject_template=notification.subject_template,
-        preheader_template=notification.preheader_template,
-        status=notification.status,
-        context_used=notification.context_used,
-        adapter_extra_parameters=notification.adapter_extra_parameters,
-    )
-
-
 class NotificationServiceTestCase(TestCase):
     def setup_method(self, method):
         CONTEXT_GENERATION_TIMESTAMPS.clear()

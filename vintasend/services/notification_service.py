@@ -50,12 +50,12 @@ from vintasend.services.notification_adapters.async_base import AsyncBaseNotific
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
     NotificationFilter,
     NotificationOrderBy,
 )
+from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
 from vintasend.services.service_utils import (
     download_from_url,
     is_asyncio_context_function,
