@@ -3,7 +3,7 @@
 - **Feature**: Multi-Backend Replication
 - **Plan**: `ai-plans/2026-07-23-MULTI_BACKEND_REPLICATION_IMPLEMENTATION_PLAN.md`
 - **Started**: 2026-07-23
-- **Last updated**: 2026-07-23 (Phase 2 complete)
+- **Last updated**: 2026-07-23 (Phase 3 complete)
 - **Feature flag**: none (inert unless a host passes `additional_backends`)
 
 ## Run options
@@ -46,13 +46,22 @@
 - **Known best-effort limitation** (→ Phase 6 release note): the read-then-write fallback (non-snapshot-apply backends) does not converge attachments or intermediate audit fields, and cannot create a row with the primary's id inline — backends needing full-fidelity replication implement `apply_replication_snapshot_if_newer`.
 - **Gate**: ruff clean; mypy clean; full suite 512 passed, 2 skipped (pre-existing).
 
+### Phase 3 — Queued replication ✅
+
+- **Implementer model**: claude-opus-4-8 (Tier 4) · **Reviewer**: claude-opus-4-8 (Tier 4) · **Fixer**: claude-sonnet-5 (Tier 3)
+- **Commits**: `Add ReplicationError exception`; `Add replication queue service seam and fake stub`; `Add NOTIFICATION_REPLICATION_MODE and queue service settings`; `Resolve replication queue service in helpers`; `Wire queued replication into notification services`; `Add process_replication worker entrypoint to notification services`; `Add replication queue stub to implementation template`; + fix commits `Classify uncreatable replicas as process_replication failures`, `Validate replication_mode and cover its resolution`, `Cover a failing middle backend in queued enqueue fallback`
+- **Files**: new `notification_queue_services/replication_base.py` + `asyncio_replication_base.py` + `stubs/fake_replication_queue_service.py`; `exceptions.py` (`ReplicationError`); `helpers.py` (resolver); `app_settings.py` (2 settings × 6 layers); `notification_service.py` (queued branch + `process_replication`); `README.md` + `ai-tools/AGENTS.md` (env-var docs, required by add-env-var); template `replication_queue_service.py` + `test_replication_queue_service.py`; tests `test_multi_backend_replication.py`, `test_app_settings.py`, `test_notification_queue_services.py`
+- **Summary**: New abstract replication-queue seam `BaseNotificationReplicationQueueService.enqueue_replication(id, backend_identifier)` (+ AsyncIO twin + Fake stub), sibling of the send-queue seam. Both services accept/resolve `replication_queue_service` and honour `replication_mode="queued"` (resolved from `NOTIFICATION_REPLICATION_MODE`, explicit arg wins, invalid value raises). Queued branch enqueues one task per additional backend; falls back to inline-all + warning when no queue service or unresolvable id, and inline-only-that-backend on a per-backend enqueue error. `process_replication(id, target=None)` worker entrypoint converges targets via the shared Phase 2 path, returns `{successes, failures}`, raises `BackendNotFoundError` on unknown target and `ReplicationError` on missing-on-primary; a target that can't be created (declining backend lacking the row) is classified as a failure, not false success. `replicate_notification` is the no-target alias. Two new settings across all six layers (via add-env-var). Template gained a replication-queue stub (per user decision).
+- **Review**: 0 BLOCKER, 2 SHOULD-FIX (process_replication false-success on uncreatable target; untested mode resolution) + 2 NIT (invalid-mode fail-loud; 3-replica middle-failure test) — all fixed in-phase.
+- **Env-var-in-worktree caveat**: `test_clone_produces_an_immediately_green_test_suite` fails ONLY in this worktree (effective `poetry run` venv is the main checkout's, whose editable `vintasend` lacks the unmerged modules; the clone subprocess resolves that stale source). Proven benign — the template suite passes 62/62 when `vintasend` resolves to the worktree source, and it passes in CI/single-checkout. Every phase's gate verifies this is the SOLE failure.
+- **Gate**: ruff clean; mypy clean (74 files); full suite 607 passed, 2 skipped, 1 failed (the clone-test artifact above only).
+
 ## Current phase
 
-- Phase 3 — Queued replication
+- Phase 4 — Sync verification and health stats
 
 ## Remaining phases
 
-- Phase 3 — Queued replication (Tier 4; reviewer Tier 4) — ALSO add `replication_queue_service.py` + `test_replication_queue_service.py` to `templates/vintasend-implementation-template/` (see Template decision above)
 - Phase 4 — Sync verification and health stats (Tier 3)
 - Phase 5 — Backend migration (Tier 3)
 - Phase 6 — Documentation (Tier 2)
