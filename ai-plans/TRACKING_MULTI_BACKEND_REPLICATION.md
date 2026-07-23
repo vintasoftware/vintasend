@@ -3,7 +3,7 @@
 - **Feature**: Multi-Backend Replication
 - **Plan**: `ai-plans/2026-07-23-MULTI_BACKEND_REPLICATION_IMPLEMENTATION_PLAN.md`
 - **Started**: 2026-07-23
-- **Last updated**: 2026-07-23 (Phase 1 complete)
+- **Last updated**: 2026-07-23 (Phase 2 complete)
 - **Feature flag**: none (inert unless a host passes `additional_backends`)
 
 ## Run options
@@ -19,6 +19,7 @@
 - `commit_strategy_resolved`: modular-commits
 - `plan_branch`: `plan/multi-backend-replication`
 - **Version decision**: fold into unreleased 2.0.0 RELEASE_NOTES; correct `pyproject.toml` back to `2.0.0` in Phase 6 (do NOT create a new version entry).
+- **Template decision** (user, mid-run): in Phase 3, add `replication_queue_service.py` + `test_replication_queue_service.py` to `templates/vintasend-implementation-template/` mirroring the existing `queue_service` stub (the new `BaseNotificationReplicationQueueService` seam is abstract). Leave the template `backend.py` untouched — the multi-backend backend methods are concrete-by-design and must not be stubbed. Add a short template-README note in Phase 6.
 
 ## PR
 
@@ -35,14 +36,23 @@
 - **Review**: 3 findings (2 SHOULD-FIX + 1 NIT), all fixed in-phase: duplicate-identifier guard, multi-page pagination test, empty-page terminator. No BLOCKERs.
 - **Gate**: mypy clean; full suite 487 passed, 2 skipped (pre-existing).
 
+### Phase 2 — Inline write fan-out ✅
+
+- **Implementer model**: claude-opus-4-8 (Tier 4) · **Reviewer**: claude-opus-4-8 (Tier 4) · **Fixer**: claude-sonnet-5 (Tier 3)
+- **Commits**: `Add ApplyResult and default snapshot-apply to backend seam`; `Fan notification writes out to additional backends inline`; `Isolate replication snapshot read from primary write`; `Cover multi-backend mark_read_bulk fan-out`; `Converge replica status through intermediate transitions`
+- **Files**: `vintasend/services/dataclasses.py` (`ApplyResult`), `notification_backends/base.py` + `asyncio_base.py` (concrete `apply_replication_snapshot_if_newer` default), `notification_backends/stubs/fake_backend.py` (working upsert override on both fakes), `notification_service.py` (wrapper + routing), `tests/test_services/test_multi_backend_writes.py`
+- **Summary**: One `_execute_multi_backend_write` wrapper on both services: primary write first (its result/exception is the user's), then fan out to each additional backend in registry order under try/except — replica failures logged and swallowed, never re-raised. Single-backend service short-circuits (no replication path). Replica path prefers `apply_replication_snapshot_if_newer` (concrete default → `ApplyResult(applied=False)`), else read-then-write convergence. `_is_likely_duplicate_replication_conflict` flips create↔update once on a duplicate/conflict. Every write routed: create/create_one_off/update/resend, mark sent/failed/read (+bulk), cancel, store_context_used, store_git_commit_sha, and the send()/delayed_send() points. `replication_mode` param accepted (only "inline" behaves; "queued" is Phase 3).
+- **Review**: 1 BLOCKER + 3 SHOULD-FIX + 1 NIT. BLOCKER (a replication-only snapshot re-read could fail an already-committed primary write on a non-`NotificationError`) fixed by widening the catch to swallow+log+return None. SHOULD-FIX: added declining-backend *create* test (proves the documented no-inline-create gap) + `mark_read_bulk` convergence test; improved read-then-write status transitions (reach READ via SENT). NIT (fold one helper) deferred to Phase 3.
+- **Known best-effort limitation** (→ Phase 6 release note): the read-then-write fallback (non-snapshot-apply backends) does not converge attachments or intermediate audit fields, and cannot create a row with the primary's id inline — backends needing full-fidelity replication implement `apply_replication_snapshot_if_newer`.
+- **Gate**: ruff clean; mypy clean; full suite 512 passed, 2 skipped (pre-existing).
+
 ## Current phase
 
-- Phase 2 — Inline write fan-out
+- Phase 3 — Queued replication
 
 ## Remaining phases
 
-- Phase 2 — Inline write fan-out (Tier 4; reviewer Tier 4)
-- Phase 3 — Queued replication (Tier 4; reviewer Tier 4)
+- Phase 3 — Queued replication (Tier 4; reviewer Tier 4) — ALSO add `replication_queue_service.py` + `test_replication_queue_service.py` to `templates/vintasend-implementation-template/` (see Template decision above)
 - Phase 4 — Sync verification and health stats (Tier 3)
 - Phase 5 — Backend migration (Tier 3)
 - Phase 6 — Documentation (Tier 2)
