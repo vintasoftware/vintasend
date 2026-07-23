@@ -1107,8 +1107,17 @@ class NotificationService(Generic[A, B]):
         Raises ``BackendNotFoundError`` if either the source or the destination names an
         unregistered backend, and ``BackendMigrationError`` if they name the same one --
         migrating a backend onto itself is a caller mistake, not a partial no-op worth silently
-        accepting.
+        accepting -- or if ``batch_size`` is not a positive integer.
+
+        Assumes the source is quiescent: it pages the source with a stable cursor, so if the
+        source is concurrently receiving writes (for example, it is itself a live replica of
+        another active service), rows inserted mid-run can shift page boundaries and be skipped
+        or seen twice.
         """
+        if batch_size <= 0:
+            raise BackendMigrationError(
+                f"batch_size must be a positive integer, got {batch_size!r}"
+            )
         if not self.has_backend(destination_backend_identifier):
             raise BackendNotFoundError(
                 f"No backend registered with identifier '{destination_backend_identifier}'"
@@ -3039,8 +3048,18 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ``failures`` list and does not abort the rest of the migration.
 
         Raises ``BackendNotFoundError`` if either the source or the destination names an
-        unregistered backend, and ``BackendMigrationError`` if they name the same one.
+        unregistered backend, and ``BackendMigrationError`` if they name the same one, or if
+        ``batch_size`` is not a positive integer.
+
+        Assumes the source is quiescent: it pages the source with a stable cursor, so if the
+        source is concurrently receiving writes (for example, it is itself a live replica of
+        another active service), rows inserted mid-run can shift page boundaries and be skipped
+        or seen twice.
         """
+        if batch_size <= 0:
+            raise BackendMigrationError(
+                f"batch_size must be a positive integer, got {batch_size!r}"
+            )
         if not self.has_backend(destination_backend_identifier):
             raise BackendNotFoundError(
                 f"No backend registered with identifier '{destination_backend_identifier}'"

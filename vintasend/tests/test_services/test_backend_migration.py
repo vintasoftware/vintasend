@@ -212,6 +212,16 @@ class BackendMigrationTestCase(TestCase):
                 "backend-1", batch_size=10, source_backend_identifier="backend-1"
             )
 
+    def test_zero_batch_size_raises_backend_migration_error(self):
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(BackendMigrationError):
+            worker.migrate_to_backend("backend-1", batch_size=0)
+
+    def test_negative_batch_size_raises_backend_migration_error(self):
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(BackendMigrationError):
+            worker.migrate_to_backend("backend-1", batch_size=-1)
+
     def test_migrate_to_empty_replica_matches_primary_and_second_run_changes_nothing(self):
         # Integration: populate the primary, migrate to an empty replica, assert it matches; a
         # second run must change nothing.
@@ -372,6 +382,16 @@ class AsyncIOBackendMigrationTestCase(IsolatedAsyncioTestCase):
             await worker.migrate_to_backend(
                 "backend-1", batch_size=10, source_backend_identifier="backend-1"
             )
+
+    async def test_zero_batch_size_raises_backend_migration_error(self):
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(BackendMigrationError):
+            await worker.migrate_to_backend("backend-1", batch_size=0)
+
+    async def test_negative_batch_size_raises_backend_migration_error(self):
+        worker = self.build_service(additional_backends=[self.replica_one])
+        with self.assertRaises(BackendMigrationError):
+            await worker.migrate_to_backend("backend-1", batch_size=-1)
 
     async def test_migrate_to_empty_replica_matches_primary_and_second_run_changes_nothing(self):
         primary_only = self.build_service()
