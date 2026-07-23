@@ -1,5 +1,157 @@
 # Release Notes
 
+## Version 2.0.0 (2026-07-23)
+
+2.0 is a major release that bundles three feature sets: background notification sending through a
+queue service, a composable filtering / ordering API, and a dedicated attachment manager seam. The
+breaking changes come from the background-sending rework and from new abstract methods that every
+downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade guidance.
+
+### Features
+
+#### Background sending via a queue service
+- Adapters opt in to background delivery by subclassing `BackgroundNotificationAdapter` (sync) or
+  `AsyncIOBackgroundNotificationAdapter` (AsyncIO). When a background-capable adapter is used,
+  `send()` enqueues the notification id to the configured queue service and returns immediately; a
+  worker calls the service's `delayed_send(notification_id)` to deliver it. This decouples web
+  request latency from notification delivery.
+- The queue now carries only the notification id, not serialized notification data. The worker
+  reloads the notification from the backend, so context is generated at delivery time (not at
+  enqueue time) and attachments work on the background path for the first time.
+- `NOTIFICATION_SERVICE_FACTORY` points to a callable that returns a ready `NotificationService`
+  or `AsyncIONotificationService` for the worker. The factory runs once per process and the result
+  is cached, enabling ORM sessions scoped to the worker rather than rebuilt per task.
+- `AsyncIONotificationService` supports background sending via `AsyncIOBackgroundNotificationAdapter`
+  and `AsyncIOBaseNotificationQueueService`.
+
+#### Filtering, ordering, and resend
+- `filter_notifications(filter, page, page_size, order_by=None)`, `count_notifications(filter)` and
+  `get_backend_supported_filter_capabilities()` on both services. The composable filter vocabulary
+  lives in `vintasend.services.notification_backends.filters`: field filters (scalar equality or
+  list membership), string lookups (`exact` / `starts_with` / `ends_with` / `includes`, case
+  sensitivity configurable), inclusive date ranges, and `and` / `or` / `not` groups that nest
+  arbitrarily. An empty filter matches every notification. `get_backend_supported_filter_capabilities`
+  reports which fields, lookups and sort fields the configured backend supports, so a client can
+  grey out what it can't use. See the README's "Filtering and Ordering Notifications" section.
+- `resend_notification(notification_id, use_stored_context_if_available=False)` on both services:
+  clones a sent notification into a brand-new pending row and sends it immediately, leaving the
+  original untouched. Refuses one-off notifications and notifications still scheduled in the future
+  by raising `NotificationResendError`. `use_stored_context_if_available=True` reuses the source's
+  stored context verbatim instead of regenerating it through the context registry.
+- `Notification` and `OneOffNotification` gained `sent_at`, `read_at` and `tenant` fields
+  (`datetime | None` / `datetime | None` / `str | None`, all defaulting to `None`).
+  `mark_pending_as_sent` sets `sent_at`; `mark_sent_as_read` and `mark_sent_as_read_bulk` set
+  `read_at`. `persist_notification` and `persist_one_off_notification` gained an optional `tenant`
+  keyword. The filter vocabulary includes `sent_at_range`, `read_at_range` and `tenant` (equality
+  or membership).
+
+#### Attachment manager seam
+- New attachment manager seam: `BaseAttachmentManager` and `AsyncIOBaseAttachmentManager`
+  (`vintasend.services.attachment_managers`) own every byte of attachment storage —
+  `upload_file`, `reconstruct_attachment_file`, and `delete_file_by_identifiers` — so a
+  notification backend never reads, writes, or downloads a file itself. Core ships the ABCs plus a
+  working reference, `FakeAttachmentManager` / `FakeAsyncIOAttachmentManager`; real managers (local
+  disk, S3, Django storage, and so on) live in their own `vintasend-*` package. See
+  [ATTACHMENTS.md](ATTACHMENTS.md).
+- Both services take a new `attachment_manager` constructor argument (instance, dotted import
+  string, or the new `NOTIFICATION_ATTACHMENT_MANAGER` setting), injected into the backend through
+  the duck-typed `inject_attachment_manager` hook. A backend that predates this seam and has no
+  such method is left untouched and keeps working with no attachment support.
+- The attachment model is now checksum-indexed: `AttachmentFileRecord` describes one stored blob,
+  and `StoredAttachment` is the join row linking a notification to it. `storage_metadata` is kept
+  as a deprecated alias for the new `storage_identifiers` field.
+- `NotificationAttachmentReference(file_id=...)` attaches an already-uploaded file by id instead of
+  re-uploading it. `NotificationAttachment` (an upload) and `NotificationAttachmentReference` (a
+  reference) are both accepted through the new `AnyNotificationAttachment` union, distinguished with
+  the new `is_attachment_reference` type guard. Identical uploads are deduplicated on checksum and
+  size; a reference to an unknown `file_id` raises the new `AttachmentFileNotFoundError`.
+- `get_orphaned_attachment_files` returns file records no longer referenced by any notification, for
+  a caller-driven, two-step reclamation. Nothing is deleted automatically.
+
+### Bug Fixes
+- `FakeFileBackend` and `FakeAsyncIOFileBackend` now stamp `created` and `modified` when a
+  notification is persisted, and advance `modified` on updates and status transitions — matching a
+  real ORM's `auto_now_add` / `auto_now`. Previously both fields stayed `None` for any notification
+  created through the service, so `created_at_range` filters matched nothing and the default
+  `created`-descending ordering fell through to the `id` tiebreaker.
+
+### Breaking Changes
+
+1. **`raise_on_failed_send` defaults to `False`.** In 1.x, send failures raised
+   `NotificationSendError` and similar exceptions. In 2.0 they are logged but not raised by default.
+   Applications that catch these exceptions should pass `raise_on_failed_send=True` to
+   `NotificationService` / `AsyncIONotificationService` to restore 1.x behavior.
+2. **Background adapter `delayed_send` signature changed.** The adapter marker method now takes only
+   `notification_id`, not `(notification_dict, context_dict)`. Core never calls this method;
+   delivery happens via the adapter's `send()` after the worker loads the notification. Adapter
+   authors must move background delivery logic from `delayed_send` to `send()`.
+3. **Deleted serialization hooks and types.** The eight abstract serialize/restore methods on
+   `AsyncNotificationProtocol`, plus the types `NotificationDict` and `OneOffNotificationDict`, are
+   deleted. No serialization is needed with id-only payloads.
+4. **`NOTIFICATION_SERVICE_FACTORY` is required for background sending.** The worker needs a factory
+   callable to rebuild the service in its own process. Web and worker must also share the same
+   `NOTIFICATION_BACKEND` and `NOTIFICATION_QUEUE_SERVICE` settings, or the worker silently fails to
+   find notifications.
+5. **Adapter rename.** `AsyncBaseNotificationAdapter` is renamed to `BackgroundNotificationAdapter`;
+   the old name is kept as a silent alias for compatibility. New AsyncIO background adapters
+   subclass `AsyncIOBackgroundNotificationAdapter`.
+6. **New abstract methods on both backend base classes — every custom backend subclass MUST
+   implement them before it can be instantiated against 2.0:**
+   - From the filtering API: `filter_notifications`. (`get_filter_capabilities` and
+     `count_notifications` are concrete defaults, so they need no changes but SHOULD be overridden
+     for efficiency.)
+   - From the attachment seam: `store_attachment_file_record`, `get_attachment_file_record`,
+     `find_attachment_file_by_checksum`, `delete_attachment_file`, `get_orphaned_attachment_files`,
+     `get_attachments`, and `delete_notification_attachment`. (`inject_attachment_manager` is added
+     too, but concrete with a default, so it needs no change.)
+
+### New exceptions
+- `TenantReassignmentError`: raised by `update_notification` when `tenant` appears in the update
+  kwargs. `tenant` cannot be changed after a notification is created.
+- `NotificationResendError`: raised by `resend_notification` for a one-off notification or one still
+  scheduled in the future.
+- `AttachmentFileNotFoundError`, `AttachmentUploadError`, and `UnsupportedAttachmentFileTypeError`
+  for the attachment paths.
+- All derive from `NotificationError`, which derives from `ValueError`, so existing
+  `except ValueError` handlers keep working.
+
+### Backwards Compatibility
+- **`AsyncBaseNotificationAdapter` is now an alias** for `BackgroundNotificationAdapter`. Existing
+  imports keep working; `BackgroundNotificationAdapter` is the recommended name for new code.
+- **`raise_on_failed_send` silent behavior change.** Code that does not catch send exceptions sees
+  the same behavior (failures logged). Code that catches `NotificationSendError` must pass
+  `raise_on_failed_send=True` to restore 1.x semantics.
+- The `sent_at`, `read_at` and `tenant` fields are additive with `None` defaults, appended after the
+  existing ones, so existing positional construction and existing callers are unaffected. The
+  optional trailing `tenant` keyword on `persist_notification` / `persist_one_off_notification` is
+  forwarded only when a caller passes it, so a backend built against a pre-2.0 signature keeps
+  working for tenant-less callers.
+- `update_notification` now raises `TenantReassignmentError` if `tenant` is present in the update
+  kwargs (checked on the raw dict). `send()` gained an optional trailing `context` keyword used
+  internally by `resend_notification`; every existing caller passes no `context` and is unaffected.
+- `UpdateNotificationKwargs.attachments` intentionally stays typed `list[StoredAttachment]`, not
+  widened to `AnyNotificationAttachment`, because `persist_notification_update` has no upload path.
+- **Downstream packages.** `vintasend-celery` is significantly affected and requires a 2.0 release
+  of its own. `vintasend-django` must implement the new filter and attachment seams (plus a schema
+  migration for the new attachment table) before it can pin `vintasend>=2.0.0`. `vintasend-sqlalchemy`
+  cannot adopt this release until its own catch-up plan lands, since it is already missing methods
+  from 1.2.0.
+
+### Operational Requirements
+- **Drain or dual-register the Celery queue before deploying.** Tasks queued under 1.x carry a
+  different payload format and will fail against 2.0. Either drain the queue before deploying the
+  2.0 worker or register the new entrypoint under a new task name and run both workers until the old
+  queue empties. See `MIGRATION_TO_2.0.0.md`.
+
+### Upgrade Path
+1. Read `MIGRATION_TO_2.0.0.md` for the breaking changes and the deploy procedure.
+2. If you use background sending, set up `NOTIFICATION_SERVICE_FACTORY`.
+3. If you maintain an adapter, move to `BackgroundNotificationAdapter` /
+   `AsyncIOBackgroundNotificationAdapter` and move `delayed_send` logic to `send()`.
+4. If you maintain a backend, implement the new filter and attachment abstract methods.
+5. Test end-to-end, including attachments in background sends (now supported), then drain the queue
+   and deploy the 2.0 worker.
+
 ## Version 1.4.0 (2026-07-22)
 
 ### Bug Fixes
