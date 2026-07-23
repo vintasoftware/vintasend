@@ -107,3 +107,8 @@ class GitCommitShaReassignmentError(NotificationError):
     """Raised when an update attempts to set a notification's git_commit_sha. The field is
     system-managed -- only NotificationService writes it, at send time, through
     store_git_commit_sha."""
+
+
+class BackendNotFoundError(NotificationError):
+    """Raised when a multi-backend read or operation names a ``backend_identifier`` that
+    is not registered on the service -- neither the primary nor any additional backend."""
