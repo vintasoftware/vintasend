@@ -4,7 +4,17 @@ import uuid
 from unittest import IsolatedAsyncioTestCase, TestCase
 
 from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.services.dataclasses import Notification, OneOffNotification
+from vintasend.exceptions import NotificationResendError
+from vintasend.services.dataclasses import (
+    Notification,
+    NotificationAttachment,
+    NotificationContextDict,
+    OneOffNotification,
+)
+from vintasend.services.notification_adapters.stubs.fake_adapter import (
+    FakeAsyncIOEmailAdapter,
+    FakeEmailAdapter,
+)
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
     is_field_filter,
@@ -18,6 +28,10 @@ from vintasend.services.notification_backends.stubs.fake_backend import (
 from vintasend.services.notification_service import (
     AsyncIONotificationService,
     NotificationService,
+    register_context,
+)
+from vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer import (
+    FakeTemplateRenderer,
 )
 
 
@@ -426,6 +440,64 @@ class FilterNotificationsBackendTestCase(TestCase):
     def test_get_filter_capabilities_is_empty(self):
         assert self.backend.get_filter_capabilities() == {}
 
+    def test_pagination_sweep_with_shared_created_returns_every_row_once_descending(self):
+        # Same setup as the ascending sweep above, but pinning that the ``id`` tiebreaker is
+        # also honored -- in the SAME (descending) direction -- when the primary sort direction
+        # is reversed. Phase 2 only exercised the ascending direction exhaustively.
+        shared = _dt(5)
+        ids = [f"id-{i:02d}" for i in range(10)]
+        scrambled = [ids[i] for i in (3, 7, 0, 9, 1, 5, 2, 8, 4, 6)]
+        self._seed([_build_notification(i, created=shared) for i in scrambled])
+
+        order_by = {"field": "created_at", "direction": "desc"}
+        page_size = 3
+        swept: list[str] = []
+        page = 1
+        while True:
+            batch = self.backend.filter_notifications({}, page, page_size, order_by=order_by)
+            if not batch:
+                break
+            swept.extend(n.id for n in batch)
+            page += 1
+
+        # No drops, no duplicates.
+        assert sorted(swept) == ids
+        assert len(swept) == len(set(swept)) == len(ids)
+        # And the tiebreaker orders equal-``created`` rows by id descending.
+        assert swept == sorted(ids, reverse=True)
+
+    def test_count_agrees_with_exhaustive_filtered_sweep(self):
+        # filter -> count -> paginate through every page, asserting the union of every page
+        # equals the filtered set exactly, with no duplicates.
+        self._seed(
+            [
+                _build_notification(
+                    f"id-{i:02d}",
+                    tenant="acme" if i % 3 == 0 else "beta",
+                    created=_dt((i % 5) + 1),
+                )
+                for i in range(23)
+            ]
+        )
+        filt = {"tenant": "acme"}
+        expected_ids = {n.id for n in self.backend.notifications if n.tenant == "acme"}
+        total = self.backend.count_notifications(filt)
+        assert total == len(expected_ids)
+
+        order_by = {"field": "created_at", "direction": "asc"}
+        page_size = 4
+        swept: list[str] = []
+        page = 1
+        while True:
+            batch = self.backend.filter_notifications(filt, page, page_size, order_by=order_by)
+            if not batch:
+                break
+            swept.extend(n.id for n in batch)
+            page += 1
+
+        assert len(swept) == len(set(swept)) == total
+        assert set(swept) == expected_ids
+
 
 class FilterNotificationsAsyncBackendTestCase(IsolatedAsyncioTestCase):
     """AsyncIO mirror of the core backend filtering behavior."""
@@ -495,6 +567,82 @@ class FilterNotificationsAsyncBackendTestCase(IsolatedAsyncioTestCase):
 
     async def test_get_filter_capabilities_is_empty(self):
         assert await self.backend.get_filter_capabilities() == {}
+
+    async def test_pagination_sweep_with_shared_created_returns_every_row_once_ascending(self):
+        # AsyncIO mirror of the sync fake's exhaustive sweep -- no full multi-page sweep exists
+        # yet on this fake in either direction, so both are added here.
+        shared = _dt(5)
+        ids = [f"id-{i:02d}" for i in range(10)]
+        scrambled = [ids[i] for i in (3, 7, 0, 9, 1, 5, 2, 8, 4, 6)]
+        self._seed([_build_notification(i, created=shared) for i in scrambled])
+
+        order_by = {"field": "created_at", "direction": "asc"}
+        page_size = 3
+        swept: list[str] = []
+        page = 1
+        while True:
+            batch = await self.backend.filter_notifications({}, page, page_size, order_by=order_by)
+            if not batch:
+                break
+            swept.extend(n.id for n in batch)
+            page += 1
+
+        assert sorted(swept) == ids
+        assert len(swept) == len(set(swept)) == len(ids)
+        assert swept == ids
+
+    async def test_pagination_sweep_with_shared_created_returns_every_row_once_descending(self):
+        shared = _dt(5)
+        ids = [f"id-{i:02d}" for i in range(10)]
+        scrambled = [ids[i] for i in (3, 7, 0, 9, 1, 5, 2, 8, 4, 6)]
+        self._seed([_build_notification(i, created=shared) for i in scrambled])
+
+        order_by = {"field": "created_at", "direction": "desc"}
+        page_size = 3
+        swept: list[str] = []
+        page = 1
+        while True:
+            batch = await self.backend.filter_notifications({}, page, page_size, order_by=order_by)
+            if not batch:
+                break
+            swept.extend(n.id for n in batch)
+            page += 1
+
+        assert sorted(swept) == ids
+        assert len(swept) == len(set(swept)) == len(ids)
+        assert swept == sorted(ids, reverse=True)
+
+    async def test_count_agrees_with_exhaustive_filtered_sweep(self):
+        self._seed(
+            [
+                _build_notification(
+                    f"id-{i:02d}",
+                    tenant="acme" if i % 3 == 0 else "beta",
+                    created=_dt((i % 5) + 1),
+                )
+                for i in range(23)
+            ]
+        )
+        filt = {"tenant": "acme"}
+        expected_ids = {n.id for n in self.backend.notifications if n.tenant == "acme"}
+        total = await self.backend.count_notifications(filt)
+        assert total == len(expected_ids)
+
+        order_by = {"field": "created_at", "direction": "asc"}
+        page_size = 4
+        swept: list[str] = []
+        page = 1
+        while True:
+            batch = await self.backend.filter_notifications(
+                filt, page, page_size, order_by=order_by
+            )
+            if not batch:
+                break
+            swept.extend(n.id for n in batch)
+            page += 1
+
+        assert len(swept) == len(set(swept)) == total
+        assert set(swept) == expected_ids
 
 
 class _TenantUnsupportedBackend(FakeFileBackend):
@@ -594,3 +742,306 @@ class FilterNotificationsAsyncServiceTestCase(IsolatedAsyncioTestCase):
             if key == "fields.tenant":
                 continue
             assert value is True, key
+
+
+def _nonce_context(**_kwargs) -> NotificationContextDict:
+    """A context generator that returns a fresh value every call.
+
+    Used to distinguish "regenerated" (a new nonce) from "reused verbatim" (the exact same
+    stored dict) in the ``resend_notification`` tests below.
+    """
+    return NotificationContextDict({"nonce": str(uuid.uuid4())})
+
+
+class ResendNotificationServiceTestCase(TestCase):
+    """Exercise ``resend_notification`` end to end against the sync fake + adapter."""
+
+    def setUp(self):
+        self.database_file_name = tempfile.mktemp(suffix=".json")
+        self.backend = FakeFileBackend(database_file_name=self.database_file_name)
+        self.adapter = FakeEmailAdapter(
+            backend=self.backend, template_renderer=FakeTemplateRenderer()
+        )
+        self.service: NotificationService = NotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+        register_context("resend_nonce_context")(_nonce_context)
+
+    def tearDown(self):
+        self.backend.clear()
+
+    def _create_sent_notification(self, **overrides) -> Notification:
+        kwargs: dict = {
+            "user_id": 1,
+            "notification_type": NotificationTypes.EMAIL.value,
+            "title": "Title",
+            "body_template": "body",
+            "context_name": "resend_nonce_context",
+            "context_kwargs": NotificationContextDict({}),
+            "send_after": None,
+            "subject_template": "subject",
+            "preheader_template": "preheader",
+        }
+        kwargs.update(overrides)
+        return self.service.create_notification(**kwargs)
+
+    def test_resend_creates_new_row_and_leaves_original_untouched(self):
+        source = self._create_sent_notification()
+        original_snapshot = self.backend.get_notification(source.id)
+        assert original_snapshot.status == NotificationStatus.SENT.value
+
+        clone = self.service.resend_notification(source.id)
+
+        assert clone.id != source.id
+        assert clone.status == NotificationStatus.SENT.value
+        assert len(self.backend.notifications) == 2
+
+        reloaded_original = self.backend.get_notification(source.id)
+        assert reloaded_original.id == original_snapshot.id
+        assert reloaded_original.status == original_snapshot.status
+        assert reloaded_original.sent_at == original_snapshot.sent_at
+        assert reloaded_original.read_at == original_snapshot.read_at
+        assert reloaded_original.context_used == original_snapshot.context_used
+
+    def test_resend_regenerates_context_by_default(self):
+        source = self._create_sent_notification()
+        clone = self.service.resend_notification(source.id)
+        assert clone.context_used != source.context_used
+
+    def test_resend_reuses_stored_context_verbatim_when_requested(self):
+        source = self._create_sent_notification()
+        clone = self.service.resend_notification(source.id, use_stored_context_if_available=True)
+        assert clone.context_used == source.context_used
+
+    def test_resend_regenerates_when_no_stored_context_even_if_requested(self):
+        # A notification with no stored context_used (never sent) falls back to regenerating,
+        # even when the caller asks to reuse a stored context.
+        notification = self.backend.persist_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Title",
+            body_template="body",
+            context_name="resend_nonce_context",
+            context_kwargs={},
+            send_after=None,
+            subject_template="subject",
+            preheader_template="preheader",
+        )
+        assert notification.context_used is None
+
+        clone = self.service.resend_notification(
+            notification.id, use_stored_context_if_available=True
+        )
+        assert clone.context_used is not None
+
+    def test_resend_one_off_raises(self):
+        one_off = self.service.create_one_off_notification(
+            email_or_phone="user@example.com",
+            first_name="A",
+            last_name="B",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Title",
+            body_template="body",
+            context_name="resend_nonce_context",
+            context_kwargs=NotificationContextDict({}),
+            send_after=None,
+            subject_template="subject",
+            preheader_template="preheader",
+        )
+        assert len(self.backend.notifications) == 1
+
+        with self.assertRaises(NotificationResendError):
+            self.service.resend_notification(one_off.id)
+
+        assert len(self.backend.notifications) == 1
+
+    def test_resend_future_scheduled_raises(self):
+        future = datetime.datetime.now(tz=UTC) + datetime.timedelta(days=1)
+        notification = self.backend.persist_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Title",
+            body_template="body",
+            context_name="resend_nonce_context",
+            context_kwargs={},
+            send_after=future,
+            subject_template="subject",
+            preheader_template="preheader",
+        )
+        assert len(self.backend.notifications) == 1
+
+        with self.assertRaises(NotificationResendError):
+            self.service.resend_notification(notification.id)
+
+        assert len(self.backend.notifications) == 1
+
+    def test_resend_copies_attachment_rows(self):
+        source = self._create_sent_notification(
+            attachments=[
+                NotificationAttachment(
+                    file=b"hello world",
+                    filename="hello.txt",
+                    content_type="text/plain",
+                )
+            ]
+        )
+        assert len(source.attachments) == 1
+
+        clone = self.service.resend_notification(source.id)
+
+        assert len(clone.attachments) == 1
+        assert clone.attachments[0].filename == "hello.txt"
+        assert clone.attachments[0].get_file_data() == b"hello world"
+
+    def test_resend_carries_tenant_forward(self):
+        source = self._create_sent_notification(tenant="acme")
+        clone = self.service.resend_notification(source.id)
+        assert clone.tenant == "acme"
+
+
+class ResendNotificationAsyncServiceTestCase(IsolatedAsyncioTestCase):
+    """AsyncIO mirror of ``ResendNotificationServiceTestCase``."""
+
+    def setUp(self):
+        self.database_file_name = tempfile.mktemp(suffix=".json")
+        self.backend = FakeAsyncIOFileBackend(database_file_name=self.database_file_name)
+        self.adapter = FakeAsyncIOEmailAdapter(
+            backend=self.backend, template_renderer=FakeTemplateRenderer()
+        )
+        self.service: AsyncIONotificationService = AsyncIONotificationService(
+            notification_adapters=[self.adapter],
+            notification_backend=self.backend,
+        )
+        register_context("resend_nonce_context_async")(_nonce_context)
+
+    async def asyncTearDown(self):
+        await self.backend.clear()
+
+    async def _create_sent_notification(self, **overrides) -> Notification:
+        kwargs: dict = {
+            "user_id": 1,
+            "notification_type": NotificationTypes.EMAIL.value,
+            "title": "Title",
+            "body_template": "body",
+            "context_name": "resend_nonce_context_async",
+            "context_kwargs": NotificationContextDict({}),
+            "send_after": None,
+            "subject_template": "subject",
+            "preheader_template": "preheader",
+        }
+        kwargs.update(overrides)
+        return await self.service.create_notification(**kwargs)
+
+    async def test_resend_creates_new_row_and_leaves_original_untouched(self):
+        source = await self._create_sent_notification()
+        original_snapshot = await self.backend.get_notification(source.id)
+        assert original_snapshot.status == NotificationStatus.SENT.value
+
+        clone = await self.service.resend_notification(source.id)
+
+        assert clone.id != source.id
+        assert clone.status == NotificationStatus.SENT.value
+        assert len(self.backend.notifications) == 2
+
+        reloaded_original = await self.backend.get_notification(source.id)
+        assert reloaded_original.id == original_snapshot.id
+        assert reloaded_original.status == original_snapshot.status
+        assert reloaded_original.sent_at == original_snapshot.sent_at
+        assert reloaded_original.read_at == original_snapshot.read_at
+        assert reloaded_original.context_used == original_snapshot.context_used
+
+    async def test_resend_regenerates_context_by_default(self):
+        source = await self._create_sent_notification()
+        clone = await self.service.resend_notification(source.id)
+        assert clone.context_used != source.context_used
+
+    async def test_resend_reuses_stored_context_verbatim_when_requested(self):
+        source = await self._create_sent_notification()
+        clone = await self.service.resend_notification(
+            source.id, use_stored_context_if_available=True
+        )
+        assert clone.context_used == source.context_used
+
+    async def test_resend_regenerates_when_no_stored_context_even_if_requested(self):
+        notification = await self.backend.persist_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Title",
+            body_template="body",
+            context_name="resend_nonce_context_async",
+            context_kwargs={},
+            send_after=None,
+            subject_template="subject",
+            preheader_template="preheader",
+        )
+        assert notification.context_used is None
+
+        clone = await self.service.resend_notification(
+            notification.id, use_stored_context_if_available=True
+        )
+        assert clone.context_used is not None
+
+    async def test_resend_one_off_raises(self):
+        one_off = await self.service.create_one_off_notification(
+            email_or_phone="user@example.com",
+            first_name="A",
+            last_name="B",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Title",
+            body_template="body",
+            context_name="resend_nonce_context_async",
+            context_kwargs=NotificationContextDict({}),
+            send_after=None,
+            subject_template="subject",
+            preheader_template="preheader",
+        )
+        assert len(self.backend.notifications) == 1
+
+        with self.assertRaises(NotificationResendError):
+            await self.service.resend_notification(one_off.id)
+
+        assert len(self.backend.notifications) == 1
+
+    async def test_resend_future_scheduled_raises(self):
+        future = datetime.datetime.now(tz=UTC) + datetime.timedelta(days=1)
+        notification = await self.backend.persist_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Title",
+            body_template="body",
+            context_name="resend_nonce_context_async",
+            context_kwargs={},
+            send_after=future,
+            subject_template="subject",
+            preheader_template="preheader",
+        )
+        assert len(self.backend.notifications) == 1
+
+        with self.assertRaises(NotificationResendError):
+            await self.service.resend_notification(notification.id)
+
+        assert len(self.backend.notifications) == 1
+
+    async def test_resend_copies_attachment_rows(self):
+        source = await self._create_sent_notification(
+            attachments=[
+                NotificationAttachment(
+                    file=b"hello world",
+                    filename="hello.txt",
+                    content_type="text/plain",
+                )
+            ]
+        )
+        assert len(source.attachments) == 1
+
+        clone = await self.service.resend_notification(source.id)
+
+        assert len(clone.attachments) == 1
+        assert clone.attachments[0].filename == "hello.txt"
+        assert clone.attachments[0].get_file_data() == b"hello world"
+
+    async def test_resend_carries_tenant_forward(self):
+        source = await self._create_sent_notification(tenant="acme")
+        clone = await self.service.resend_notification(source.id)
+        assert clone.tenant == "acme"
