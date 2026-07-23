@@ -156,6 +156,7 @@ email renderer, or look at `vintasend-jinja`'s implementation.
 ```checklist
 BaseNotificationTemplateRenderer.render
 BaseTemplatedEmailRenderer.render
+BaseTemplatedEmailRenderer.render_from_template_content
 BaseTemplatedSMSRenderer.render
 ```
 
