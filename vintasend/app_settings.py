@@ -12,6 +12,8 @@ class NotificationSettingsDict(TypedDict):
     NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL: str
     NOTIFICATION_DEFAULT_BASE_URL_DOMAIN: str
     NOTIFICATION_DEFAULT_FROM_EMAIL: str
+    NOTIFICATION_QUEUE_SERVICE: str | None
+    NOTIFICATION_SERVICE_FACTORY: str | None
 
 
 DEFAULT_SETTINGS: NotificationSettingsDict = {
@@ -22,6 +24,8 @@ DEFAULT_SETTINGS: NotificationSettingsDict = {
     "NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL": "http",
     "NOTIFICATION_DEFAULT_BASE_URL_DOMAIN": "example.com",
     "NOTIFICATION_DEFAULT_FROM_EMAIL": "foo@examplo.com",
+    "NOTIFICATION_QUEUE_SERVICE": None,
+    "NOTIFICATION_SERVICE_FACTORY": None,
 }
 
 
@@ -152,6 +156,8 @@ class NotificationSettings(metaclass=SingletonMeta):
     NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL: str
     NOTIFICATION_DEFAULT_BASE_URL_DOMAIN: str
     NOTIFICATION_DEFAULT_FROM_EMAIL: str
+    NOTIFICATION_QUEUE_SERVICE: str | None
+    NOTIFICATION_SERVICE_FACTORY: str | None
 
     def __init__(self, config: Any = None):
         self.NOTIFICATION_ADAPTERS = cast(
@@ -170,6 +176,12 @@ class NotificationSettings(metaclass=SingletonMeta):
         )
         self.NOTIFICATION_DEFAULT_FROM_EMAIL = cast(
             str, get_config("NOTIFICATION_DEFAULT_FROM_EMAIL", config)
+        )
+        self.NOTIFICATION_QUEUE_SERVICE = cast(
+            str | None, get_config("NOTIFICATION_QUEUE_SERVICE", config)
+        )
+        self.NOTIFICATION_SERVICE_FACTORY = cast(
+            str | None, get_config("NOTIFICATION_SERVICE_FACTORY", config)
         )
 
     def get_notification_model_cls(self):
