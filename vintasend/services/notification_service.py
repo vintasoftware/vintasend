@@ -51,6 +51,11 @@ from vintasend.services.notification_adapters.async_base import (
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_backends.filters import (
+    DEFAULT_BACKEND_FILTER_CAPABILITIES,
+    NotificationFilter,
+    NotificationOrderBy,
+)
 from vintasend.services.service_utils import (
     download_from_url,
     is_asyncio_context_function,
@@ -722,6 +727,66 @@ class NotificationService(Generic[A, B]):
         ):
             raise NotificationError("No in-app notification adapter found")
         return self.notification_backend.count_in_app_unread_notifications(user_id)
+
+    def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        """
+        Query notifications with a composable filter, ordering and pagination.
+
+        The filter supports ``and`` / ``or`` / ``not`` groups, scalar-or-list membership, string
+        lookups and inclusive date ranges. An empty filter (``{}``) matches every notification.
+        Both ``Notification`` and ``OneOffNotification`` are returned. See
+        ``BaseNotificationBackend.filter_notifications`` for the full semantics.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` matches everything)
+            page: int - the 1-indexed page number to get
+            page_size: int - the number of notifications per page
+            order_by: NotificationOrderBy | None - the primary sort field and direction
+
+        Returns:
+            Iterable[Notification | OneOffNotification] - the selected page of matches
+        """
+        return self.notification_backend.filter_notifications(
+            filter, page=page, page_size=page_size, order_by=order_by
+        )
+
+    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        """
+        Count notifications matching ``filter``, ignoring pagination.
+
+        This is the total a dashboard needs to render pagination; ``filter_notifications``
+        returns an ``Iterable`` that cannot be ``len()``-ed.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` counts everything)
+
+        Returns:
+            int - the number of matching notifications
+        """
+        return self.notification_backend.count_notifications(filter)
+
+    def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter capabilities the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER an
+        all-``True`` default, so every capability the backend does not mention comes back
+        ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
+        kept byte-identical to the TypeScript sibling so one dashboard consumes either.
+
+        Returns:
+            dict[str, bool] - the merged capability report
+        """
+        return {
+            **DEFAULT_BACKEND_FILTER_CAPABILITIES,
+            **self.notification_backend.get_filter_capabilities(),
+        }
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -1403,6 +1468,66 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ):
             raise NotificationError("No in-app notification adapter found")
         return await self.notification_backend.count_in_app_unread_notifications(user_id)
+
+    async def filter_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: NotificationOrderBy | None = None,
+    ) -> Iterable[Notification | OneOffNotification]:
+        """
+        Query notifications with a composable filter, ordering and pagination.
+
+        The filter supports ``and`` / ``or`` / ``not`` groups, scalar-or-list membership, string
+        lookups and inclusive date ranges. An empty filter (``{}``) matches every notification.
+        Both ``Notification`` and ``OneOffNotification`` are returned. See
+        ``AsyncIOBaseNotificationBackend.filter_notifications`` for the full semantics.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` matches everything)
+            page: int - the 1-indexed page number to get
+            page_size: int - the number of notifications per page
+            order_by: NotificationOrderBy | None - the primary sort field and direction
+
+        Returns:
+            Iterable[Notification | OneOffNotification] - the selected page of matches
+        """
+        return await self.notification_backend.filter_notifications(
+            filter, page=page, page_size=page_size, order_by=order_by
+        )
+
+    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+        """
+        Count notifications matching ``filter``, ignoring pagination.
+
+        This is the total a dashboard needs to render pagination; ``filter_notifications``
+        returns an ``Iterable`` that cannot be ``len()``-ed.
+
+        Parameters:
+            filter: NotificationFilter - the composable filter (``{}`` counts everything)
+
+        Returns:
+            int - the number of matching notifications
+        """
+        return await self.notification_backend.count_notifications(filter)
+
+    async def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter capabilities the configured backend supports.
+
+        The backend declares only what it *cannot* do; this merges that report OVER an
+        all-``True`` default, so every capability the backend does not mention comes back
+        ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
+        kept byte-identical to the TypeScript sibling so one dashboard consumes either.
+
+        Returns:
+            dict[str, bool] - the merged capability report
+        """
+        return {
+            **DEFAULT_BACKEND_FILTER_CAPABILITIES,
+            **await self.notification_backend.get_filter_capabilities(),
+        }
 
     async def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         """
