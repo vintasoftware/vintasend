@@ -1,4 +1,4 @@
-from unittest import TestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
@@ -32,7 +32,7 @@ class ImplementationTemplateBackendTestCase(TestCase):
             list(backend.get_all_pending_notifications())
 
 
-class ImplementationTemplateAsyncIOBackendTestCase(TestCase):
+class ImplementationTemplateAsyncIOBackendTestCase(IsolatedAsyncioTestCase):
     def test_subclasses_the_real_abc(self):
         assert issubclass(ImplementationTemplateAsyncIOBackend, AsyncIOBaseNotificationBackend)
 
@@ -48,3 +48,8 @@ class ImplementationTemplateAsyncIOBackendTestCase(TestCase):
     def test_stub_is_instantiable(self):
         backend = ImplementationTemplateAsyncIOBackend()
         assert isinstance(backend, AsyncIOBaseNotificationBackend)
+
+    async def test_calling_an_unimplemented_method_fails_loudly(self):
+        backend = ImplementationTemplateAsyncIOBackend()
+        with self.assertRaises(NotImplementedError):
+            await backend.get_all_pending_notifications()
