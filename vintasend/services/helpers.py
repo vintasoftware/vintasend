@@ -8,6 +8,10 @@ from vintasend.exceptions import (
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
+from vintasend.services.git_commit_sha_providers.asyncio_base import (
+    AsyncIOBaseGitCommitShaProvider,
+)
+from vintasend.services.git_commit_sha_providers.base import BaseGitCommitShaProvider
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -413,3 +417,83 @@ def get_asyncio_attachment_manager(
             f"Notifications Attachment Manager Error: {import_str_with_fallback} is not a valid AsyncIO attachment manager"
         )
     return cast(AsyncIOBaseAttachmentManager, attachment_manager)
+
+
+def get_git_commit_sha_provider(
+    git_commit_sha_provider_import_str: str | None,
+    git_commit_sha_provider_kwargs: dict | None = None,
+    config: Any = None,
+) -> BaseGitCommitShaProvider | None:
+    app_settings = NotificationSettings(config)
+    import_str_with_fallback = (
+        git_commit_sha_provider_import_str
+        if git_commit_sha_provider_import_str is not None
+        else app_settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER
+    )
+
+    if not import_str_with_fallback:
+        return None
+
+    try:
+        git_commit_sha_provider_cls = _import_class(import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise ValueError(
+            f"Notifications Git Commit Sha Provider Error: Could not import {import_str_with_fallback}"
+        ) from e
+
+    try:
+        git_commit_sha_provider = (
+            git_commit_sha_provider_cls(**git_commit_sha_provider_kwargs)
+            if git_commit_sha_provider_kwargs
+            else git_commit_sha_provider_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(
+            f"Notifications Git Commit Sha Provider Error: Could not instantiate {import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(git_commit_sha_provider, BaseGitCommitShaProvider):
+        raise ValueError(
+            f"Notifications Git Commit Sha Provider Error: {import_str_with_fallback} is not a valid git commit sha provider"
+        )
+    return cast(BaseGitCommitShaProvider, git_commit_sha_provider)
+
+
+def get_asyncio_git_commit_sha_provider(
+    git_commit_sha_provider_import_str: str | None,
+    git_commit_sha_provider_kwargs: dict | None = None,
+    config: Any = None,
+) -> AsyncIOBaseGitCommitShaProvider | None:
+    app_settings = NotificationSettings(config)
+    import_str_with_fallback = (
+        git_commit_sha_provider_import_str
+        if git_commit_sha_provider_import_str is not None
+        else app_settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER
+    )
+
+    if not import_str_with_fallback:
+        return None
+
+    try:
+        git_commit_sha_provider_cls = _import_class(import_str_with_fallback)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise ValueError(
+            f"Notifications Git Commit Sha Provider Error: Could not import {import_str_with_fallback}"
+        ) from e
+
+    try:
+        git_commit_sha_provider = (
+            git_commit_sha_provider_cls(**git_commit_sha_provider_kwargs)
+            if git_commit_sha_provider_kwargs
+            else git_commit_sha_provider_cls()
+        )
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(
+            f"Notifications Git Commit Sha Provider Error: Could not instantiate {import_str_with_fallback}"
+        ) from e
+
+    if not isinstance(git_commit_sha_provider, AsyncIOBaseGitCommitShaProvider):
+        raise ValueError(
+            f"Notifications Git Commit Sha Provider Error: {import_str_with_fallback} is not a valid AsyncIO git commit sha provider"
+        )
+    return cast(AsyncIOBaseGitCommitShaProvider, git_commit_sha_provider)

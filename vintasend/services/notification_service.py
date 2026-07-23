@@ -23,6 +23,7 @@ else:
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     DuplicateNotificationAdapterError,
+    GitCommitShaReassignmentError,
     NotificationContextGenerationError,
     NotificationError,
     NotificationMarkFailedError,
@@ -42,12 +43,18 @@ from vintasend.services.dataclasses import (
     OneOffNotification,
     UpdateNotificationKwargs,
 )
+from vintasend.services.git_commit_sha_providers.asyncio_base import (
+    AsyncIOBaseGitCommitShaProvider,
+)
+from vintasend.services.git_commit_sha_providers.base import BaseGitCommitShaProvider
 from vintasend.services.helpers import (
     get_asyncio_attachment_manager,
+    get_asyncio_git_commit_sha_provider,
     get_asyncio_notification_adapters,
     get_asyncio_notification_backend,
     get_asyncio_notification_queue_service,
     get_attachment_manager,
+    get_git_commit_sha_provider,
     get_notification_adapters,
     get_notification_backend,
     get_notification_queue_service,
@@ -77,6 +84,7 @@ from vintasend.services.notification_queue_services.base import BaseNotification
 from vintasend.services.service_utils import (
     is_asyncio_context_function,
     is_sync_context_function,
+    normalize_git_commit_sha,
     validate_attachments,
     validate_email_or_phone,
 )
@@ -175,6 +183,7 @@ class NotificationService(Generic[A, B]):
         config: Any = None,
         notification_queue_service: BaseNotificationQueueService | str | None = None,
         attachment_manager: BaseAttachmentManager | str | None = None,
+        git_commit_sha_provider: BaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
     ):
         """
@@ -188,6 +197,10 @@ class NotificationService(Generic[A, B]):
             notifications to a worker. Accepts an instance or an import string; when it is
             None, `NOTIFICATION_QUEUE_SERVICE` is used, and background sending is simply
             unavailable if that is unset too.
+        :param git_commit_sha_provider: resolves the git commit SHA recorded on a
+            notification at send time. Accepts an instance or an import string; when it is
+            None, `NOTIFICATION_GIT_COMMIT_SHA_PROVIDER` is used, and no SHA is ever
+            resolved or written if that is unset too -- the feature is simply off.
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
@@ -231,6 +244,16 @@ class NotificationService(Generic[A, B]):
             self.attachment_manager = get_attachment_manager(attachment_manager, None, config)
         if self.attachment_manager is not None and supports_attachments(self.notification_backend):
             self.notification_backend.inject_attachment_manager(self.attachment_manager)
+
+        # Resolve the git commit SHA provider (instance, dotted path, or the
+        # NOTIFICATION_GIT_COMMIT_SHA_PROVIDER setting). None means the feature is off: no
+        # SHA is ever resolved or written -- see _resolve_and_persist_git_commit_sha.
+        if isinstance(git_commit_sha_provider, BaseGitCommitShaProvider):
+            self.git_commit_sha_provider: BaseGitCommitShaProvider | None = git_commit_sha_provider
+        else:
+            self.git_commit_sha_provider = get_git_commit_sha_provider(
+                git_commit_sha_provider, None, config
+            )
 
         if notification_adapters is None or self._check_is_adapters_tuple_iterable(
             notification_adapters
@@ -313,6 +336,41 @@ class NotificationService(Generic[A, B]):
         """
         self.notification_queue_service = queue_service
 
+    def _resolve_and_persist_git_commit_sha(
+        self, notification: Notification | OneOffNotification
+    ) -> None:
+        """Resolve the current git commit SHA and store it if it differs from what is stored.
+
+        Called at the top of both send() and delayed_send() so foreground and background
+        deliveries record the revision that actually handled this execution. A no-op when no
+        provider is configured. A provider that raises is caught and logged, then treated
+        the same as a None return -- audit metadata is never worth failing a delivery over.
+        A non-null but malformed SHA is a configuration error and propagates
+        InvalidGitCommitShaError rather than being swallowed.
+        """
+        if self.git_commit_sha_provider is None:
+            return
+
+        try:
+            resolved_sha = self.git_commit_sha_provider.get_current_git_commit_sha()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Git commit SHA provider raised while resolving the SHA for notification "
+                "%s; treating it as unknown for this execution",
+                notification.id,
+            )
+            return
+
+        if resolved_sha is None:
+            return
+
+        normalized_sha = normalize_git_commit_sha(resolved_sha)
+        if normalized_sha == notification.git_commit_sha:
+            return
+
+        self.notification_backend.store_git_commit_sha(notification.id, normalized_sha)
+        notification.git_commit_sha = normalized_sha
+
     def send(
         self,
         notification: Notification | OneOffNotification,
@@ -325,6 +383,10 @@ class NotificationService(Generic[A, B]):
         notification id is handed to the configured queue service and a worker delivers it
         later through delayed_send, so no context is generated and the notification's status
         is left untouched on that path.
+
+        If a git commit SHA provider is configured, this always resolves and (when it
+        differs from what is stored) persists the current git commit SHA first, regardless
+        of raise_on_failed_send. A malformed, non-null SHA raises InvalidGitCommitShaError.
 
         With raise_on_failed_send=False (the default) every failure below is logged and the
         remaining adapters still run. With raise_on_failed_send=True this method may raise:
@@ -343,6 +405,8 @@ class NotificationService(Generic[A, B]):
                 a stored ``context_used`` verbatim; regular callers leave this ``None`` so
                 context is generated as usual.
         """
+        self._resolve_and_persist_git_commit_sha(notification)
+
         # Context is generated lazily below, and only for adapters that deliver in this
         # process: the enqueue branch must not pay for a context the worker will generate
         # again anyway. A caller such as resend_notification may pass a context in, in which
@@ -583,6 +647,9 @@ class NotificationService(Generic[A, B]):
         This method may raise the following exceptions:
             * TenantReassignmentError if ``tenant`` is present in kwargs -- a
               notification's tenant cannot be reassigned after creation.
+            * GitCommitShaReassignmentError if ``git_commit_sha`` is present in kwargs --
+              it is system-managed and only ever written by NotificationService at send
+              time.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -594,6 +661,10 @@ class NotificationService(Generic[A, B]):
         """
         if "tenant" in kwargs:
             raise TenantReassignmentError("A notification's tenant cannot be reassigned")
+        if "git_commit_sha" in kwargs:
+            raise GitCommitShaReassignmentError(
+                "A notification's git_commit_sha is system-managed and cannot be set directly"
+            )
         notification = self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -1053,6 +1124,11 @@ class NotificationService(Generic[A, B]):
         Note that NotificationNotFoundError propagates regardless of raise_on_failed_send:
         an id that resolves to nothing is a wiring or retention problem, not a failed send.
 
+        If a git commit SHA provider is configured, this always resolves and (when it
+        differs from what is stored) persists the current git commit SHA before delivering,
+        so the worker records the revision that actually sent the notification. A malformed,
+        non-null SHA raises InvalidGitCommitShaError.
+
         Parameters:
             notification_id: int | str | uuid.UUID - the id of the notification to deliver
         """
@@ -1065,6 +1141,11 @@ class NotificationService(Generic[A, B]):
                 notification.status,
             )
             return
+
+        # Resolved here, after the already-delivered check: the SHA records the revision
+        # that sends the notification, so a skipped redelivery of an already-sent row must
+        # not overwrite it with a later, unrelated revision.
+        self._resolve_and_persist_git_commit_sha(notification)
 
         context: NotificationContextDict | None = None
         background_adapter_found = False
@@ -1164,6 +1245,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         config: Any = None,
         notification_queue_service: AsyncIOBaseNotificationQueueService | str | None = None,
         attachment_manager: AsyncIOBaseAttachmentManager | str | None = None,
+        git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
     ):
         """
@@ -1177,6 +1259,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notifications to a worker. Accepts an instance or an import string; when it is
             None, `NOTIFICATION_QUEUE_SERVICE` is used, and background sending is simply
             unavailable if that is unset too.
+        :param git_commit_sha_provider: resolves the git commit SHA recorded on a
+            notification at send time. Accepts an instance or an import string; when it is
+            None, `NOTIFICATION_GIT_COMMIT_SHA_PROVIDER` is used, and no SHA is ever
+            resolved or written if that is unset too -- the feature is simply off.
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
@@ -1226,6 +1312,18 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             self.notification_backend
         ):
             self.notification_backend.inject_attachment_manager(self.attachment_manager)
+
+        # Resolve the git commit SHA provider (instance, dotted path, or the
+        # NOTIFICATION_GIT_COMMIT_SHA_PROVIDER setting). None means the feature is off: no
+        # SHA is ever resolved or written -- see _resolve_and_persist_git_commit_sha.
+        if isinstance(git_commit_sha_provider, AsyncIOBaseGitCommitShaProvider):
+            self.git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | None = (
+                git_commit_sha_provider
+            )
+        else:
+            self.git_commit_sha_provider = get_asyncio_git_commit_sha_provider(
+                git_commit_sha_provider, None, config
+            )
 
         if notification_adapters is None or self._check_is_adapters_tuple_iterable(
             notification_adapters
@@ -1310,6 +1408,43 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         self.notification_queue_service = queue_service
 
+    async def _resolve_and_persist_git_commit_sha(
+        self,
+        notification: Notification | OneOffNotification,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        """Resolve the current git commit SHA and store it if it differs from what is stored.
+
+        Called at the top of both send() and delayed_send() so foreground and background
+        deliveries record the revision that actually handled this execution. A no-op when no
+        provider is configured. A provider that raises is caught and logged, then treated
+        the same as a None return -- audit metadata is never worth failing a delivery over.
+        A non-null but malformed SHA is a configuration error and propagates
+        InvalidGitCommitShaError rather than being swallowed.
+        """
+        if self.git_commit_sha_provider is None:
+            return
+
+        try:
+            resolved_sha = await self.git_commit_sha_provider.get_current_git_commit_sha()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Git commit SHA provider raised while resolving the SHA for notification "
+                "%s; treating it as unknown for this execution",
+                notification.id,
+            )
+            return
+
+        if resolved_sha is None:
+            return
+
+        normalized_sha = normalize_git_commit_sha(resolved_sha)
+        if normalized_sha == notification.git_commit_sha:
+            return
+
+        await self.notification_backend.store_git_commit_sha(notification.id, normalized_sha, lock)
+        notification.git_commit_sha = normalized_sha
+
     async def send(
         self,
         notification: Notification | OneOffNotification,
@@ -1323,6 +1458,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Their notification id is handed to the configured queue service and a worker
         delivers it later through delayed_send, so no context is generated and the
         notification's status is left untouched on that path.
+
+        If a git commit SHA provider is configured, this always resolves and (when it
+        differs from what is stored) persists the current git commit SHA first, regardless
+        of raise_on_failed_send. A malformed, non-null SHA raises InvalidGitCommitShaError.
 
         With raise_on_failed_send=False (the default) every failure below is logged and the
         remaining adapters still run. With raise_on_failed_send=True this method may raise:
@@ -1343,6 +1482,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 a stored ``context_used`` verbatim; regular callers leave this ``None`` so
                 context is generated as usual.
         """
+        await self._resolve_and_persist_git_commit_sha(notification, lock)
+
         # Context is generated lazily below, and only for adapters that deliver in this
         # process: the enqueue branch must not pay for a context the worker will generate
         # again anyway. A caller such as resend_notification may pass a context in, in which
@@ -1588,6 +1729,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         This method may raise the following exceptions:
             * TenantReassignmentError if ``tenant`` is present in kwargs -- a
               notification's tenant cannot be reassigned after creation.
+            * GitCommitShaReassignmentError if ``git_commit_sha`` is present in kwargs --
+              it is system-managed and only ever written by AsyncIONotificationService at
+              send time.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -1599,6 +1743,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         if "tenant" in kwargs:
             raise TenantReassignmentError("A notification's tenant cannot be reassigned")
+        if "git_commit_sha" in kwargs:
+            raise GitCommitShaReassignmentError(
+                "A notification's git_commit_sha is system-managed and cannot be set directly"
+            )
         notification = await self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -2076,6 +2224,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Note that NotificationNotFoundError propagates regardless of raise_on_failed_send:
         an id that resolves to nothing is a wiring or retention problem, not a failed send.
 
+        If a git commit SHA provider is configured, this always resolves and (when it
+        differs from what is stored) persists the current git commit SHA before delivering,
+        so the worker records the revision that actually sent the notification. A malformed,
+        non-null SHA raises InvalidGitCommitShaError.
+
         Parameters:
             notification_id: int | str | uuid.UUID - the id of the notification to deliver
         """
@@ -2088,6 +2241,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 notification.status,
             )
             return
+
+        # Resolved here, after the already-delivered check: the SHA records the revision
+        # that sends the notification, so a skipped redelivery of an already-sent row must
+        # not overwrite it with a later, unrelated revision.
+        await self._resolve_and_persist_git_commit_sha(notification)
 
         context: NotificationContextDict | None = None
         background_adapter_found = False

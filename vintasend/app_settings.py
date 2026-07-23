@@ -15,6 +15,7 @@ class NotificationSettingsDict(TypedDict):
     NOTIFICATION_ATTACHMENT_MANAGER: str | None
     NOTIFICATION_QUEUE_SERVICE: str | None
     NOTIFICATION_SERVICE_FACTORY: str | None
+    NOTIFICATION_GIT_COMMIT_SHA_PROVIDER: str | None
 
 
 DEFAULT_SETTINGS: NotificationSettingsDict = {
@@ -30,6 +31,9 @@ DEFAULT_SETTINGS: NotificationSettingsDict = {
     "NOTIFICATION_ATTACHMENT_MANAGER": None,
     "NOTIFICATION_QUEUE_SERVICE": None,
     "NOTIFICATION_SERVICE_FACTORY": None,
+    # No default git commit SHA provider ships in core -- host applications supply their
+    # own. Unset means the feature is off: no SHA is ever resolved or written.
+    "NOTIFICATION_GIT_COMMIT_SHA_PROVIDER": None,
 }
 
 
@@ -163,6 +167,7 @@ class NotificationSettings(metaclass=SingletonMeta):
     NOTIFICATION_ATTACHMENT_MANAGER: str | None
     NOTIFICATION_QUEUE_SERVICE: str | None
     NOTIFICATION_SERVICE_FACTORY: str | None
+    NOTIFICATION_GIT_COMMIT_SHA_PROVIDER: str | None
 
     def __init__(self, config: Any = None):
         self.NOTIFICATION_ADAPTERS = cast(
@@ -190,6 +195,9 @@ class NotificationSettings(metaclass=SingletonMeta):
         )
         self.NOTIFICATION_SERVICE_FACTORY = cast(
             str | None, get_config("NOTIFICATION_SERVICE_FACTORY", config)
+        )
+        self.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER = cast(
+            str | None, get_config("NOTIFICATION_GIT_COMMIT_SHA_PROVIDER", config)
         )
 
     def get_notification_model_cls(self):
