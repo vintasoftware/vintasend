@@ -1,17 +1,22 @@
-[tool.poetry]
+[project]
 name = "vintasend"
 version = "2.0.0"
 description = "A flexible package for implementing transactional notifications"
-authors = ["Hugo bessa <hugo@vinta.com.br>"]
+authors = [{ name = "Hugo bessa", email = "hugo@vinta.com.br" }]
 license = "MIT"
 readme = "README.md"
+requires-python = ">=3.10,<3.15"
+# Constraints stay under [tool.poetry.dependencies] to keep caret syntax, which
+# is not valid PEP 621. 'dynamic' tells build tooling the real list lives there.
+dynamic = ["dependencies"]
+
+[tool.poetry]
 packages = [{ include = "vintasend" }]
 include = [
   { path = "vintasend/py.typed", format = "wheel" }
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.15"
 typing-extensions = "^4.15.0"
 packaging = "^26.2"
 requests = "^2.34.2"
