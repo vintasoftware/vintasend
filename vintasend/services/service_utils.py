@@ -3,7 +3,11 @@ import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Coroutine, TypeGuard
 
-from vintasend.exceptions import InvalidOneOffNotificationRecipientError, NotificationError
+from vintasend.exceptions import (
+    InvalidGitCommitShaError,
+    InvalidOneOffNotificationRecipientError,
+    NotificationError,
+)
 from vintasend.services.dataclasses import NotificationAttachment, is_attachment_reference
 
 
@@ -17,6 +21,7 @@ if TYPE_CHECKING:
 # with `^...$` here would let a trailing "\n" through undetected, unlike the reference behavior.
 _EMAIL_PATTERN = re.compile(r".+@.+\..+")
 _PHONE_PATTERN = re.compile(r"\+?[0-9]{10,15}")
+_GIT_COMMIT_SHA_PATTERN = re.compile(r"[a-f0-9]{40}")
 
 
 def validate_email_or_phone(email_or_phone: str) -> None:
@@ -50,6 +55,23 @@ def validate_attachments(
             raise NotificationError(f"Unsupported attachment type: {type(attachment).__name__}")
 
     return attachments
+
+
+def normalize_git_commit_sha(sha: str) -> str:
+    """Trim, lowercase and validate a git commit SHA, raising on a malformed value.
+
+    A valid SHA is exactly 40 hexadecimal characters once trimmed and lowercased --
+    matches `^[a-f0-9]{40}$` via `fullmatch`. Anything else (a short/abbreviated SHA, a
+    branch name, an empty string) raises `InvalidGitCommitShaError` rather than persisting
+    garbage. This never receives `None` -- a provider returning `None` is handled by the
+    caller before normalization is attempted.
+    """
+    normalized = sha.strip().lower()
+    if not _GIT_COMMIT_SHA_PATTERN.fullmatch(normalized):
+        raise InvalidGitCommitShaError(
+            f"Invalid git commit SHA: {sha!r} is not 40 hexadecimal characters"
+        )
+    return normalized
 
 
 def is_asyncio_context_function(
