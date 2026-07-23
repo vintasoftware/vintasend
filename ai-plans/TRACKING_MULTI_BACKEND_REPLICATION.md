@@ -3,7 +3,7 @@
 - **Feature**: Multi-Backend Replication
 - **Plan**: `ai-plans/2026-07-23-MULTI_BACKEND_REPLICATION_IMPLEMENTATION_PLAN.md`
 - **Started**: 2026-07-23
-- **Last updated**: 2026-07-23 (Phase 5 complete)
+- **Last updated**: 2026-07-23 (all phases complete)
 - **Feature flag**: none (inert unless a host passes `additional_backends`)
 
 ## Run options
@@ -74,13 +74,18 @@
 - **Review**: 0 BLOCKER, 1 SHOULD-FIX (unvalidated batch_size → silent no-op) + 2 NIT (redundant read left per reviewer; quiescent-source doc added) — SHOULD-FIX + doc NIT fixed in-phase.
 - **Gate**: ruff clean; mypy clean (76 files); full suite 646 passed, 2 skipped, 1 failed (clone-test artifact only).
 
-## Current phase
+### Phase 6 — Documentation ✅
 
-- Phase 6 — Documentation
+- **Implementer model**: claude-sonnet-5 (Tier 2) · **Reviewer**: claude-opus-4-8 (Tier 4)
+- **Commits**: `Document multi-backend configuration in the README`; `Record multi-backend in the 2.0.0 release notes`; `Note the replication queue stub in the template README`; `Deslop multi-backend comments and docstrings`
+- **Files**: `README.md` (Multi-Backend Configuration section, absorbing the Phase 3 Queued Replication subsection), `RELEASE_NOTES.md` (folded into the unreleased 2.0.0 section — no new version heading), `templates/.../README.md` (+ `test_template_checklist.py` `_ABC_LOCATIONS` data for the new checklist block), comment-only deslop in `notification_service.py`/`fake_backend.py`/two test files
+- **Summary**: README documents primary+additional backends, identifier resolution, read routing, inline vs queued replication + fallback, the monitoring/repair surface (verify/stats/process_replication/migrate), and a plain failure-semantics statement (primary propagates, replicas best-effort, no read-your-writes, no failover). RELEASE_NOTES entry folded into 2.0.0: non-breaking (concrete backend methods), the deliberate documented divergence from abstract-by-default + rationale, backwards-compatibility notes for downstream backends, and the read-then-write fidelity limitation. `pyproject.toml` verified at `2.0.0` (unchanged — corrected earlier by the main-merge). Template README gained the replication-queue stub note. Deslop: 5 comment/docstring rewrites, no behavior change.
+- **Review**: 0 findings — every documented API cross-checked against source; RELEASE_NOTES confirmed folded (no new heading); no behavior change.
+- **Gate**: ruff clean; mypy clean (76 files); full suite 646 passed, 2 skipped, 1 failed (clone-test artifact only).
 
 ## Remaining phases
 
-- Phase 6 — Documentation (Tier 2) — fold into unreleased 2.0.0 notes; VERIFY pyproject=2.0.0 (already corrected by the merge); template-README note
+- _(none — all executable phases complete)_
 
 ## Deferred phases
 
