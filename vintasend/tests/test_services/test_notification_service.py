@@ -3,7 +3,6 @@ import inspect
 import subprocess
 import sys
 import uuid
-from types import MappingProxyType
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
 
@@ -19,11 +18,12 @@ from vintasend.exceptions import (
     NotificationMarkFailedError,
     NotificationMarkSentError,
     NotificationNotFoundError,
+    NotificationQueueServiceMissingError,
     NotificationSendError,
     NotificationUpdateError,
+    TenantReassignmentError,
 )
 from vintasend.services.dataclasses import Notification, NotificationContextDict, OneOffNotification
-from vintasend.services.notification_adapters.async_base import NotificationDict
 from vintasend.services.notification_adapters.stubs.fake_adapter import (
     FakeAsyncEmailAdapter,
     FakeAsyncIOEmailAdapter,
@@ -33,6 +33,7 @@ from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
     FakeFileBackend,
 )
+from vintasend.services.notification_queue_services.stubs.fake_queue_service import FakeQueueService
 from vintasend.services.notification_service import (
     AsyncIONotificationService,
     NotificationService,
@@ -41,59 +42,92 @@ from vintasend.services.notification_service import (
 from vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer import (
     FakeTemplateRenderer,
 )
+from vintasend.tests.utils import _reset_notification_settings_singleton
 
 
-def notification_to_dict(notification: "Notification") -> NotificationDict:
-    return NotificationDict(
-        id=notification.id if not isinstance(notification.id, uuid.UUID) else str(notification.id),
-        user_id=notification.user_id
-        if not isinstance(notification.user_id, uuid.UUID)
-        else str(notification.user_id),
-        notification_type=notification.notification_type,
-        title=notification.title,
-        body_template=notification.body_template,
-        context_name=notification.context_name,
-        context_kwargs={
-            k: v if not isinstance(v, uuid.UUID) else str(v)
-            for k, v in notification.context_kwargs.items()
-        },
-        send_after=notification.send_after.isoformat() if notification.send_after else None,
-        subject_template=notification.subject_template,
-        preheader_template=notification.preheader_template,
-        status=notification.status,
-        context_used=notification.context_used,
-        adapter_extra_parameters=notification.adapter_extra_parameters,
-    )
+CONTEXT_GENERATION_TIMESTAMPS: list[str] = []
 
 
-def _reset_notification_settings_singleton(test_case: TestCase) -> None:
-    """Clear the NotificationSettings singleton for one test, then restore it.
+@register_context("delivery_time_context")
+def delivery_time_context() -> NotificationContextDict:
+    """Context generator that reports when it ran, to pin down *when* context is generated."""
+    generated_at = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+    CONTEXT_GENERATION_TIMESTAMPS.append(generated_at)
+    return NotificationContextDict({"generated_at": generated_at})
 
-    NotificationSettings uses SingletonMeta: the first construction wins, and every later
-    `config` argument is ignored. SingletonMeta.__call__ stores the built instance on an
-    `_instances` attribute it sets directly on the class being constructed. Once
-    NotificationSettings has been built once, that per-class attribute shadows the empty
-    default living on SingletonMeta itself, so clearing SingletonMeta's own `_instances` has
-    no effect at that point. NotificationSettings's own `_instances` attribute is the one
-    that must be cleared, and it must be restored after the test. This state is process-global,
-    so leaking it would make other tests order-dependent.
+
+class PreTenantFakeFileBackend(FakeFileBackend):
+    """Regression fixture modeling a downstream backend built against vintasend <=1.4.0.
+
+    ``persist_notification`` intentionally omits the ``tenant`` keyword Phase 1 added, so a
+    caller that forwards ``tenant`` unconditionally raises ``TypeError`` against it -- exactly
+    what a real pre-1.5 backend would do.
     """
-    sentinel = object()
-    original = vars(NotificationSettings).get("_instances", sentinel)
 
-    def _restore() -> None:
-        if original is sentinel:
-            if "_instances" in vars(NotificationSettings):
-                delattr(NotificationSettings, "_instances")
-        else:
-            NotificationSettings._instances = original
+    def persist_notification(  # type: ignore[override]
+        self,
+        user_id: int | str | uuid.UUID,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None,
+        subject_template: str,
+        preheader_template: str,
+        adapter_extra_parameters: dict | None = None,
+        attachments: list | None = None,
+    ) -> Notification:
+        return super().persist_notification(
+            user_id=user_id,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template,
+            preheader_template=preheader_template,
+            adapter_extra_parameters=adapter_extra_parameters,
+            attachments=attachments,
+        )
 
-    test_case.addCleanup(_restore)
-    NotificationSettings._instances = MappingProxyType({})
+
+class PreTenantFakeAsyncIOFileBackend(FakeAsyncIOFileBackend):
+    """AsyncIO twin of ``PreTenantFakeFileBackend``, see its docstring."""
+
+    async def persist_notification(  # type: ignore[override]
+        self,
+        user_id: int | str | uuid.UUID,
+        notification_type: str,
+        title: str,
+        body_template: str,
+        context_name: str,
+        context_kwargs: dict[str, uuid.UUID | str | int],
+        send_after: datetime.datetime | None,
+        subject_template: str,
+        preheader_template: str,
+        adapter_extra_parameters: dict | None = None,
+        attachments: list | None = None,
+    ) -> Notification:
+        return await super().persist_notification(
+            user_id=user_id,
+            notification_type=notification_type,
+            title=title,
+            body_template=body_template,
+            context_name=context_name,
+            context_kwargs=context_kwargs,
+            send_after=send_after,
+            subject_template=subject_template,
+            preheader_template=preheader_template,
+            adapter_extra_parameters=adapter_extra_parameters,
+            attachments=attachments,
+        )
 
 
 class NotificationServiceTestCase(TestCase):
     def setup_method(self, method):
+        CONTEXT_GENERATION_TIMESTAMPS.clear()
         register_context("test_context")(self.create_notification_context)
         self.notification_service = NotificationService(
             notification_adapters=[
@@ -113,6 +147,32 @@ class NotificationServiceTestCase(TestCase):
         if test != "test":
             raise ValueError()
         return NotificationContextDict({"test": "test"})
+
+    def build_service(self, **kwargs) -> NotificationService:
+        """Build a service on the shared test backend, overriding whatever the test needs.
+
+        Most callers pass raise_on_failed_send=True: send() swallows and logs failures by
+        default since 2.0, so a test that wants to assert on the exception has to opt back
+        into the 1.x behaviour.
+        """
+        kwargs.setdefault(
+            "notification_adapters",
+            [
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+        )
+        kwargs.setdefault(
+            "notification_backend",
+            "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
+        )
+        kwargs.setdefault(
+            "notification_backend_kwargs",
+            {"database_file_name": "service-tests-notifications.json"},
+        )
+        return NotificationService(**kwargs)
 
     def test_sends_without_context(self):
         notification = Notification(
@@ -199,19 +259,55 @@ class NotificationServiceTestCase(TestCase):
         backend.notifications.append(notification)
         backend._store_notifications()
 
-        self.notification_service = NotificationService(
+        self.notification_service = self.build_service(
             notification_adapters=[
                 (
                     "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
                     "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRendererWithException",
                 ),
             ],
-            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
-            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
+            raise_on_failed_send=True,
         )
 
         with pytest.raises(NotificationSendError):
             self.notification_service.send(notification)
+
+    def test_sends_with_rendering_error_without_raise_on_failed_send(self):
+        """The 2.0 default: a rendering failure is logged and marked failed, never raised."""
+        notification = Notification(
+            id=str(uuid.uuid4()),
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            status=NotificationStatus.PENDING_SEND.value,
+        )
+        backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        backend.notifications.append(notification)
+        backend._store_notifications()
+
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRendererWithException",
+                ),
+            ],
+        )
+
+        with patch("vintasend.services.notification_service.logger") as mocked_logger:
+            notification_service.send(notification)
+
+        mocked_logger.exception.assert_called_once()
+        assert (
+            notification_service.get_notification(notification.id).status
+            == NotificationStatus.FAILED.value
+        )
 
     def test_sends_with_context(self):
         notification = Notification(
@@ -337,10 +433,124 @@ class NotificationServiceTestCase(TestCase):
         assert len(self.notification_service.notification_backend.notifications) == 1
         assert one_off_notification.email_or_phone == "+1234567890"
 
+    def test_create_notification_persists_tenant(self):
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+        self.notification_service.mark_read(notification.id)
+
+        assert notification.tenant == "tenant-a"
+
+        reloaded_backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        reloaded_notification = reloaded_backend.get_notification(notification.id)
+        assert reloaded_notification.tenant == "tenant-a"
+        assert reloaded_notification.sent_at is not None
+        assert reloaded_notification.read_at is not None
+
+    def test_create_notification_without_tenant_defaults_to_none(self):
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert notification.tenant is None
+
+    def test_create_notification_without_tenant_is_compatible_with_pre_tenant_backend(self):
+        """A caller that never passes ``tenant`` must not forward it to the backend.
+
+        Guards against the service unconditionally forwarding ``tenant=tenant`` to
+        ``persist_notification``, which would raise ``TypeError`` against any downstream
+        backend implemented before the ``tenant`` keyword existed -- even for callers who
+        never use tenants at all.
+        """
+        backend = PreTenantFakeFileBackend(database_file_name="service-tests-notifications.json")
+        notification_service = NotificationService(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_backend=backend,
+        )
+
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert notification.tenant is None
+
+    def test_create_one_off_notification_persists_tenant(self):
+        one_off_notification = self.notification_service.create_one_off_notification(
+            email_or_phone="test@example.com",
+            first_name="John",
+            last_name="Doe",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-Off Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+        self.notification_service.mark_read(one_off_notification.id)
+
+        assert one_off_notification.tenant == "tenant-a"
+
+        reloaded_backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        reloaded_notification = reloaded_backend.get_notification(one_off_notification.id)
+        assert reloaded_notification.tenant == "tenant-a"
+        assert reloaded_notification.sent_at is not None
+        assert reloaded_notification.read_at is not None
+
+    def test_create_one_off_notification_without_tenant_defaults_to_none(self):
+        one_off_notification = self.notification_service.create_one_off_notification(
+            email_or_phone="test@example.com",
+            first_name="John",
+            last_name="Doe",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-Off Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert one_off_notification.tenant is None
+
     @patch(
         "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_sent"
     )
     def test_create_notification_with_failing_mark_as_sent(self, mock_mark_pending_as_sent):
+        self.notification_service = self.build_service(raise_on_failed_send=True)
         assert len(self.notification_service.notification_backend.notifications) == 0
         mock_mark_pending_as_sent.side_effect = NotificationUpdateError()
 
@@ -361,15 +571,14 @@ class NotificationServiceTestCase(TestCase):
         "vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend.mark_pending_as_failed"
     )
     def test_create_notification_with_failing_mark_as_failed(self, mock_mark_pending_as_failed):
-        self.notification_service = NotificationService(
+        self.notification_service = self.build_service(
             notification_adapters=[
                 (
                     "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter",
                     "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRendererWithException",
                 ),
             ],
-            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
-            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
+            raise_on_failed_send=True,
         )
 
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -489,6 +698,56 @@ class NotificationServiceTestCase(TestCase):
 
         assert updated_notification.send_after is None
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+
+    def test_update_notification_with_tenant_raises_tenant_reassignment_error(self):
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+
+        with pytest.raises(TenantReassignmentError):
+            self.notification_service.update_notification(
+                notification_id=notification.id,
+                tenant="tenant-b",  # type: ignore[call-arg]
+            )
+
+        unchanged_notification = self.notification_service.get_notification(notification.id)
+        assert unchanged_notification.tenant == "tenant-a"
+
+    def test_update_notification_with_tenant_via_raw_kwargs_raises(self):
+        """Even bypassing the TypedDict via a plain dict must still raise.
+
+        UpdateNotificationKwargs is not enforced at runtime, so update_notification must
+        check the raw kwargs dict for "tenant" rather than relying on the TypedDict.
+        """
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+        untyped_kwargs: dict = {"title": "New title", "tenant": "tenant-b"}
+
+        with pytest.raises(TenantReassignmentError):
+            self.notification_service.update_notification(notification.id, **untyped_kwargs)
+
+        unchanged_notification = self.notification_service.get_notification(notification.id)
+        assert unchanged_notification.tenant == "tenant-a"
+        assert unchanged_notification.title == "Test Notification"
 
     def test_send_pending_notifications(self):
         send_after = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1)
@@ -725,6 +984,44 @@ class NotificationServiceTestCase(TestCase):
         retrieved_notification = self.notification_service.get_notification(notification.id)
         assert retrieved_notification.status == NotificationStatus.READ.value
 
+    def test_mark_read_sets_read_at(self):
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+        assert notification.read_at is None
+
+        self.notification_service.mark_read(notification.id)
+
+        retrieved_notification = self.notification_service.get_notification(notification.id)
+        assert retrieved_notification.read_at is not None
+
+    def test_sent_at_is_none_until_sent_then_set(self):
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+        assert notification.sent_at is None
+
+        self.notification_service.send(notification)
+
+        sent_notification = self.notification_service.get_notification(notification.id)
+        assert sent_notification.sent_at is not None
+
     def test_get_in_app_unread_without_an_in_app_adapter_configured(self):
         self.notification_service.create_notification(
             user_id=1,
@@ -834,6 +1131,8 @@ class NotificationServiceTestCase(TestCase):
         assert {n.id for n in result} == {n.id for n in created}
         assert all(n.status == NotificationStatus.READ.value for n in result)
         assert service.get_in_app_unread_count(user_id=1) == 0
+        # One bulk call must stamp a single, shared read_at across every row it touches.
+        assert len({n.read_at for n in result}) == 1
 
     def test_mark_read_bulk_is_idempotent(self):
         service = self._in_app_service()
@@ -869,8 +1168,30 @@ class NotificationServiceTestCase(TestCase):
         assert {n.id for n in result} == {already_read.id, sent.id}
         assert all(n.status == NotificationStatus.READ.value for n in result)
 
+    def test_mark_read_bulk_sets_read_at_on_affected_rows_only(self):
+        service = self._in_app_service()
+        already_read = self._create_in_app(service)
+        service.mark_read(already_read.id)
+        already_read_at = service.get_notification(already_read.id).read_at
+
+        newly_read = self._create_in_app(service)
+        skipped = self._create_in_app(service)
+        assert newly_read.read_at is None
+        assert skipped.read_at is None
+
+        result = list(service.mark_read_bulk([already_read.id, newly_read.id]))
+
+        assert {n.id for n in result} == {already_read.id, newly_read.id}
+        newly_read_notification = service.get_notification(newly_read.id)
+        assert newly_read_notification.read_at is not None
+        # Already-read rows are left untouched.
+        assert service.get_notification(already_read.id).read_at == already_read_at
+        # Notifications not passed to mark_read_bulk are never touched.
+        assert service.get_notification(skipped.id).read_at is None
+
     @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter.send")
     def test_mark_notification_as_failed_if_sending_fails(self, mock_adapter_send):
+        self.notification_service = self.build_service(raise_on_failed_send=True)
         notification = self.notification_service.create_notification(
             user_id=1,
             notification_type=NotificationTypes.EMAIL.value,
@@ -887,6 +1208,30 @@ class NotificationServiceTestCase(TestCase):
 
         with pytest.raises(NotificationSendError):
             self.notification_service.send(notification)
+        retrieved_notification = self.notification_service.get_notification(notification.id)
+        assert retrieved_notification.status == NotificationStatus.FAILED.value
+
+    @patch("vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter.send")
+    def test_mark_notification_as_failed_without_raise_on_failed_send(self, mock_adapter_send):
+        """The 2.0 default still marks the notification failed -- it just does not raise."""
+        notification = self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        mock_adapter_send.side_effect = NotificationError()
+
+        with patch("vintasend.services.notification_service.logger") as mocked_logger:
+            self.notification_service.send(notification)
+
+        mocked_logger.exception.assert_called_once()
         retrieved_notification = self.notification_service.get_notification(notification.id)
         assert retrieved_notification.status == NotificationStatus.FAILED.value
 
@@ -1301,16 +1646,287 @@ class NotificationServiceTestCase(TestCase):
                 notification_backend_kwargs={},
             )
 
-    def test_delayed_send(self):
-        self.notification_service = NotificationService(
+    def test_send_enqueues_only_the_notification_id_for_a_background_adapter(self):
+        """The enqueue branch hands over the id and nothing else -- no context, no status change."""
+        queue_service = FakeQueueService()
+        notification_service = self.build_service(
             notification_adapters=[
                 (
                     "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
                     "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
                 )
             ],
-            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
-            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
+            notification_queue_service=queue_service,
+        )
+
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="delivery_time_context",
+            context_kwargs=NotificationContextDict({}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert queue_service.enqueued_notification_ids == [notification.id]
+        # No context generated in the enqueueing process: that is the worker's job now.
+        assert CONTEXT_GENERATION_TIMESTAMPS == []
+        adapter = next(iter(notification_service.notification_adapters))
+        assert adapter.sent_emails == []
+        stored = notification_service.get_notification(notification.id)
+        assert stored.status == NotificationStatus.PENDING_SEND.value
+        assert stored.context_used is None
+
+    def test_send_accepts_a_queue_service_import_string(self):
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_queue_service=(
+                "vintasend.services.notification_queue_services.stubs."
+                "fake_queue_service.FakeQueueService"
+            ),
+        )
+
+        assert isinstance(notification_service.notification_queue_service, FakeQueueService)
+
+    def test_send_without_a_queue_service_logs_and_continues(self):
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+        )
+        assert notification_service.notification_queue_service is None
+
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        with patch("vintasend.services.notification_service.logger") as mocked_logger:
+            notification_service.send(notification)
+
+        mocked_logger.error.assert_called_once()
+        assert (
+            notification_service.get_notification(notification.id).status
+            == NotificationStatus.PENDING_SEND.value
+        )
+
+    def test_send_without_a_queue_service_raises_under_raise_on_failed_send(self):
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            raise_on_failed_send=True,
+        )
+
+        notification = Notification(
+            id=str(uuid.uuid4()),
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            status=NotificationStatus.PENDING_SEND.value,
+        )
+
+        with pytest.raises(NotificationQueueServiceMissingError):
+            notification_service.send(notification)
+
+    def test_send_wraps_a_failing_queue_service(self):
+        class BrokenQueueService(FakeQueueService):
+            def enqueue_notification(self, notification_id):
+                raise NotificationError("broker is down")
+
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_queue_service=BrokenQueueService(),
+        )
+        notification = Notification(
+            id=str(uuid.uuid4()),
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            status=NotificationStatus.PENDING_SEND.value,
+        )
+
+        with patch("vintasend.services.notification_service.logger") as mocked_logger:
+            notification_service.send(notification)
+        mocked_logger.exception.assert_called_once()
+
+        notification_service.raise_on_failed_send = True
+        with pytest.raises(NotificationSendError):
+            notification_service.send(notification)
+
+    def test_register_queue_service_injects_it_after_construction(self):
+        queue_service = FakeQueueService()
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+        )
+        assert notification_service.notification_queue_service is None
+
+        notification_service.register_queue_service(queue_service)
+
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert queue_service.enqueued_notification_ids == [notification.id]
+
+    def test_send_runs_both_a_background_and_a_foreground_adapter(self):
+        """Both adapter kinds coexist in one service and each handles its own type.
+
+        A single send() can only ever reach one adapter, because duplicate notification
+        types are rejected at construction. What this pins down is that configuring a
+        background adapter does not disable the foreground ones -- the failure mode the
+        old `return` in the adapter loop caused.
+        """
+        queue_service = FakeQueueService()
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_in_app_adapter.FakeInAppAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                ),
+            ],
+            notification_queue_service=queue_service,
+        )
+        background_adapter, foreground_adapter = notification_service.notification_adapters
+
+        background_notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Background Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+        foreground_notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.IN_APP.value,
+            title="Foreground Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert queue_service.enqueued_notification_ids == [background_notification.id]
+        assert background_adapter.sent_emails == []
+        assert len(foreground_adapter.sent_emails) == 1
+        assert (
+            notification_service.get_notification(foreground_notification.id).status
+            == NotificationStatus.SENT.value
+        )
+
+    def test_send_keeps_going_after_the_enqueue_branch(self):
+        """Regression: the enqueue branch must `continue`, not abandon the adapter loop.
+
+        Two adapters of the same notification type cannot be passed to the constructor --
+        it rejects duplicates -- so the list is assembled directly here. That is the only
+        way to observe the difference between `continue` and the `return` this replaced,
+        which silently skipped every adapter after the background one.
+        """
+        queue_service = FakeQueueService()
+        backend = FakeFileBackend(database_file_name="service-tests-notifications.json")
+        background_adapter = FakeAsyncEmailAdapter(
+            template_renderer=FakeTemplateRenderer(), backend=backend
+        )
+        foreground_adapter = FakeEmailAdapter(
+            template_renderer=FakeTemplateRenderer(), backend=backend
+        )
+        notification_service = self.build_service(
+            notification_adapters=[background_adapter],
+            notification_backend=backend,
+            notification_queue_service=queue_service,
+        )
+        notification_service.notification_adapters = [background_adapter, foreground_adapter]
+
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert queue_service.enqueued_notification_ids == [notification.id]
+        assert len(foreground_adapter.sent_emails) == 1
+        assert (
+            notification_service.get_notification(notification.id).status
+            == NotificationStatus.SENT.value
+        )
+
+    def test_delayed_send(self):
+        queue_service = FakeQueueService()
+        self.notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_queue_service=queue_service,
         )
 
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -1327,17 +1943,93 @@ class NotificationServiceTestCase(TestCase):
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
 
-        self.notification_service.delayed_send(
-            notification_to_dict(notification),
-            {"test": "test"},
-        )
+        # The worker is handed the id the queue service recorded, and nothing else.
+        self.notification_service.delayed_send(queue_service.enqueued_notification_ids[0])
 
         assert len(self.notification_service.notification_backend.notifications) == 1
-        assert notification == self.notification_service.notification_backend.notifications[0]
-        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+        adapter = next(iter(self.notification_service.notification_adapters))
+        assert len(adapter.sent_emails) == 1
+        sent_notification, context, _attachments = adapter.sent_emails[0]
+        assert str(sent_notification.id) == str(notification.id)
+        assert context == {"test": "test"}
+        stored = self.notification_service.get_notification(notification.id)
+        assert stored.status == NotificationStatus.SENT.value
+        assert stored.context_used == {"test": "test"}
+
+    def test_delayed_send_generates_the_context_at_delivery_time(self):
+        """A scheduled notification renders against data current in the worker, not at enqueue."""
+        queue_service = FakeQueueService()
+        enqueued_at = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+        delivered_at = datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc)
+
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_queue_service=queue_service,
+        )
+
+        with freeze_time(enqueued_at):
+            notification = notification_service.create_notification(
+                user_id=1,
+                notification_type=NotificationTypes.EMAIL.value,
+                title="Test Notification",
+                body_template="vintasend_django/emails/test/test_templated_email_body.html",
+                context_name="delivery_time_context",
+                context_kwargs=NotificationContextDict({}),
+                send_after=None,
+                subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+                preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            )
+            assert CONTEXT_GENERATION_TIMESTAMPS == []
+
+        with freeze_time(delivered_at):
+            notification_service.delayed_send(notification.id)
+
+        assert CONTEXT_GENERATION_TIMESTAMPS == [delivered_at.isoformat()]
+        stored = notification_service.get_notification(notification.id)
+        assert stored.context_used == {"generated_at": delivered_at.isoformat()}
+
+    def test_delayed_send_tolerates_redelivery_of_an_already_sent_notification(self):
+        """Queue delivery is at-least-once, so the same id can arrive twice."""
+        queue_service = FakeQueueService()
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_queue_service=queue_service,
+        )
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        notification_service.delayed_send(notification.id)
+        notification_service.delayed_send(notification.id)
+
+        adapter = next(iter(notification_service.notification_adapters))
+        assert len(adapter.sent_emails) == 1
+        assert (
+            notification_service.get_notification(notification.id).status
+            == NotificationStatus.SENT.value
+        )
 
     def test_delayed_send_with_unsupported_notification_type(self):
-        self.notification_service = NotificationService(
+        """A type no background adapter handles is logged, and the notification stays pending."""
+        self.notification_service = self.build_service(
             notification_adapters=[
                 (
                     "vintasend.services.notification_adapters.stubs.fake_in_app_adapter.FakeInAppAdapter",
@@ -1348,8 +2040,6 @@ class NotificationServiceTestCase(TestCase):
                     "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
                 ),
             ],
-            notification_backend="vintasend.services.notification_backends.stubs.fake_backend.FakeFileBackend",
-            notification_backend_kwargs={"database_file_name": "service-tests-notifications.json"},
         )
 
         assert len(self.notification_service.notification_backend.notifications) == 0
@@ -1372,17 +2062,16 @@ class NotificationServiceTestCase(TestCase):
         )
 
         with freeze_time(send_after + datetime.timedelta(days=1)):
-            self.notification_service.delayed_send(
-                notification_to_dict(notification),
-                {"test": "test"},
-            )
+            with patch("vintasend.services.notification_service.logger") as mocked_logger:
+                self.notification_service.delayed_send(notification.id)
 
+            mocked_logger.error.assert_called_once()
             assert (
                 len(self.notification_service.notification_backend.get_all_pending_notifications())
                 == 1
             )
 
-    def test_delayed_send_without_async_adapter(self):
+    def test_delayed_send_without_a_background_adapter(self):
         assert len(self.notification_service.notification_backend.notifications) == 0
 
         notification = self.notification_service.create_notification(
@@ -1392,18 +2081,76 @@ class NotificationServiceTestCase(TestCase):
             body_template="vintasend_django/emails/test/test_templated_email_body.html",
             context_name="test_context",
             context_kwargs=NotificationContextDict({"test": "test"}),
-            send_after=None,
+            send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
             subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
             preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
         )
         assert len(self.notification_service.notification_backend.notifications) == 1
 
-        self.notification_service.delayed_send(
-            notification_to_dict(notification),
-            {"test": "test"},
+        with patch("vintasend.services.notification_service.logger") as mocked_logger:
+            self.notification_service.delayed_send(notification.id)
+
+        mocked_logger.error.assert_called_once()
+        assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 0
+        assert (
+            self.notification_service.get_notification(notification.id).status
+            == NotificationStatus.PENDING_SEND.value
         )
 
-        assert len(self.notification_service.notification_backend.notifications) == 1
+    def test_delayed_send_without_a_background_adapter_raises_under_raise_on_failed_send(self):
+        notification_service = self.build_service(raise_on_failed_send=True)
+
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        with pytest.raises(NotificationSendError):
+            notification_service.delayed_send(notification.id)
+
+    def test_delayed_send_marks_the_notification_failed_when_the_adapter_fails(self):
+        notification_service = self.build_service(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+        )
+        notification = notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        with patch(
+            "vintasend.services.notification_adapters.stubs.fake_adapter.FakeEmailAdapter.send",
+            side_effect=NotificationError(),
+        ):
+            notification_service.delayed_send(notification.id)
+
+        assert (
+            notification_service.get_notification(notification.id).status
+            == NotificationStatus.FAILED.value
+        )
+
+    def test_delayed_send_raises_when_the_notification_does_not_exist(self):
+        """A missing id is a wiring problem, not a failed send, so it is never swallowed."""
+        with pytest.raises(NotificationNotFoundError):
+            self.notification_service.delayed_send(str(uuid.uuid4()))
 
     def test_instanciate_with_adapters_and_backend_instances_instead_of_string(self):
         notification_backend = FakeFileBackend(
@@ -1821,6 +2568,129 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         assert one_off_notification.email_or_phone == "+1234567890"
 
     @pytest.mark.asyncio
+    async def test_create_notification_persists_tenant(self):
+        notification = await self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+        await self.notification_service.mark_read(notification.id)
+
+        assert notification.tenant == "tenant-a"
+
+        reloaded_backend = FakeAsyncIOFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        reloaded_notification = await reloaded_backend.get_notification(notification.id)
+        assert reloaded_notification.tenant == "tenant-a"
+        assert reloaded_notification.sent_at is not None
+        assert reloaded_notification.read_at is not None
+
+    @pytest.mark.asyncio
+    async def test_create_notification_without_tenant_defaults_to_none(self):
+        notification = await self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert notification.tenant is None
+
+    @pytest.mark.asyncio
+    async def test_create_one_off_notification_persists_tenant(self):
+        one_off_notification = await self.notification_service.create_one_off_notification(
+            email_or_phone="test@example.com",
+            first_name="John",
+            last_name="Doe",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-Off Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+        await self.notification_service.mark_read(one_off_notification.id)
+
+        assert one_off_notification.tenant == "tenant-a"
+
+        reloaded_backend = FakeAsyncIOFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        reloaded_notification = await reloaded_backend.get_notification(one_off_notification.id)
+        assert reloaded_notification.tenant == "tenant-a"
+        assert reloaded_notification.sent_at is not None
+        assert reloaded_notification.read_at is not None
+
+    @pytest.mark.asyncio
+    async def test_create_one_off_notification_without_tenant_defaults_to_none(self):
+        one_off_notification = await self.notification_service.create_one_off_notification(
+            email_or_phone="test@example.com",
+            first_name="John",
+            last_name="Doe",
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test One-Off Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert one_off_notification.tenant is None
+
+    @pytest.mark.asyncio
+    async def test_create_notification_without_tenant_is_compatible_with_pre_tenant_backend(self):
+        """AsyncIO twin of the sync compatibility regression test.
+
+        A caller that never passes ``tenant`` must not forward it to the backend, or every
+        downstream AsyncIO backend implemented before the ``tenant`` keyword existed would
+        raise ``TypeError`` on every create.
+        """
+        backend = PreTenantFakeAsyncIOFileBackend(
+            database_file_name="service-tests-notifications.json"
+        )
+        notification_service = AsyncIONotificationService(
+            notification_adapters=[
+                (
+                    "vintasend.services.notification_adapters.stubs.fake_adapter.FakeAsyncIOEmailAdapter",
+                    "vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer.FakeTemplateRenderer",
+                )
+            ],
+            notification_backend=backend,
+        )
+
+        notification = await notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+
+        assert notification.tenant is None
+
+    @pytest.mark.asyncio
     @patch(
         "vintasend.services.notification_backends.stubs.fake_backend.FakeAsyncIOFileBackend.mark_pending_as_sent"
     )
@@ -1981,6 +2851,58 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
 
         assert updated_notification.send_after is None
         assert len(next(iter(self.notification_service.notification_adapters)).sent_emails) == 1
+
+    @pytest.mark.asyncio
+    async def test_update_notification_with_tenant_raises_tenant_reassignment_error(self):
+        notification = await self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+
+        with pytest.raises(TenantReassignmentError):
+            await self.notification_service.update_notification(
+                notification_id=notification.id,
+                tenant="tenant-b",  # type: ignore[call-arg]
+            )
+
+        unchanged_notification = await self.notification_service.get_notification(notification.id)
+        assert unchanged_notification.tenant == "tenant-a"
+
+    @pytest.mark.asyncio
+    async def test_update_notification_with_tenant_via_raw_kwargs_raises(self):
+        """Even bypassing the TypedDict via a plain dict must still raise.
+
+        UpdateNotificationKwargs is not enforced at runtime, so update_notification must
+        check the raw kwargs dict for "tenant" rather than relying on the TypedDict.
+        """
+        notification = await self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+            tenant="tenant-a",
+        )
+        untyped_kwargs: dict = {"title": "New title", "tenant": "tenant-b"}
+
+        with pytest.raises(TenantReassignmentError):
+            await self.notification_service.update_notification(notification.id, **untyped_kwargs)
+
+        unchanged_notification = await self.notification_service.get_notification(notification.id)
+        assert unchanged_notification.tenant == "tenant-a"
+        assert unchanged_notification.title == "Test Notification"
 
     @pytest.mark.asyncio
     async def test_send_pending_notifications(self):
@@ -2229,6 +3151,46 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
         assert retrieved_notification.status == NotificationStatus.READ.value
 
     @pytest.mark.asyncio
+    async def test_mark_read_sets_read_at(self):
+        notification = await self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=None,
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+        assert notification.read_at is None
+
+        await self.notification_service.mark_read(notification.id)
+
+        retrieved_notification = await self.notification_service.get_notification(notification.id)
+        assert retrieved_notification.read_at is not None
+
+    @pytest.mark.asyncio
+    async def test_sent_at_is_none_until_sent_then_set(self):
+        notification = await self.notification_service.create_notification(
+            user_id=1,
+            notification_type=NotificationTypes.EMAIL.value,
+            title="Test Notification",
+            body_template="vintasend_django/emails/test/test_templated_email_body.html",
+            context_name="test_context",
+            context_kwargs=NotificationContextDict({"test": "test"}),
+            send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=1),
+            subject_template="vintasend_django/emails/test/test_templated_email_subject.txt",
+            preheader_template="vintasend_django/emails/test/test_templated_email_preheader.html",
+        )
+        assert notification.sent_at is None
+
+        await self.notification_service.send(notification)
+
+        sent_notification = await self.notification_service.get_notification(notification.id)
+        assert sent_notification.sent_at is not None
+
+    @pytest.mark.asyncio
     async def test_get_in_app_unread_without_an_in_app_adapter_configured(self):
         await self.notification_service.create_notification(
             user_id=1,
@@ -2298,9 +3260,37 @@ class AsyncIONotificationServiceTestCase(IsolatedAsyncioTestCase):
             assert {n.id for n in result} == set(sent_ids)
             assert all(n.status == NotificationStatus.READ.value for n in result)
             assert await backend.count_in_app_unread_notifications(1) == 0
+            # One bulk call must stamp a single, shared read_at across every row it touches.
+            assert len({n.read_at for n in result}) == 1
             # idempotent re-run
             again = list(await backend.mark_sent_as_read_bulk(sent_ids, user_id=1))
             assert {n.id for n in again} == set(sent_ids)
+        finally:
+            await backend.clear()
+
+    @pytest.mark.asyncio
+    async def test_async_backend_mark_sent_as_read_bulk_sets_read_at_on_affected_rows_only(self):
+        backend = FakeAsyncIOFileBackend(database_file_name="async-in-app-tests.json")
+        already_read = self._make_in_app(1, NotificationStatus.READ.value)
+        already_read.read_at = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        expected_already_read_at = already_read.read_at
+        newly_read = self._make_in_app(1, NotificationStatus.SENT.value)
+        skipped = self._make_in_app(1, NotificationStatus.SENT.value)
+        backend.notifications = [already_read, newly_read, skipped]
+        try:
+            result = list(
+                await backend.mark_sent_as_read_bulk([already_read.id, newly_read.id], user_id=1)
+            )
+
+            assert {n.id for n in result} == {already_read.id, newly_read.id}
+            updated_newly_read = await backend.get_notification(newly_read.id)
+            assert updated_newly_read.read_at is not None
+            # Already-read rows are left untouched.
+            updated_already_read = await backend.get_notification(already_read.id)
+            assert updated_already_read.read_at == expected_already_read_at
+            # Notifications not passed to mark_sent_as_read_bulk are never touched.
+            updated_skipped = await backend.get_notification(skipped.id)
+            assert updated_skipped.read_at is None
         finally:
             await backend.clear()
 
@@ -2965,6 +3955,12 @@ SERVICE_METHOD_PARITY_ALLOWLIST: dict[str, tuple[str, str]] = {
         "a task queue (see AGENTS.md's note on notification_adapters/async_base.py) rather than "
         "genuine async/await. AsyncIONotificationService has no such adapter kind to send "
         "through today; the background-send-queue plan adds one.",
+    ),
+    "register_queue_service": (
+        "NotificationService",
+        "Injects the queue service the background send path enqueues through. Only the sync "
+        "service has that path so far; phase 3 of the background-send-queue plan gives "
+        "AsyncIONotificationService its own and removes this entry.",
     ),
     "_send_notification_with_error_logging": (
         "AsyncIONotificationService",

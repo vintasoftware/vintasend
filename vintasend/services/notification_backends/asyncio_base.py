@@ -17,6 +17,10 @@ if TYPE_CHECKING:
         StoredAttachment,
         UpdateNotificationKwargs,
     )
+    from vintasend.services.notification_backends.filters import (
+        NotificationFilter,
+        NotificationOrderBy,
+    )
 
 
 class AsyncIOBaseNotificationBackend(ABC):
@@ -73,6 +77,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list["AnyNotificationAttachment"] | None = None,
+        tenant: str | None = None,
         lock: asyncio.Lock | None = None,
     ) -> "Notification": ...
 
@@ -92,6 +97,7 @@ class AsyncIOBaseNotificationBackend(ABC):
         preheader_template: str,
         adapter_extra_parameters: dict | None = None,
         attachments: list["AnyNotificationAttachment"] | None = None,
+        tenant: str | None = None,
         lock: asyncio.Lock | None = None,
     ) -> "OneOffNotification": ...
 
@@ -112,7 +118,12 @@ class AsyncIOBaseNotificationBackend(ABC):
     @abstractmethod
     async def mark_pending_as_sent(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification | OneOffNotification": ...
+    ) -> "Notification | OneOffNotification":
+        """
+        Mark a pending notification as sent. Implementations must set ``sent_at`` to
+        the current time on the affected row.
+        """
+        ...
 
     @abstractmethod
     async def mark_pending_as_failed(
@@ -122,7 +133,12 @@ class AsyncIOBaseNotificationBackend(ABC):
     @abstractmethod
     async def mark_sent_as_read(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
-    ) -> "Notification | OneOffNotification": ...
+    ) -> "Notification | OneOffNotification":
+        """
+        Mark a sent notification as read. Implementations must set ``read_at`` to
+        the current time on the affected row.
+        """
+        ...
 
     @abstractmethod
     async def mark_sent_as_read_bulk(
@@ -136,11 +152,13 @@ class AsyncIOBaseNotificationBackend(ABC):
 
         Semantics:
             * Every notification in ``notification_ids`` that is currently SENT is
-              moved to READ.
+              moved to READ, and ``read_at`` is set to the current time on every
+              row moved this way.
             * If ``user_id`` is provided, the update is scoped to that user; rows
               owned by other users are never touched. This is the safe default for
               an endpoint and callers are strongly encouraged to always pass it.
-            * Idempotent: ids that are already READ cause no error.
+            * Idempotent: ids that are already READ cause no error and their
+              ``read_at`` is left untouched.
             * Returns the serialized notifications for the requested ids that are
               READ after the operation (newly-marked + already-read), so the caller
               sees the final state. Ids that are missing, not owned, or in a
@@ -217,6 +235,77 @@ class AsyncIOBaseNotificationBackend(ABC):
         for efficiency (e.g. a database ``COUNT``).
         """
         return sum(1 for _ in await self.filter_all_in_app_unread_notifications(user_id))
+
+    @abstractmethod
+    async def filter_notifications(
+        self,
+        filter: "NotificationFilter",  # noqa: A002
+        page: int,
+        page_size: int,
+        order_by: "NotificationOrderBy | None" = None,
+    ) -> Iterable["Notification | OneOffNotification"]:
+        """
+        Return one page of notifications matching a composable filter.
+
+        This is the general-purpose query a monitoring dashboard consumes. It covers BOTH
+        ``Notification`` and ``OneOffNotification`` -- a dashboard wants one list -- so a caller
+        that must separate them does so on the returned objects, not via the filter.
+
+        Filter semantics:
+            * An **empty filter (``{}``) matches every notification** -- it is the unrestricted
+              listing. "Empty filter returns nothing" is an equally plausible but WRONG reading;
+              a backend that gets this backwards silently hides every row.
+            * Multiple keys inside one field filter are an implicit ``AND``. A scalar means
+              equality; a list means membership. ``and`` / ``or`` / ``not`` compose and nest
+              arbitrarily.
+            * **Date-range bounds are inclusive on both ends** (``from`` -> ``>=``, ``to`` ->
+              ``<=``). A client computing "today" from midnight to midnight double-counts
+              boundary rows if an implementation makes them exclusive.
+            * A positive filter on a field whose value is ``None`` does not match; consequently a
+              ``None`` row IS included under negation (``not``). Nullable columns must include
+              their ``None`` rows under negation.
+
+        Ordering:
+            * ``order_by`` selects a single primary sort field and direction; ``None`` is the
+              backend's documented default.
+            * Ordering MUST be **stable**: implementations append ``id`` as a tiebreaker in the
+              SAME direction as the primary sort key. ``created`` and ``modified`` are not
+              unique, and offset pagination over a non-unique key silently drops and duplicates
+              rows across pages without this.
+
+        The return type stays ``Iterable`` for consistency with the other reads and to let ORM
+        backends return generators; use ``count_notifications`` when a total is needed.
+        """
+        ...
+
+    async def get_filter_capabilities(self) -> dict[str, bool]:
+        """
+        Report which filter fields, string lookups and sort fields this backend supports.
+
+        Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``) and a
+        backend declares ONLY what it *cannot* do -- the service merges this report OVER an
+        all-``True`` default, so a missing key means supported. The concrete default returns
+        ``{}`` (everything supported); backends override to decline specific capabilities.
+        """
+        return {}
+
+    async def count_notifications(self, filter: "NotificationFilter") -> int:  # noqa: A002
+        """
+        Total number of notifications matching ``filter``, ignoring pagination.
+
+        Concrete default derived from ``filter_notifications`` by exhausting every page, so a
+        backend that only implements the abstract ``filter_notifications`` keeps working.
+        Backends SHOULD override this for efficiency (e.g. a database ``COUNT``).
+        """
+        total = 0
+        page = 1
+        page_size = 100
+        while True:
+            batch = list(await self.filter_notifications(filter, page=page, page_size=page_size))
+            total += len(batch)
+            if len(batch) < page_size:
+                return total
+            page += 1
 
     @abstractmethod
     async def get_user_email_from_notification(
