@@ -6,6 +6,9 @@ import pytest
 
 from vintasend.constants import NotificationTypes
 from vintasend.services.dataclasses import (
+    _VOLATILE_NOTIFICATION_SYNC_FIELDS,
+    NOTIFICATION_SYNC_COMPARABLE_FIELDS,
+    ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     NotificationContextDict,
     OneOffNotification,
 )
@@ -536,3 +539,78 @@ class AsyncIOBackendSyncStatsTestCase(IsolatedAsyncioTestCase):
         assert stats["backend-2"]["status"] == "error"
         assert stats["backend-2"]["total_notifications"] == 0
         assert stats["backend-2"]["error"] == "backend down"
+
+
+# --- comparable-field derivation pin --------------------------------------------------------
+
+
+class SyncComparableFieldsPinTestCase(TestCase):
+    """Pins the derived comparable-field lists used by ``verify_notification_sync``.
+
+    ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+    (in ``vintasend/services/dataclasses.py``) are derived as "every ``Notification`` /
+    ``OneOffNotification`` field minus ``_VOLATILE_NOTIFICATION_SYNC_FIELDS``". That derivation
+    is deliberately favored over a hand-maintained list because it never goes stale by omission
+    -- but it means a newly added dataclass field is silently pulled into cross-backend
+    comparison without anyone deciding whether it belongs there.
+
+    If this test fails because a field was added to (or removed from) ``Notification`` or
+    ``OneOffNotification``, do not just update the expected values below to match. Decide first:
+    - If the new field holds comparable content (like ``title`` or ``status``), add it to the
+      relevant expected tuple here.
+    - If the new field is volatile/derived per-backend (like ``created``/``modified``/
+      ``attachments``), add it to ``_VOLATILE_NOTIFICATION_SYNC_FIELDS`` in ``dataclasses.py``
+      instead, then update the expected set below to match.
+    Only after that conscious decision should this test's expected values change.
+    """
+
+    def test_volatile_fields_are_pinned(self):
+        assert _VOLATILE_NOTIFICATION_SYNC_FIELDS == frozenset(
+            {"created", "modified", "attachments"}
+        )
+
+    def test_notification_comparable_fields_are_pinned(self):
+        assert NOTIFICATION_SYNC_COMPARABLE_FIELDS == (
+            "id",
+            "user_id",
+            "notification_type",
+            "title",
+            "body_template",
+            "context_name",
+            "context_kwargs",
+            "send_after",
+            "subject_template",
+            "preheader_template",
+            "status",
+            "context_used",
+            "adapter_used",
+            "adapter_extra_parameters",
+            "sent_at",
+            "read_at",
+            "tenant",
+            "git_commit_sha",
+        )
+
+    def test_one_off_notification_comparable_fields_are_pinned(self):
+        assert ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS == (
+            "id",
+            "email_or_phone",
+            "first_name",
+            "last_name",
+            "notification_type",
+            "title",
+            "body_template",
+            "context_name",
+            "context_kwargs",
+            "send_after",
+            "subject_template",
+            "preheader_template",
+            "status",
+            "context_used",
+            "adapter_used",
+            "adapter_extra_parameters",
+            "sent_at",
+            "read_at",
+            "tenant",
+            "git_commit_sha",
+        )
