@@ -2,10 +2,11 @@
 
 ## Version 2.0.0 (2026-07-23)
 
-2.0 is a major release that bundles three feature sets: background notification sending through a
-queue service, a composable filtering / ordering API, and a dedicated attachment manager seam. The
-breaking changes come from the background-sending rework and from new abstract methods that every
-downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade guidance.
+2.0 is a major release that bundles several feature sets: background notification sending through a
+queue service, a composable filtering / ordering API, a dedicated attachment manager seam, git commit
+SHA tracking, and rendering a notification from historical template content. The breaking changes
+come from the background-sending rework and from new abstract methods that every downstream backend
+and email renderer must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade guidance.
 
 ### Features
 
@@ -71,6 +72,23 @@ downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
   keyword. The filter vocabulary includes `sent_at_range`, `read_at_range` and `tenant` (equality
   or membership).
 
+#### Render a notification from historical template content
+- `render_email_template_from_content(notification, template_content, context)` on both services:
+  given a notification, an `EmailTemplateContent` (`subject_template`, `body_template`, optional
+  `preheader_template`), and a context -- typically a notification's stored `context_used` -- renders
+  and returns the resulting `TemplatedEmail` without sending or persisting anything. This is a
+  read-shaped preview/audit operation: no context is generated (the caller supplies it verbatim) and
+  the notification's own stored templates are never consulted. Raises the new
+  `NotificationRenderError` when the notification's type has no email adapter configured, or its
+  configured renderer is not a `BaseTemplatedEmailRenderer`. See the README's "Rendering a
+  notification from historical template content" section, including its injection-safety caveat.
+- New abstract method `render_from_template_content` on `BaseTemplatedEmailRenderer`, mirroring
+  `render`'s signature with an `EmailTemplateContent` replacing the stored template reference. The
+  reference implementation, `FakeTemplateRenderer`, renders the supplied content directly. See
+  "Breaking Changes" and "Backwards Compatibility" below.
+- `TemplatedEmail` gained an optional `preheader: str | None = None` field, additive with a default,
+  so it reproduces a historical preheader when one was supplied.
+
 #### Attachment manager seam
 - New attachment manager seam: `BaseAttachmentManager` and `AsyncIOBaseAttachmentManager`
   (`vintasend.services.attachment_managers`) own every byte of attachment storage —
@@ -130,6 +148,9 @@ downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
      `find_attachment_file_by_checksum`, `delete_attachment_file`, `get_orphaned_attachment_files`,
      `get_attachments`, and `delete_notification_attachment`. (`inject_attachment_manager` is added
      too, but concrete with a default, so it needs no change.)
+7. **New abstract method on `BaseTemplatedEmailRenderer` — every custom email renderer subclass MUST
+   implement `render_from_template_content` before it can be instantiated against 2.0.** See
+   "Backwards Compatibility" below.
 
 ### New exceptions
 - `TenantReassignmentError`: raised by `update_notification` when `tenant` appears in the update
@@ -138,6 +159,10 @@ downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
   scheduled in the future.
 - `AttachmentFileNotFoundError`, `AttachmentUploadError`, and `UnsupportedAttachmentFileTypeError`
   for the attachment paths.
+- `NotificationRenderError`: raised by `render_email_template_from_content` when the notification's
+  type has no email adapter configured, or its configured renderer is not a
+  `BaseTemplatedEmailRenderer`. Distinct from the existing `NotificationTemplateRenderingError`
+  family, which covers a renderer failing while actually rendering a template it was handed.
 - All derive from `NotificationError`, which derives from `ValueError`, so existing
   `except ValueError` handlers keep working.
 
@@ -168,10 +193,18 @@ downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
   `TypeError` at construction. This repo releases first; `vintasend-django` follows with a
   matching release that widens its `vintasend` pin. `vintasend-sqlalchemy` adopts it as part of
   its ongoing catch-up plan.
-- No existing method signature or semantic changed, and no other seam gained an abstract method.
-  With no `git_commit_sha_provider` configured (the default), `send()`, `delayed_send()`,
-  `create_notification()`, and `update_notification()` behave exactly as in 2.0 -- this is an
-  additive minor release for every caller who does not opt in.
+- **New abstract method**: `render_from_template_content(notification, template_content, context)`
+  was added to `BaseTemplatedEmailRenderer`. Every downstream email renderer implementation MUST
+  implement it before it can be instantiated -- a subclass missing it raises `TypeError` at
+  construction. `vintasend-django` and `vintasend-jinja` are the two affected packages; both must
+  implement it and widen their `vintasend` pin before they can be released against `vintasend>=2.0.0`.
+  This repo releases first. Backends, adapters, and non-email renderers are untouched.
+- With no `git_commit_sha_provider` configured (the default), `send()`, `delayed_send()`,
+  `create_notification()`, and `update_notification()` behave exactly as before this release -- that
+  feature is additive for every caller who does not opt in. Likewise,
+  `render_email_template_from_content` is a wholly new, opt-in entrypoint: no existing method's
+  signature or semantics changed to support it, and no notification is sent or persisted by calling
+  it.
 
 ### Operational Requirements
 - **Drain or dual-register the Celery queue before deploying.** Tasks queued under 1.x carry a
@@ -185,7 +218,8 @@ downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
 3. If you maintain an adapter, move to `BackgroundNotificationAdapter` /
    `AsyncIOBackgroundNotificationAdapter` and move `delayed_send` logic to `send()`.
 4. If you maintain a backend, implement the new filter and attachment abstract methods.
-5. Test end-to-end, including attachments in background sends (now supported), then drain the queue
+5. If you maintain an email template renderer, implement `render_from_template_content`.
+6. Test end-to-end, including attachments in background sends (now supported), then drain the queue
    and deploy the 2.0 worker.
 
 ## Version 1.4.0 (2026-07-22)
