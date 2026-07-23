@@ -3,9 +3,9 @@ import io
 import mimetypes
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, BinaryIO, TypedDict, TypeGuard
+from typing import Any, BinaryIO, Literal, TypedDict, TypeGuard
 
 
 # Type alias for supported file inputs (for creating notifications)
@@ -270,6 +270,124 @@ class OneOffNotification:
     # injected BaseGitCommitShaProvider. Never set on creation, and update_notification
     # rejects it in raw kwargs -- see GitCommitShaReassignmentError.
     git_commit_sha: str | None = None
+
+
+# Fields deliberately excluded from cross-backend sync comparison (see
+# ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+# below) because they legitimately differ per backend rather than signalling replication drift:
+# - ``created`` / ``modified``: write-time timestamps each backend assigns independently. The
+#   primary and a replica commit at different instants, so these never agree even when the
+#   record's content is perfectly in sync.
+# - ``attachments``: a ``StoredAttachment``'s ``id`` and ``storage_identifiers`` are assigned by
+#   whichever storage backend wrote it, so the same logical file has different, backend-specific
+#   values on every backend -- not a single comparable value the way a scalar field is.
+_VOLATILE_NOTIFICATION_SYNC_FIELDS = frozenset({"created", "modified", "attachments"})
+
+# Every persisted, comparable field on ``Notification``, derived from the dataclass itself (minus
+# the volatile fields above) so a newly added dataclass field is automatically picked up by
+# ``NotificationService.verify_notification_sync`` without this constant needing an edit.
+NOTIFICATION_SYNC_COMPARABLE_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(Notification) if f.name not in _VOLATILE_NOTIFICATION_SYNC_FIELDS
+)
+
+# AsyncIO/one-off twin of the above. ``OneOffNotification`` has no ``user_id`` -- it carries
+# ``email_or_phone`` / ``first_name`` / ``last_name`` instead -- so its comparable-field list is
+# derived separately rather than reusing ``NOTIFICATION_SYNC_COMPARABLE_FIELDS``.
+ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(OneOffNotification) if f.name not in _VOLATILE_NOTIFICATION_SYNC_FIELDS
+)
+
+
+class NotificationSyncFieldReport(TypedDict):
+    """One comparable field's cross-backend agreement, part of ``NotificationSyncReport``.
+
+    ``differing_values`` is populated only when ``in_agreement`` is ``False`` -- keyed by backend
+    identifier, holding that backend's value for this field. Only backends that hold the record
+    at all, and whose record type declares this field (see the ``Notification`` /
+    ``OneOffNotification`` split above), contribute a value; a backend missing the record
+    entirely is already reported once at ``NotificationSyncReport.backends_missing_record``, not
+    repeated per field.
+    """
+
+    field: str
+    in_agreement: bool
+    differing_values: dict[str, Any]
+
+
+class NotificationSyncReport(TypedDict):
+    """Return type of ``NotificationService.verify_notification_sync`` / its AsyncIO twin.
+
+    Answers, for one notification id, which registered backends hold the record and whether they
+    agree on its content field by field -- what a dashboard needs to flag replication drift.
+    """
+
+    notification_id: int | str | uuid.UUID
+    primary_backend_identifier: str
+    backends_with_record: list[str]
+    backends_missing_record: list[str]
+    in_sync: bool
+    fields: list[NotificationSyncFieldReport]
+
+
+class _BackendSyncStatsRequired(TypedDict):
+    total_notifications: int
+    status: Literal["healthy", "error"]
+
+
+class BackendSyncStats(_BackendSyncStatsRequired, total=False):
+    """Per-backend entry in ``NotificationService.get_backend_sync_stats``'s return dict.
+
+    ``error`` is present only when ``status == "error"`` -- the backend raised while being
+    queried, and ``total_notifications`` is reported as ``0`` rather than the exception
+    propagating, so one broken backend never fails stats for the others.
+    """
+
+    error: str
+
+
+class BackendMigrationFailure(TypedDict):
+    """One record's destination-write failure during
+    ``NotificationService.migrate_to_backend``, part of ``BackendMigrationResult``.
+
+    Captured rather than raised so one bad record does not abort the rest of the migration --
+    the caller decides whether to retry the failed ids, re-run the whole migration (idempotent
+    via the duplicate-conflict retry), or investigate.
+    """
+
+    notification_id: int | str | uuid.UUID
+    error: str
+
+
+class BackendMigrationResult(TypedDict):
+    """Return type of ``NotificationService.migrate_to_backend`` / its AsyncIO twin.
+
+    ``migrated`` counts records confirmed present on the destination after being written --
+    whether via the destination's ``apply_replication_snapshot_if_newer`` or the read-then-write
+    fallback. ``failures`` lists every source record that did not land on the destination,
+    without aborting the rest of the migration.
+    """
+
+    migrated: int
+    failures: list[BackendMigrationFailure]
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    """Outcome of a backend's ``apply_replication_snapshot_if_newer`` call.
+
+    This is the contract between the service's inline replication and a backend's optional
+    newer-wins upsert. ``applied`` is ``True`` when the backend accepted the primary's
+    snapshot -- creating the replica row with the primary's id, or refreshing an existing row
+    because the snapshot was newer -- so the service need do nothing further for that backend.
+    It is ``False`` when the backend declined: either because it does not implement snapshot
+    application at all (the concrete ``BaseNotificationBackend`` default) or because the row it
+    already holds is newer than the snapshot. On ``False`` the service falls back to a
+    read-then-write replica mutation. ``reason`` is an optional, human-readable note for logs;
+    it never drives control flow.
+    """
+
+    applied: bool
+    reason: str | None = None
 
 
 class UpdateNotificationKwargs(TypedDict, total=False):

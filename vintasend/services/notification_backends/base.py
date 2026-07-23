@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+from vintasend.services.dataclasses import ApplyResult
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
     AndFilter,
@@ -304,6 +305,62 @@ class BaseNotificationBackend(ABC):
         backends return generators; use ``count_notifications`` when a total is needed.
         """
         ...
+
+    def get_backend_identifier(self) -> str | None:
+        """
+        Return this backend's stable identifier for multi-backend routing.
+
+        Concrete default returning ``None``: the owning ``NotificationService`` falls back
+        to ``backend-{n}`` (``n`` being this backend's position among the service's
+        configured backends) when a backend does not declare its own identifier. Override
+        to return a stable, host-chosen identifier (e.g. a region or database alias) so
+        routing does not shift if backends are reordered.
+        """
+        return None
+
+    def apply_replication_snapshot_if_newer(
+        self, snapshot: "Notification | OneOffNotification"
+    ) -> ApplyResult:
+        """Upsert the primary's snapshot into this backend when it is the newer record.
+
+        Concrete default that declines every snapshot (``ApplyResult(applied=False)``): a
+        backend that does not override this makes the owning ``NotificationService`` fall back
+        to a read-then-write replica mutation. Override to implement an id-keyed, newer-wins
+        upsert (comparing ``modified``) so inline replication can create a replica's copy with
+        the primary's id, or refresh it, in a single call -- return ``ApplyResult(applied=True)``
+        once applied so the service skips the fallback, and ``applied=False`` (optionally with a
+        ``reason``) to defer to it.
+
+        ``snapshot`` is the primary backend's authoritative record for a notification; it must
+        be written with its existing id, never a freshly assigned one. Concrete rather than
+        abstract on purpose: multi-backend replication is opt-in, so forcing every backend to
+        implement it would break single-backend deployments that never use it.
+        """
+        return ApplyResult(
+            applied=False,
+            reason="apply_replication_snapshot_if_newer is not implemented by this backend",
+        )
+
+    def get_all_notifications(self) -> Iterable["Notification | OneOffNotification"]:
+        """
+        Return every notification the backend holds, across all pages.
+
+        Concrete default derived from ``filter_notifications({})`` by exhausting every
+        page, so a backend that only implements the abstract ``filter_notifications``
+        keeps working. Backends SHOULD override this for efficiency (e.g. an unpaginated
+        query or a streaming cursor). Feeds multi-backend sync stats and migration.
+        """
+        results: "list[Notification | OneOffNotification]" = []
+        page = 1
+        page_size = 100
+        while True:
+            batch = list(self.filter_notifications({}, page=page, page_size=page_size))
+            if not batch:
+                return results
+            results.extend(batch)
+            if len(batch) < page_size:
+                return results
+            page += 1
 
     def get_filter_capabilities(self) -> dict[str, bool]:
         """

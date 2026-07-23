@@ -4,9 +4,11 @@
 
 2.0 is a major release that bundles several feature sets: background notification sending through a
 queue service, a composable filtering / ordering API, a dedicated attachment manager seam, git commit
-SHA tracking, and rendering a notification from historical template content. The breaking changes
-come from the background-sending rework and from new abstract methods that every downstream backend
-and email renderer must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade guidance.
+SHA tracking, rendering a notification from historical template content, and multi-backend
+replication. The breaking changes come from the background-sending rework and from new abstract
+methods that every downstream backend and email renderer must implement; multi-backend replication
+is additive and non-breaking on its own. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade
+guidance.
 
 ### Features
 
@@ -112,6 +114,66 @@ and email renderer must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
 - `get_orphaned_attachment_files` returns file records no longer referenced by any notification, for
   a caller-driven, two-step reclamation. Nothing is deleted automatically.
 
+#### Multi-backend replication
+- Both services now accept `additional_backends`: a service can hold one primary backend plus
+  zero or more extra backends kept in sync by replication, each addressable by a stable
+  identifier. A backend declares its own identifier by overriding `get_backend_identifier()`;
+  if it doesn't, the service assigns `backend-{n}` (the primary is always `backend-0`). Two
+  configured backends resolving to the same identifier raise the new
+  `DuplicateBackendIdentifierError` at construction. A service with no `additional_backends`
+  is byte-for-byte identical to a single-backend 2.0 deployment.
+- New identifier and routing surface on both services: `get_primary_backend_identifier`,
+  `get_all_backend_identifiers`, `get_additional_backend_identifiers`, `has_backend`. Every read
+  method (`get_notification`, `filter_notifications`, `get_future_notifications`, and the rest
+  of the getters) gained an optional trailing `backend_identifier` keyword — omitted, it reads
+  the primary exactly as before; an unknown identifier raises the new `BackendNotFoundError`.
+- Every write (create, update, mark sent/failed/read, cancel, store context, and the one-off
+  variants) now fans out to the additional backends after the primary write succeeds. The
+  primary write is the source of truth: its result and any exception are the caller's, exactly
+  as on a single-backend service. A replica that rejects a write is logged, not raised, and is
+  reconciled by a later write or by `process_replication`. A replication conflict that looks
+  like the replica already has the row being created, or lacks the row being updated, flips the
+  operation once (create ↔ update) before giving up, so retries under partial failure
+  self-heal instead of piling up errors.
+- New constructor keyword `replication_mode: Literal["inline", "queued"]` (also settable via the
+  new `NOTIFICATION_REPLICATION_MODE` setting, defaulting to `"inline"`). `"inline"` replicates
+  on the request path, right after the primary write. `"queued"` enqueues one replication task
+  per destination backend through a new `replication_queue_service` argument (also settable via
+  the new `NOTIFICATION_REPLICATION_QUEUE_SERVICE` setting) and reuses the same host-factory
+  worker model background sending already established. A missing replication queue service, an
+  unresolvable notification id, or a failed enqueue for one backend all fall back to inline
+  replication rather than silently dropping it — a broken queue is never a data-loss risk.
+  `register_replication_queue_service` injects the queue service after construction, mirroring
+  `register_queue_service`.
+- New sibling seam: `BaseNotificationReplicationQueueService` and its AsyncIO twin
+  `AsyncIOBaseNotificationReplicationQueueService`
+  (`vintasend.services.notification_queue_services`) — a single method,
+  `enqueue_replication(notification_id, backend_identifier)`. Core ships the ABCs plus a working
+  reference, `FakeReplicationQueueService` / `FakeAsyncIOReplicationQueueService`.
+- New management and monitoring surface on both services, for a replication dashboard:
+  `verify_notification_sync(notification_id)` reads the record from every registered backend and
+  reports, field by field, which backends hold it and whether they agree;
+  `get_backend_sync_stats()` reports each backend's notification count and reachability, never
+  letting one broken backend fail the others; `process_replication(notification_id,
+  target_backend_identifier=None)` (and its no-target alias `replicate_notification`) converges
+  one or every additional backend to the primary's current snapshot, returning
+  `{"successes": [...], "failures": [...]}`; `migrate_to_backend(destination_backend_identifier,
+  batch_size, source_backend_identifier=None)` pages through a source backend (the primary by
+  default) copying every notification into a destination, idempotent on re-run and reporting
+  per-record failures without aborting the rest of the batch. Copy-only — it never deletes from
+  the source. The new `BackendMigrationError` covers migration-level misuse (migrating a backend
+  onto itself, a non-positive `batch_size`).
+- New optional backend methods, on both `BaseNotificationBackend` and
+  `AsyncIOBaseNotificationBackend`, that make all of the above possible:
+  `get_backend_identifier() -> str | None`, `apply_replication_snapshot_if_newer(snapshot) ->
+  ApplyResult`, and `get_all_notifications()`. **These ship as concrete methods with working
+  defaults, not `@abstractmethod`** — see "Backwards Compatibility" below for why, and for what
+  that means for downstream backends.
+- See the README's "Multi-Backend Configuration" section, including its "Failure semantics"
+  subsection: replication is best-effort, not synchronous multi-master, offers no
+  read-your-writes guarantee across backends, and this library never fails a primary over to a
+  replica automatically.
+
 ### Bug Fixes
 - `FakeFileBackend` and `FakeAsyncIOFileBackend` now stamp `created` and `modified` when a
   notification is persisted, and advance `modified` on updates and status transitions — matching a
@@ -163,6 +225,15 @@ and email renderer must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
   type has no email adapter configured, or its configured renderer is not a
   `BaseTemplatedEmailRenderer`. Distinct from the existing `NotificationTemplateRenderingError`
   family, which covers a renderer failing while actually rendering a template it was handed.
+- `BackendNotFoundError`: raised when a `backend_identifier` argument (on a read, or on
+  `process_replication` / `migrate_to_backend`) names a backend that isn't registered on the
+  service.
+- `DuplicateBackendIdentifierError`: raised at construction when two configured backends resolve
+  to the same identifier.
+- `ReplicationError`: raised when a replication worker is asked to replicate a notification id
+  that doesn't resolve on the primary backend.
+- `BackendMigrationError`: raised by `migrate_to_backend` for migration-level misuse -- the same
+  backend named as both source and destination, or a non-positive `batch_size`.
 - All derive from `NotificationError`, which derives from `ValueError`, so existing
   `except ValueError` handlers keep working.
 
@@ -205,6 +276,38 @@ and email renderer must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
   `render_email_template_from_content` is a wholly new, opt-in entrypoint: no existing method's
   signature or semantics changed to support it, and no notification is sent or persisted by calling
   it.
+- **Multi-backend replication is non-breaking, despite touching the backend seam.** The three new
+  backend methods -- `get_backend_identifier`, `apply_replication_snapshot_if_newer`, and
+  `get_all_notifications` -- ship as **concrete methods with working defaults**, not
+  `@abstractmethod`. No downstream backend breaks at instantiation: a single-backend deployment
+  that passes no `additional_backends` is byte-for-byte identical to its pre-multi-backend
+  behavior, and every existing custom backend subclass keeps working unmodified against
+  `vintasend>=2.0.0`. The three new methods are optional overrides a backend picks up at its own
+  pace; `vintasend-django` and `vintasend-sqlalchemy` need no release to remain compatible, and
+  MAY later override the hooks for efficiency (a real identifier, an `update_or_create`-style
+  newer-wins upsert, an unpaginated query).
+- **This is a deliberate, documented exception to the project's abstract-by-default seam rule**
+  (see `AGENTS.md`), which every other seam addition in this 2.0 release follows. Multi-backend
+  replication is opt-in -- most deployments never configure `additional_backends` -- so forcing
+  every downstream backend to implement replication hooks for a feature they never use would be
+  the wrong trade. The concrete defaults are functionally complete on their own:
+  `get_backend_identifier` falls back to a service-assigned `backend-{n}`, and
+  `apply_replication_snapshot_if_newer`'s default decline routes the service through a
+  read-then-write fallback (`_converge_replica_to_snapshot`) that works against any backend's
+  existing primitives.
+- **Best-effort consistency, not synchronous multi-master.** A replica write failure is logged,
+  not raised -- the primary write has already committed and is never rolled back. There is no
+  read-your-writes guarantee across backends: a read against a named replica immediately after a
+  write may not yet reflect it, especially in `"queued"` mode. `verify_notification_sync` and
+  `process_replication` are the reconciliation tools, not a substitute for that guarantee.
+- **The read-then-write fallback has a real fidelity limit.** On a backend that does not
+  implement `apply_replication_snapshot_if_newer`, inline and queued replication fall back to
+  `_converge_replica_to_snapshot`, which can only update a row the replica already holds -- it
+  cannot create a row with the primary's id, since no base backend primitive lets a caller choose
+  an id on create. It also does not converge attachments or intermediate audit fields (e.g.
+  `sent_at`) that aren't part of `UpdateNotificationKwargs`. A backend that needs full-fidelity
+  replication -- including creating rows on a fresh replica, and converging attachments -- should
+  implement `apply_replication_snapshot_if_newer` rather than relying on this fallback.
 
 ### Operational Requirements
 - **Drain or dual-register the Celery queue before deploying.** Tasks queued under 1.x carry a

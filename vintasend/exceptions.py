@@ -109,6 +109,35 @@ class GitCommitShaReassignmentError(NotificationError):
     store_git_commit_sha."""
 
 
+class BackendNotFoundError(NotificationError):
+    """Raised when a multi-backend read or operation names a ``backend_identifier`` that
+    is not registered on the service -- neither the primary nor any additional backend."""
+
+
+class DuplicateBackendIdentifierError(NotificationError):
+    """Raised when two configured backends resolve to the same identifier."""
+
+
+class ReplicationError(NotificationError):
+    """Raised when a replication worker cannot carry out a replication it was told to do --
+    for example ``process_replication`` is handed a notification id that does not resolve on
+    the primary backend, so there is no authoritative snapshot to replicate.
+
+    Distinct from a best-effort replica write failing during inline or queued fan-out: those
+    are logged and reconciled later, never raised, because the primary write is the source of
+    truth. A ``ReplicationError`` means the reconciliation entrypoint itself was given something
+    it cannot act on."""
+
+
+class BackendMigrationError(NotificationError):
+    """Raised for a migration-level misuse of ``NotificationService.migrate_to_backend`` --
+    for example the destination backend named is the same as the source backend.
+
+    Distinct from a single record's destination-write failure during migration: those are
+    captured in the returned ``BackendMigrationResult.failures`` rather than raised, so one bad
+    record does not abort the whole migration."""
+
+
 class NotificationRenderError(NotificationError):
     """Raised when a notification has no email renderer available to render it: either no
     adapter is configured for its notification type, or the configured adapter's template

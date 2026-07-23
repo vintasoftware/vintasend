@@ -35,6 +35,12 @@ _ABC_LOCATIONS = {
     "AsyncIOBaseNotificationQueueService": (
         "vintasend.services.notification_queue_services.asyncio_base"
     ),
+    "BaseNotificationReplicationQueueService": (
+        "vintasend.services.notification_queue_services.replication_base"
+    ),
+    "AsyncIOBaseNotificationReplicationQueueService": (
+        "vintasend.services.notification_queue_services.asyncio_replication_base"
+    ),
     "BaseAttachmentManager": "vintasend.services.attachment_managers.base",
     "AsyncIOBaseAttachmentManager": "vintasend.services.attachment_managers.asyncio_base",
 }

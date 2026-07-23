@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import datetime
 import io
 import json
@@ -16,6 +17,7 @@ from vintasend.services.attachment_managers.stubs.fake_attachment_manager import
 )
 from vintasend.services.dataclasses import (
     AnyNotificationAttachment,
+    ApplyResult,
     AttachmentFile,
     AttachmentFileRecord,
     Notification,
@@ -776,6 +778,35 @@ class FakeFileBackend(BaseNotificationBackend):
         notification.git_commit_sha = git_commit_sha
         self._store_notifications()
 
+    def apply_replication_snapshot_if_newer(
+        self, snapshot: Notification | OneOffNotification
+    ) -> ApplyResult:
+        """Id-keyed, newer-wins upsert of a primary snapshot -- the reference implementation.
+
+        Inserts the snapshot when this backend lacks the row (preserving the primary's id),
+        replaces it when the snapshot's ``modified`` is at least as new as the stored row's,
+        and declines when the stored row is strictly newer. A defensive copy is stored so the
+        primary and this replica never share a mutable record. Downstream backends (e.g.
+        ``vintasend-django``) mirror this as an ``update_or_create`` that only overwrites when
+        ``modified`` is newer.
+        """
+        incoming = dataclasses.replace(snapshot)
+        for index, existing in enumerate(self.notifications):
+            if str(existing.id) != str(snapshot.id):
+                continue
+            if (
+                existing.modified is not None
+                and snapshot.modified is not None
+                and snapshot.modified < existing.modified
+            ):
+                return ApplyResult(applied=False, reason="local row is newer than the snapshot")
+            self.notifications[index] = incoming
+            self._store_notifications()
+            return ApplyResult(applied=True)
+        self.notifications.append(incoming)
+        self._store_notifications()
+        return ApplyResult(applied=True)
+
 
 class Config:
     def __init__(self, config_a: Decimal | None = None, config_b: datetime.datetime | None = None):
@@ -1513,3 +1544,32 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification = await self.get_notification(notification_id)
         notification.git_commit_sha = git_commit_sha
         await self._store_notifications(lock)
+
+    async def apply_replication_snapshot_if_newer(
+        self, snapshot: Notification | OneOffNotification
+    ) -> ApplyResult:
+        """Id-keyed, newer-wins upsert of a primary snapshot -- the reference implementation.
+
+        Inserts the snapshot when this backend lacks the row (preserving the primary's id),
+        replaces it when the snapshot's ``modified`` is at least as new as the stored row's,
+        and declines when the stored row is strictly newer. A defensive copy is stored so the
+        primary and this replica never share a mutable record. Downstream backends (e.g.
+        ``vintasend-django``) mirror this as an ``update_or_create`` that only overwrites when
+        ``modified`` is newer.
+        """
+        incoming = dataclasses.replace(snapshot)
+        for index, existing in enumerate(self.notifications):
+            if str(existing.id) != str(snapshot.id):
+                continue
+            if (
+                existing.modified is not None
+                and snapshot.modified is not None
+                and snapshot.modified < existing.modified
+            ):
+                return ApplyResult(applied=False, reason="local row is newer than the snapshot")
+            self.notifications[index] = incoming
+            await self._store_notifications()
+            return ApplyResult(applied=True)
+        self.notifications.append(incoming)
+        await self._store_notifications()
+        return ApplyResult(applied=True)

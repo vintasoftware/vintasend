@@ -4,8 +4,8 @@ import logging
 import sys
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable
-from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, ClassVar, Coroutine, Generic, Literal, TypeGuard, TypeVar, cast
 
 from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -22,25 +22,37 @@ else:
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
+    BackendMigrationError,
+    BackendNotFoundError,
+    DuplicateBackendIdentifierError,
     DuplicateNotificationAdapterError,
     GitCommitShaReassignmentError,
     NotificationContextGenerationError,
     NotificationError,
     NotificationMarkFailedError,
     NotificationMarkSentError,
+    NotificationNotFoundError,
     NotificationQueueServiceMissingError,
     NotificationRenderError,
     NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
+    ReplicationError,
     TenantReassignmentError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.dataclasses import (
+    NOTIFICATION_SYNC_COMPARABLE_FIELDS,
+    ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     AnyNotificationAttachment,
+    BackendMigrationFailure,
+    BackendMigrationResult,
+    BackendSyncStats,
     Notification,
     NotificationContextDict,
+    NotificationSyncFieldReport,
+    NotificationSyncReport,
     OneOffNotification,
     UpdateNotificationKwargs,
 )
@@ -54,11 +66,13 @@ from vintasend.services.helpers import (
     get_asyncio_notification_adapters,
     get_asyncio_notification_backend,
     get_asyncio_notification_queue_service,
+    get_asyncio_notification_replication_queue_service,
     get_attachment_manager,
     get_git_commit_sha_provider,
     get_notification_adapters,
     get_notification_backend,
     get_notification_queue_service,
+    get_notification_replication_queue_service,
 )
 from vintasend.services.notification_adapters.async_base import BackgroundNotificationAdapter
 from vintasend.services.notification_adapters.asyncio_background_base import (
@@ -81,7 +95,13 @@ from vintasend.services.notification_backends.filters import (
 from vintasend.services.notification_queue_services.asyncio_base import (
     AsyncIOBaseNotificationQueueService,
 )
+from vintasend.services.notification_queue_services.asyncio_replication_base import (
+    AsyncIOBaseNotificationReplicationQueueService,
+)
 from vintasend.services.notification_queue_services.base import BaseNotificationQueueService
+from vintasend.services.notification_queue_services.replication_base import (
+    BaseNotificationReplicationQueueService,
+)
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     BaseTemplatedEmailRenderer,
     EmailTemplateContent,
@@ -111,6 +131,133 @@ ALREADY_DELIVERED_NOTIFICATION_STATUSES = frozenset(
         NotificationStatus.CANCELLED.value,
     }
 )
+
+
+# Substrings that mark a replica write failure as a normal, reconcilable replication conflict
+# rather than a genuine error. Under a best-effort fan-out with retries, two states are
+# expected and self-healing: the replica already holds the row a create is replicating
+# ("duplicate"/"unique"/"conflict"/"already exists"), or it lacks the row an update is
+# replicating ("not found"/"does not exist"/...). Either way the service flips to the opposite
+# operation -- converging the replica to the primary's snapshot -- before giving up. Matched
+# case-insensitively against ``str(exc)``; mirrors vintasend-ts's
+# ``isLikelyDuplicateReplicationConflict`` and widens it to the missing-row direction the flip
+# also needs. Substring matching is deliberately loose: a false positive only triggers one
+# extra idempotent reconcile attempt, never data loss.
+_REPLICATION_CONFLICT_MARKERS = (
+    "duplicate",
+    "unique",
+    "conflict",
+    "already exists",
+    "not found",
+    "does not exist",
+    "no notification",
+    "matching query does not exist",
+)
+
+
+def _is_likely_duplicate_replication_conflict(exc: BaseException) -> bool:
+    """Whether ``exc`` from a replica write looks like a reconcilable replication conflict.
+
+    See ``_REPLICATION_CONFLICT_MARKERS``: a ``True`` result tells the service the failure is
+    the expected create-collides / update-missing race and it should flip to converging the
+    replica to the snapshot, rather than logging the write off as a hard failure.
+    """
+    message = str(exc).lower()
+    return any(marker in message for marker in _REPLICATION_CONFLICT_MARKERS)
+
+
+def _comparable_fields_for_sync(record: "Notification | OneOffNotification") -> tuple[str, ...]:
+    """Which comparable-field list applies to ``record`` for ``verify_notification_sync``.
+
+    A one-off notification has no ``user_id`` -- it carries ``email_or_phone`` / ``first_name`` /
+    ``last_name`` instead -- so it compares against ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+    rather than the regular ``Notification``'s list.
+    """
+    if isinstance(record, OneOffNotification):
+        return ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS
+    return NOTIFICATION_SYNC_COMPARABLE_FIELDS
+
+
+def _build_notification_sync_report(
+    notification_id: int | str | uuid.UUID,
+    primary_backend_identifier: str,
+    all_backend_identifiers: list[str],
+    records_by_backend: dict[str, "Notification | OneOffNotification"],
+) -> NotificationSyncReport:
+    """Turn per-backend reads into the field-by-field agreement report a dashboard consumes.
+
+    Shared by the sync and AsyncIO services -- both read each backend themselves (one awaits,
+    the other does not) and hand the resulting ``records_by_backend`` map here, so the diffing
+    logic itself, which does no I/O, is written once.
+    """
+    backends_with_record = [
+        identifier for identifier in all_backend_identifiers if identifier in records_by_backend
+    ]
+    backends_missing_record = [
+        identifier for identifier in all_backend_identifiers if identifier not in records_by_backend
+    ]
+
+    reference_record = records_by_backend.get(primary_backend_identifier) or next(
+        iter(records_by_backend.values()), None
+    )
+    comparable_fields = (
+        _comparable_fields_for_sync(reference_record) if reference_record is not None else ()
+    )
+
+    field_reports: list[NotificationSyncFieldReport] = []
+    all_fields_agree = True
+
+    # Pathological but possible under corrupt replication: two backends hold different
+    # concrete dataclass types (a Notification on one, a OneOffNotification on another) for
+    # what should be the same logical record. `_comparable_fields_for_sync` only looks at the
+    # reference record's type, so without this check the mismatch is invisible and the report
+    # could claim `in_sync=True`. Report it as a synthetic field entry rather than changing
+    # the public TypedDict shapes.
+    record_types_by_backend = {
+        identifier: type(record).__name__ for identifier, record in records_by_backend.items()
+    }
+    has_heterogeneous_record_types = len(set(record_types_by_backend.values())) > 1
+    if has_heterogeneous_record_types:
+        all_fields_agree = False
+        field_reports.append(
+            {
+                "field": "record_type",
+                "in_agreement": False,
+                "differing_values": record_types_by_backend,
+            }
+        )
+
+    for field_name in comparable_fields:
+        values_by_backend = {
+            identifier: getattr(record, field_name)
+            for identifier, record in records_by_backend.items()
+            if hasattr(record, field_name)
+        }
+        values = list(values_by_backend.values())
+        in_agreement = all(value == values[0] for value in values) if values else True
+        if not in_agreement:
+            all_fields_agree = False
+        field_reports.append(
+            {
+                "field": field_name,
+                "in_agreement": in_agreement,
+                "differing_values": {} if in_agreement else values_by_backend,
+            }
+        )
+
+    return {
+        "notification_id": notification_id,
+        "primary_backend_identifier": primary_backend_identifier,
+        "backends_with_record": backends_with_record,
+        "backends_missing_record": backends_missing_record,
+        "in_sync": not backends_missing_record and all_fields_agree,
+        "fields": field_reports,
+    }
+
+
+# The return type of the primary write passed to ``_execute_multi_backend_write``, propagated
+# so a create returns a ``Notification`` and a mark returns whatever its backend method does.
+_WriteResultT = TypeVar("_WriteResultT")
 
 
 def validate_unique_adapter_notification_types(
@@ -177,7 +324,11 @@ class NotificationService(Generic[A, B]):
     notification_adapters: Iterable[A]
     notification_backend: B
     notification_queue_service: BaseNotificationQueueService | None
+    replication_queue_service: BaseNotificationReplicationQueueService | None
     raise_on_failed_send: bool
+    replication_mode: Literal["inline", "queued"]
+    _backends: dict[str, B]
+    _primary_backend_identifier: str
 
     def __init__(
         self,
@@ -191,6 +342,9 @@ class NotificationService(Generic[A, B]):
         attachment_manager: BaseAttachmentManager | str | None = None,
         git_commit_sha_provider: BaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
+        additional_backends: Iterable[B | str] | None = None,
+        replication_queue_service: BaseNotificationReplicationQueueService | str | None = None,
+        replication_mode: Literal["inline", "queued"] | None = None,
     ):
         """
         Build a notification service.
@@ -210,12 +364,51 @@ class NotificationService(Generic[A, B]):
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
+        :param additional_backends: extra backends replicated reads (and, from a later
+            phase, writes) can be routed to. Each entry is a backend instance or its import
+            string, resolved the same way as `notification_backend`. A backend is
+            addressed by its `get_backend_identifier()` when it declares one, or by
+            `backend-{n}` otherwise -- `n` is the backend's position among the additional
+            backends, starting at 1 (the primary is position 0). Absent
+            `additional_backends`, the service behaves exactly as a single-backend 2.0
+            deployment.
+        :param replication_queue_service: the queue service used to push replica writes off
+            the request path when ``replication_mode`` is ``"queued"``. Accepts an instance or
+            an import string; when it is None, `NOTIFICATION_REPLICATION_QUEUE_SERVICE` is
+            used, and queued replication simply falls back to inline if that is unset too.
+        :param replication_mode: how writes fan out to the additional backends. ``"inline"``
+            replicates on the request path, right after the primary write. ``"queued"`` enqueues
+            one replication task per destination backend via ``replication_queue_service``,
+            falling back to inline when the queue is missing or an enqueue fails. When None (the
+            default), `NOTIFICATION_REPLICATION_MODE` is used, itself defaulting to ``"inline"``.
+            Ignored entirely by a single-backend service, which never replicates.
+        :raises DuplicateBackendIdentifierError: if an additional backend's resolved
+            identifier collides with an already-registered backend's identifier --
+            including the primary's.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
-        NotificationSettings(config)
+        app_settings = NotificationSettings(config)
 
         self.raise_on_failed_send = raise_on_failed_send
+        # An explicit constructor value wins; otherwise fall back to the setting, itself
+        # defaulting to "inline". Under a bare-Python host the setting reads as {} (no
+        # framework), which is falsy and correctly resolves to "inline". Any other value --
+        # a typo like "queded" from an untyped env var/setting -- must fail loud rather than
+        # silently degrade to inline replication.
+        resolved_replication_mode: Any = (
+            replication_mode
+            if replication_mode is not None
+            else app_settings.NOTIFICATION_REPLICATION_MODE
+        )
+        if not resolved_replication_mode:
+            resolved_replication_mode = "inline"
+        if resolved_replication_mode not in ("inline", "queued"):
+            raise NotificationError(
+                f"Invalid replication_mode {resolved_replication_mode!r}; expected 'inline' or "
+                "'queued'"
+            )
+        self.replication_mode = resolved_replication_mode
 
         if isinstance(notification_queue_service, BaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -232,6 +425,19 @@ class NotificationService(Generic[A, B]):
                 # would read as "no queue configured" and silently never deliver.
                 self.notification_queue_service = None
 
+        if isinstance(replication_queue_service, BaseNotificationReplicationQueueService):
+            self.replication_queue_service = replication_queue_service
+        else:
+            try:
+                self.replication_queue_service = get_notification_replication_queue_service(
+                    replication_queue_service, None, config
+                )
+            except NotificationQueueServiceMissingError:
+                # Nothing configured: queued replication has no queue and falls back to inline
+                # per backend (see _execute_multi_backend_write). A resolution error -- a
+                # configured but unusable import string -- deliberately propagates instead.
+                self.replication_queue_service = None
+
         if isinstance(notification_backend, BaseNotificationBackend):
             self.notification_backend = cast(B, notification_backend)
         else:
@@ -240,6 +446,37 @@ class NotificationService(Generic[A, B]):
                 get_notification_backend(notification_backend, notification_backend_kwargs, config),
             )
         self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        # Build the ordered backend registry: the primary first, then every additional
+        # backend in the order given. A backend's identifier is whatever
+        # `get_backend_identifier()` reports, or `backend-{n}` (n = its position among the
+        # additional backends, 1-indexed; the primary falls back to `backend-0`) when it
+        # does not declare one. Absent `additional_backends`, this is just `{primary: ...}`
+        # and every read below resolves to the primary exactly as in a single-backend 2.0
+        # deployment.
+        primary_backend_identifier = self.notification_backend.get_backend_identifier() or (
+            "backend-0"
+        )
+        self._backends = {primary_backend_identifier: self.notification_backend}
+        self._primary_backend_identifier = primary_backend_identifier
+
+        if additional_backends is not None:
+            for index, additional_backend in enumerate(additional_backends, start=1):
+                if isinstance(additional_backend, BaseNotificationBackend):
+                    resolved_additional_backend = cast(B, additional_backend)
+                else:
+                    resolved_additional_backend = cast(
+                        B, get_notification_backend(additional_backend, None, config)
+                    )
+                additional_backend_identifier = (
+                    resolved_additional_backend.get_backend_identifier() or f"backend-{index}"
+                )
+                if additional_backend_identifier in self._backends:
+                    raise DuplicateBackendIdentifierError(
+                        f"Two configured backends resolve to the same identifier "
+                        f"'{additional_backend_identifier}'"
+                    )
+                self._backends[additional_backend_identifier] = resolved_additional_backend
 
         # Resolve the attachment manager (instance, dotted path, or the
         # NOTIFICATION_ATTACHMENT_MANAGER setting) and inject it into the backend when the
@@ -342,6 +579,612 @@ class NotificationService(Generic[A, B]):
         """
         self.notification_queue_service = queue_service
 
+    def register_replication_queue_service(
+        self, replication_queue_service: BaseNotificationReplicationQueueService
+    ) -> None:
+        """
+        Inject the replication queue service after construction.
+
+        Useful when the queue service cannot exist yet at construction time -- a broker
+        connection built during application startup, for example. Once set, ``"queued"``
+        replication enqueues one task per destination backend instead of replicating inline.
+
+        Parameters:
+            replication_queue_service: BaseNotificationReplicationQueueService - the queue
+                service to use for queued replication from now on
+        """
+        self.replication_queue_service = replication_queue_service
+
+    def get_primary_backend_identifier(self) -> str:
+        """Return the primary backend's identifier."""
+        return self._primary_backend_identifier
+
+    def get_all_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier, primary first, in the order the
+        backends were configured."""
+        return list(self._backends.keys())
+
+    def get_additional_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier except the primary's, in the order
+        the additional backends were configured."""
+        return [
+            identifier
+            for identifier in self._backends
+            if identifier != self._primary_backend_identifier
+        ]
+
+    def has_backend(self, backend_identifier: str) -> bool:
+        """Whether `backend_identifier` names a registered backend (primary or additional)."""
+        return backend_identifier in self._backends
+
+    def _get_backend(self, backend_identifier: str | None = None) -> B:
+        """Resolve a backend by identifier for read routing.
+
+        `None` resolves to the primary backend, preserving every existing call site's
+        behaviour. An identifier that names no registered backend raises
+        `BackendNotFoundError` rather than silently falling back to the primary.
+        """
+        if backend_identifier is None:
+            return self._backends[self._primary_backend_identifier]
+        if backend_identifier not in self._backends:
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{backend_identifier}'"
+            )
+        return self._backends[backend_identifier]
+
+    def _execute_multi_backend_write(
+        self,
+        primary_write: Callable[[B], _WriteResultT],
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+        replication_notification_id: int | str | uuid.UUID | None = None,
+    ) -> _WriteResultT:
+        """Run a write on the primary, then fan it out to every additional backend inline.
+
+        The primary write runs first and its result -- and any exception -- is the caller's:
+        the primary is the source of truth, so its failure is the user's failure and
+        propagates unchanged. Only after it succeeds, and only when additional backends are
+        configured, is the write replicated. Each replica is handled in registry order and any
+        replica failure is logged and swallowed, so a rejecting replica never fails the user's
+        operation -- it is reconciled by a later write. A single-backend service short-circuits
+        and never enters the replication loop, staying byte-for-byte identical to a
+        single-backend 2.0 deployment.
+
+        ``primary_write`` performs the mutation on the backend it is handed. ``additional_write``
+        applies the same mutation to a replica when snapshot application is unavailable; it
+        receives the primary's post-write snapshot (or ``None`` when there is no single record
+        to snapshot, e.g. bulk read-marking or a cancel that deleted the row).
+        ``replication_notification_id`` names the record to snapshot when the primary write does
+        not itself return one.
+
+        In ``"queued"`` mode the replica writes are enqueued (one task per destination backend)
+        instead of running inline, degrading to inline per backend when the queue is missing or
+        an enqueue fails -- see ``_replicate_queued``.
+        """
+        result = primary_write(self.notification_backend)
+
+        additional_backend_identifiers = self.get_additional_backend_identifiers()
+        if not additional_backend_identifiers:
+            return result
+
+        if self.replication_mode == "queued":
+            self._replicate_queued(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        else:
+            self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        return result
+
+    def _replicate_inline_all(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Read the primary snapshot once and replicate it inline to every named backend."""
+        snapshot = self._read_replication_snapshot(replication_notification_id, result)
+        for backend_identifier in additional_backend_identifiers:
+            self._replicate_inline_one(backend_identifier, snapshot, additional_write)
+
+    def _replicate_inline_one(
+        self,
+        backend_identifier: str,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Replicate one write to one backend inline, logging and swallowing any failure.
+
+        A rejecting replica never fails the user's operation -- it is reconciled by a later
+        write or by ``process_replication``.
+        """
+        replica = self._backends[backend_identifier]
+        try:
+            self._replicate_write_to_backend(replica, snapshot, additional_write)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to replicate a write to backend %s (notification %s); the primary "
+                "write succeeded and the replica will be reconciled by a later write",
+                backend_identifier,
+                getattr(snapshot, "id", None),
+            )
+
+    def _replicate_queued(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Enqueue one replication task per destination backend, degrading to inline.
+
+        When there is no replication queue service, or the notification id cannot be resolved,
+        every backend is replicated inline and a warning is logged -- a broken or absent queue
+        must never silently drop replication. When a single backend's ``enqueue_replication``
+        raises, only that backend is replicated inline; the ones already enqueued are left for
+        the worker. Nothing here may fail the user's already-successful primary write.
+        """
+        queued_id = replication_notification_id
+        if queued_id is None and isinstance(result, (Notification, OneOffNotification)):
+            queued_id = result.id
+
+        if self.replication_queue_service is None or queued_id is None:
+            logger.warning(
+                "Queued replication requested but %s; falling back to inline replication for "
+                "notification %s",
+                "no replication queue service is configured"
+                if self.replication_queue_service is None
+                else "the notification id could not be resolved",
+                queued_id if queued_id is not None else replication_notification_id,
+            )
+            self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+            return
+
+        snapshot: Notification | OneOffNotification | None = None
+        snapshot_read = False
+        for backend_identifier in additional_backend_identifiers:
+            try:
+                self.replication_queue_service.enqueue_replication(queued_id, backend_identifier)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to enqueue replication of notification %s to backend %s; "
+                    "replicating it inline instead",
+                    queued_id,
+                    backend_identifier,
+                )
+                if not snapshot_read:
+                    snapshot = self._read_replication_snapshot(replication_notification_id, result)
+                    snapshot_read = True
+                self._replicate_inline_one(backend_identifier, snapshot, additional_write)
+
+    def _read_replication_snapshot(
+        self,
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+    ) -> "Notification | OneOffNotification | None":
+        """Re-read the primary's authoritative record to replicate, or ``None`` if there is none.
+
+        Prefers ``replication_notification_id``; otherwise uses the id of the primary write's
+        result when that result is itself a notification (creates and updates). Returns ``None``
+        when no id resolves (e.g. bulk read-marking) or the record no longer exists on the
+        primary (e.g. a cancel that deleted it) -- the caller then relies on ``additional_write``
+        instead of snapshot application.
+
+        Runs after the primary write has already committed, so it must never fail the caller:
+        any exception raised by the re-read (not just ``NotificationError``, e.g. a transient
+        connection error from a real backend) is logged and swallowed, degrading this replica
+        pass to the ``additional_write`` fallback rather than failing an already-successful
+        primary write.
+        """
+        snapshot_id = replication_notification_id
+        if snapshot_id is None and isinstance(result, (Notification, OneOffNotification)):
+            snapshot_id = result.id
+        if snapshot_id is None:
+            return None
+        try:
+            return self.notification_backend.get_notification(snapshot_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to re-read notification %s to build a replication snapshot; the "
+                "primary write already succeeded and replication will be reconciled later",
+                snapshot_id,
+                exc_info=True,
+            )
+            return None
+
+    def _replicate_write_to_backend(
+        self,
+        replica: B,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Apply one write to one replica, preferring snapshot application then falling back.
+
+        When a snapshot is available the replica's ``apply_replication_snapshot_if_newer`` is
+        tried first: a backend that implements it upserts the whole record -- creating the row
+        with the primary's id or refreshing it newer-wins -- in one call. When it declines
+        (``applied=False``, the concrete default) the ``additional_write`` fallback mirrors the
+        mutation with the backend's own primitives. A duplicate/conflict failure -- the replica
+        already holds a created row, or lacks a row being updated -- flips once to converging the
+        replica to the snapshot before the error propagates to the caller's logging.
+        """
+        try:
+            if (
+                snapshot is not None
+                and replica.apply_replication_snapshot_if_newer(snapshot).applied
+            ):
+                return
+            additional_write(replica, snapshot)
+        except Exception as exc:  # noqa: BLE001
+            if snapshot is None or not _is_likely_duplicate_replication_conflict(exc):
+                raise
+            self._converge_replica_to_snapshot(replica, snapshot)
+
+    def _replicate_snapshot_fallback(
+        self, replica: B, snapshot: "Notification | OneOffNotification | None"
+    ) -> None:
+        """Default ``additional_write``: converge a replica to the primary's snapshot.
+
+        Used for every single-record write (create, update, mark, store). It only converges a
+        row the replica already holds; it cannot create a row with the primary's id, because no
+        base primitive assigns a chosen id -- that is exactly what
+        ``apply_replication_snapshot_if_newer`` exists for. A backend that implements snapshot
+        application never reaches this path.
+        """
+        if snapshot is None:
+            return
+        self._converge_replica_to_snapshot(replica, snapshot)
+
+    def _converge_replica_to_snapshot(
+        self, replica: B, snapshot: "Notification | OneOffNotification"
+    ) -> None:
+        """Bring an existing replica row into line with the primary's snapshot via primitives.
+
+        Serves as both the read-then-write fallback for a backend that declines snapshot
+        application and the flip target when a replica reports a duplicate/conflict. Requires the
+        row to already exist on the replica; an absent row is logged and skipped, since inline
+        replication cannot create a row with the primary's id without snapshot-apply support.
+
+        Best-effort: this read-then-write fallback does NOT converge attachments or intermediate
+        audit fields (e.g. ``sent_at``) -- ``update_data`` only carries the plain content fields.
+        A backend that needs full-fidelity replication, including attachments, should implement
+        ``apply_replication_snapshot_if_newer`` instead of relying on this fallback.
+        """
+        try:
+            replica_row = replica.get_notification(snapshot.id)
+        except NotificationNotFoundError:
+            logger.warning(
+                "Replica lacks notification %s and does not implement "
+                "apply_replication_snapshot_if_newer; cannot create it with its primary id "
+                "inline -- it will be reconciled later",
+                snapshot.id,
+            )
+            return
+        update_data: UpdateNotificationKwargs = {
+            "title": snapshot.title,
+            "body_template": snapshot.body_template,
+            "context_name": snapshot.context_name,
+            "context_kwargs": snapshot.context_kwargs,
+            "send_after": snapshot.send_after,
+            "subject_template": snapshot.subject_template,
+            "preheader_template": snapshot.preheader_template,
+            "adapter_extra_parameters": snapshot.adapter_extra_parameters,
+        }
+        replica.persist_notification_update(notification_id=snapshot.id, update_data=update_data)
+        if snapshot.context_used is not None:
+            replica.store_context_used(
+                snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
+            )
+        if snapshot.git_commit_sha is not None:
+            replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        # Reach the snapshot's status through the same intermediate transitions a real backend
+        # requires, rather than forcing a single terminal `mark_*` call: a row still PENDING_SEND
+        # must pass through SENT on its way to READ, matching the state machine every backend
+        # (including strict ones) enforces.
+        current_status = replica_row.status
+        if snapshot.status == NotificationStatus.SENT.value:
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                replica.mark_pending_as_sent(snapshot.id)
+        elif snapshot.status == NotificationStatus.FAILED.value:
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                replica.mark_pending_as_failed(snapshot.id)
+        elif snapshot.status == NotificationStatus.READ.value:
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                replica.mark_pending_as_sent(snapshot.id)
+                replica.mark_sent_as_read(snapshot.id)
+            elif current_status == NotificationStatus.SENT.value:
+                replica.mark_sent_as_read(snapshot.id)
+
+    def _replicate_store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: NotificationContextDict,
+        adapter_import_str: str,
+    ) -> None:
+        """Persist ``context_used`` on the primary and fan it out to the replicas.
+
+        Extracted from ``send`` / ``delayed_send`` into its own method so the
+        ``_execute_multi_backend_write`` closure captures these method parameters rather than
+        the send loop's ``adapter`` and ``context`` variables -- a loop-captured closure is a
+        late-binding hazard the linters (rightly) reject.
+        """
+        self._execute_multi_backend_write(
+            lambda backend: backend.store_context_used(
+                notification_id, context, adapter_import_str
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
+
+    def process_replication(
+        self,
+        notification_id: int | str | uuid.UUID,
+        target_backend_identifier: str | None = None,
+    ) -> dict[str, list]:
+        """Worker entrypoint: converge one or more replicas to the primary's snapshot.
+
+        This is what a queued-replication worker calls to drain a task enqueued by
+        ``enqueue_replication``. It reads the authoritative record from the primary backend and
+        converges each target to it, preferring the target's ``apply_replication_snapshot_if_newer``
+        and falling back to read-then-write with the duplicate-conflict retry -- the same Phase 2
+        convergence path inline replication uses.
+
+        ``target_backend_identifier`` names a single backend to replicate to; when omitted, every
+        additional backend is targeted. An unknown identifier raises ``BackendNotFoundError``.
+
+        The notification must resolve on the primary: it is the source of truth, and the worker
+        was told to replicate a specific id, so a missing record is a ``ReplicationError`` rather
+        than a silent no-op. A per-target failure is captured, not raised, so one bad replica does
+        not abort the others.
+
+        Returns ``{"successes": [<identifier>, ...], "failures": [{"backend_identifier": ...,
+        "error": ...}, ...]}``.
+        """
+        if target_backend_identifier is not None and not self.has_backend(
+            target_backend_identifier
+        ):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{target_backend_identifier}'"
+            )
+
+        try:
+            snapshot = self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError as exc:
+            raise ReplicationError(
+                f"Cannot replicate notification {notification_id}: it does not exist on the "
+                "primary backend"
+            ) from exc
+
+        if target_backend_identifier is not None:
+            targets = [target_backend_identifier]
+        else:
+            targets = self.get_additional_backend_identifiers()
+
+        successes: list[str] = []
+        failures: list[dict[str, str]] = []
+        for identifier in targets:
+            target = self._backends[identifier]
+            try:
+                self._replicate_write_to_backend(
+                    target, snapshot, self._replicate_snapshot_fallback
+                )
+                # `_replicate_write_to_backend` returns normally when a target declines
+                # snapshot application (`apply_replication_snapshot_if_newer` -> applied=False)
+                # and `_converge_replica_to_snapshot` then logs-and-skips because the row is
+                # absent -- it cannot create a row with the primary's id without snapshot-apply
+                # support. That is a legitimate best-effort outcome for the inline path, but
+                # `process_replication` has an explicit success/failure contract a queued worker
+                # relies on, so a target left without the row must be reported as a failure, not
+                # a success.
+                try:
+                    target.get_notification(notification_id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "backend_identifier": identifier,
+                            "error": (
+                                "replica lacks apply_replication_snapshot_if_newer and could "
+                                "not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    successes.append(identifier)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to replicate notification %s to backend %s during process_replication",
+                    notification_id,
+                    identifier,
+                )
+                failures.append({"backend_identifier": identifier, "error": str(exc)})
+        return {"successes": successes, "failures": failures}
+
+    def replicate_notification(self, notification_id: int | str | uuid.UUID) -> dict[str, list]:
+        """Replicate a notification to every additional backend -- the no-target alias for
+        ``process_replication(notification_id, None)``."""
+        return self.process_replication(notification_id, None)
+
+    def verify_notification_sync(
+        self, notification_id: int | str | uuid.UUID
+    ) -> NotificationSyncReport:
+        """Report, for one notification id, which backends hold it and whether they agree.
+
+        Reads the record from every registered backend (primary and every additional backend).
+        A backend that does not have the record is reported absent, not fatal --
+        ``NotificationNotFoundError`` from any single backend never aborts the check for the
+        others. For backends that do have the record, every comparable field (see
+        ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+        in ``dataclasses.py``) is compared across those backends, reporting per field whether all
+        of them agree and, when they do not, each disagreeing backend's value.
+
+        This is a read-only diagnostic -- it never writes. Use ``process_replication`` /
+        ``replicate_notification`` to reconcile drift this uncovers.
+        """
+        all_backend_identifiers = self.get_all_backend_identifiers()
+        records_by_backend: dict[str, Notification | OneOffNotification] = {}
+        for identifier in all_backend_identifiers:
+            try:
+                records_by_backend[identifier] = self._backends[identifier].get_notification(
+                    notification_id
+                )
+            except NotificationNotFoundError:
+                continue
+
+        return _build_notification_sync_report(
+            notification_id,
+            self._primary_backend_identifier,
+            all_backend_identifiers,
+            records_by_backend,
+        )
+
+    def get_backend_sync_stats(self) -> dict[str, BackendSyncStats]:
+        """Per-backend health snapshot: notification count and whether the backend is reachable.
+
+        Drives ``total_notifications`` from ``count_notifications({})``, which every backend
+        provides (a concrete default derived from ``filter_notifications``, or an efficient
+        ``COUNT``-backed override). A backend that raises while being queried is reported
+        ``status='error'`` with the exception message captured in ``error`` and
+        ``total_notifications`` at ``0`` -- the exception itself never propagates, so one broken
+        backend never fails stats for the others.
+        """
+        stats: dict[str, BackendSyncStats] = {}
+        for identifier in self.get_all_backend_identifiers():
+            try:
+                total_notifications = self._backends[identifier].count_notifications({})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Backend %s raised while computing sync stats; reporting it as unhealthy "
+                    "rather than failing stats for the other backends",
+                    identifier,
+                )
+                stats[identifier] = {
+                    "total_notifications": 0,
+                    "status": "error",
+                    "error": str(exc),
+                }
+                continue
+            stats[identifier] = {"total_notifications": total_notifications, "status": "healthy"}
+        return stats
+
+    def migrate_to_backend(
+        self,
+        destination_backend_identifier: str,
+        batch_size: int,
+        source_backend_identifier: str | None = None,
+    ) -> BackendMigrationResult:
+        """Copy every notification from one backend to another, in pages.
+
+        For onboarding a new replica or retiring an old backend. Pages through the source
+        (the primary when ``source_backend_identifier`` is omitted) via ``filter_notifications``,
+        ``batch_size`` rows at a time, writing each record into the destination through the same
+        snapshot-apply / read-then-write convergence path inline and queued replication use
+        (``_replicate_write_to_backend``): a destination implementing
+        ``apply_replication_snapshot_if_newer`` gets an id-preserving upsert in one call; one that
+        does not falls back to converging an existing row and, like ``process_replication``,
+        cannot create a row it lacks -- that is reported as a failure, not a silent success.
+
+        Copies only -- it never deletes from the source. Retiring the source is a separate,
+        operational decision made after verifying the destination, so migrating twice (or
+        migrating, verifying, then retiring) is the intended workflow.
+
+        Idempotent by re-running: a record already on the destination is converged (or upserted
+        newer-wins), never duplicated, via the same duplicate-conflict retry inline replication
+        relies on. A single record's destination-write failure is captured in the returned
+        ``failures`` list and does not abort the rest of the migration.
+
+        Raises ``BackendNotFoundError`` if either the source or the destination names an
+        unregistered backend, and ``BackendMigrationError`` if they name the same one --
+        migrating a backend onto itself is a caller mistake, not a partial no-op worth silently
+        accepting -- or if ``batch_size`` is not a positive integer.
+
+        Assumes the source is quiescent: it pages the source with a stable cursor, so if the
+        source is concurrently receiving writes (for example, it is itself a live replica of
+        another active service), rows inserted mid-run can shift page boundaries and be skipped
+        or seen twice.
+        """
+        if batch_size <= 0:
+            raise BackendMigrationError(
+                f"batch_size must be a positive integer, got {batch_size!r}"
+            )
+        if not self.has_backend(destination_backend_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{destination_backend_identifier}'"
+            )
+        resolved_source_identifier = (
+            source_backend_identifier
+            if source_backend_identifier is not None
+            else self._primary_backend_identifier
+        )
+        if not self.has_backend(resolved_source_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{resolved_source_identifier}'"
+            )
+        if resolved_source_identifier == destination_backend_identifier:
+            raise BackendMigrationError(
+                "Cannot migrate a backend onto itself: source and destination are both "
+                f"'{resolved_source_identifier}'"
+            )
+
+        source = self._backends[resolved_source_identifier]
+        destination = self._backends[destination_backend_identifier]
+
+        migrated = 0
+        failures: list[BackendMigrationFailure] = []
+        page = 1
+        while True:
+            batch = list(source.filter_notifications({}, page=page, page_size=batch_size))
+            if not batch:
+                break
+            for record in batch:
+                try:
+                    self._replicate_write_to_backend(
+                        destination, record, self._replicate_snapshot_fallback
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to migrate notification %s from backend %s to backend %s",
+                        record.id,
+                        resolved_source_identifier,
+                        destination_backend_identifier,
+                    )
+                    failures.append({"notification_id": record.id, "error": str(exc)})
+                    continue
+                # As in `process_replication`, `_replicate_write_to_backend` returns normally
+                # when the destination declines snapshot application and lacks the row -- it
+                # cannot be created inline without `apply_replication_snapshot_if_newer` support.
+                # That must be reported as a migration failure, not counted as migrated.
+                try:
+                    destination.get_notification(record.id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "notification_id": record.id,
+                            "error": (
+                                "destination lacks apply_replication_snapshot_if_newer and "
+                                "could not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    migrated += 1
+            if len(batch) < batch_size:
+                break
+            page += 1
+
+        return {"migrated": migrated, "failures": failures}
+
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
     ) -> None:
@@ -374,7 +1217,11 @@ class NotificationService(Generic[A, B]):
         if normalized_sha == notification.git_commit_sha:
             return
 
-        self.notification_backend.store_git_commit_sha(notification.id, normalized_sha)
+        self._execute_multi_backend_write(
+            lambda backend: backend.store_git_commit_sha(notification.id, normalized_sha),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification.id,
+        )
         notification.git_commit_sha = normalized_sha
 
     def send(
@@ -454,7 +1301,11 @@ class NotificationService(Generic[A, B]):
                         "Failed to generate context for notification %s", notification.id
                     )
                     try:
-                        self.notification_backend.mark_pending_as_failed(notification.id)
+                        self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification.id),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification.id,
+                        )
                     except NotificationUpdateError as e:
                         logger.exception(
                             "Failed to mark notification %s as failed", notification.id
@@ -479,7 +1330,11 @@ class NotificationService(Generic[A, B]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification.id)
                 try:
-                    self.notification_backend.mark_pending_as_failed(notification.id)
+                    self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification.id),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification.id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification.id)
                     if self.raise_on_failed_send:
@@ -492,11 +1347,13 @@ class NotificationService(Generic[A, B]):
                 continue
 
             try:
-                self.notification_backend.mark_pending_as_sent(notification.id)
-                self.notification_backend.store_context_used(
-                    notification.id,
-                    context,
-                    adapter.adapter_import_str,
+                self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification.id),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification.id,
+                )
+                self._replicate_store_context_used(
+                    notification.id, context, adapter.adapter_import_str
                 )
             except NotificationUpdateError as e:
                 logger.exception("Failed to mark notification %s as sent", notification.id)
@@ -563,7 +1420,10 @@ class NotificationService(Generic[A, B]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = self.notification_backend.persist_notification(**persist_kwargs)
+        notification = self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
+        )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -635,7 +1495,10 @@ class NotificationService(Generic[A, B]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = self.notification_backend.persist_one_off_notification(**persist_kwargs)
+        notification = self._execute_multi_backend_write(
+            lambda backend: backend.persist_one_off_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
+        )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -671,9 +1534,13 @@ class NotificationService(Generic[A, B]):
             raise GitCommitShaReassignmentError(
                 "A notification's git_commit_sha is system-managed and cannot be set directly"
             )
-        notification = self.notification_backend.persist_notification_update(
-            notification_id=notification_id,
-            update_data=kwargs,
+        notification = self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification_update(
+                notification_id=notification_id,
+                update_data=kwargs,
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -681,31 +1548,43 @@ class NotificationService(Generic[A, B]):
             self.send(notification)
         return notification
 
-    def get_all_future_notifications(self) -> Iterable[Notification | OneOffNotification]:
+    def get_all_future_notifications(
+        self, backend_identifier: str | None = None
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
+
+        Parameters:
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return self.notification_backend.get_all_future_notifications()
+        return self._get_backend(backend_identifier).get_all_future_notifications()
 
     def get_all_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
         Parameters:
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications from the user
         """
-        return self.notification_backend.get_all_future_notifications_from_user(user_id)
+        return self._get_backend(backend_identifier).get_all_future_notifications_from_user(user_id)
 
     def get_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int,
+        page_size: int,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -714,16 +1593,18 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of the future notifications from the user
         """
-        return self.notification_backend.get_future_notifications_from_user(
+        return self._get_backend(backend_identifier).get_future_notifications_from_user(
             user_id, page, page_size
         )
 
     def get_future_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -732,11 +1613,13 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return self.notification_backend.get_future_notifications(page, page_size)
+        return self._get_backend(backend_identifier).get_future_notifications(page, page_size)
 
     def _is_asyncio_context_function(
         self,
@@ -811,7 +1694,7 @@ class NotificationService(Generic[A, B]):
         logger.info("Failed to send %s notifications", notifications_failed)
 
     def get_pending_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
@@ -819,25 +1702,29 @@ class NotificationService(Generic[A, B]):
         Parameters:
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the pending notifications
         """
-        return self.notification_backend.get_pending_notifications(page, page_size)
+        return self._get_backend(backend_identifier).get_pending_notifications(page, page_size)
 
     def get_notification(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to get
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Notification | OneOffNotification - the notification
         """
-        return self.notification_backend.get_notification(notification_id)
+        return self._get_backend(backend_identifier).get_notification(notification_id)
 
     def mark_read(
         self, notification_id: int | str | uuid.UUID
@@ -854,7 +1741,11 @@ class NotificationService(Generic[A, B]):
         Returns:
             Notification | OneOffNotification - the updated notification
         """
-        return self.notification_backend.mark_sent_as_read(notification_id)
+        return self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read(notification_id),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
 
     def mark_read_bulk(
         self,
@@ -876,13 +1767,20 @@ class NotificationService(Generic[A, B]):
         Returns:
             Iterable[Notification] - the requested notifications that are read after the operation
         """
-        return self.notification_backend.mark_sent_as_read_bulk(notification_ids, user_id=user_id)
+        # Materialize once: the id iterable may be a single-use generator, and both the primary
+        # write and every replica mirror need to consume it.
+        ids = list(notification_ids)
+        return self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+            lambda backend, snapshot: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+        )
 
     def get_in_app_unread(
         self,
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get unread in-app notifications for a user.
@@ -894,6 +1792,8 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the unread in-app notifications
@@ -902,7 +1802,7 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.filter_in_app_unread_notifications(
+        return self._get_backend(backend_identifier).filter_in_app_unread_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
@@ -911,6 +1811,7 @@ class NotificationService(Generic[A, B]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get all in-app notifications (read + unread) for a user, paginated.
@@ -922,6 +1823,8 @@ class NotificationService(Generic[A, B]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the in-app notifications
@@ -930,11 +1833,13 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.filter_in_app_notifications(
+        return self._get_backend(backend_identifier).filter_in_app_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
-    def get_in_app_notifications_count(self, user_id: int | str | uuid.UUID) -> int:
+    def get_in_app_notifications_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of in-app notifications (read + unread) for a user.
 
@@ -945,9 +1850,11 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.count_in_app_notifications(user_id)
+        return self._get_backend(backend_identifier).count_in_app_notifications(user_id)
 
-    def get_in_app_unread_count(self, user_id: int | str | uuid.UUID) -> int:
+    def get_in_app_unread_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of unread in-app notifications for a user.
 
@@ -958,7 +1865,7 @@ class NotificationService(Generic[A, B]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return self.notification_backend.count_in_app_unread_notifications(user_id)
+        return self._get_backend(backend_identifier).count_in_app_unread_notifications(user_id)
 
     def filter_notifications(
         self,
@@ -966,6 +1873,7 @@ class NotificationService(Generic[A, B]):
         page: int,
         page_size: int,
         order_by: NotificationOrderBy | None = None,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Query notifications with a composable filter, ordering and pagination.
@@ -980,15 +1888,21 @@ class NotificationService(Generic[A, B]):
             page: int - the 1-indexed page number to get
             page_size: int - the number of notifications per page
             order_by: NotificationOrderBy | None - the primary sort field and direction
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of matches
         """
-        return self.notification_backend.filter_notifications(
+        return self._get_backend(backend_identifier).filter_notifications(
             filter, page=page, page_size=page_size, order_by=order_by
         )
 
-    def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+    def count_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        backend_identifier: str | None = None,
+    ) -> int:
         """
         Count notifications matching ``filter``, ignoring pagination.
 
@@ -997,13 +1911,17 @@ class NotificationService(Generic[A, B]):
 
         Parameters:
             filter: NotificationFilter - the composable filter (``{}`` counts everything)
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             int - the number of matching notifications
         """
-        return self.notification_backend.count_notifications(filter)
+        return self._get_backend(backend_identifier).count_notifications(filter)
 
-    def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+    def get_backend_supported_filter_capabilities(
+        self, backend_identifier: str | None = None
+    ) -> dict[str, bool]:
         """
         Report which filter capabilities the configured backend supports.
 
@@ -1012,12 +1930,16 @@ class NotificationService(Generic[A, B]):
         ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
         kept byte-identical to the TypeScript sibling so one dashboard consumes either.
 
+        Parameters:
+            backend_identifier: str | None - which registered backend to report on; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
+
         Returns:
             dict[str, bool] - the merged capability report
         """
         return {
             **DEFAULT_BACKEND_FILTER_CAPABILITIES,
-            **self.notification_backend.get_filter_capabilities(),
+            **self._get_backend(backend_identifier).get_filter_capabilities(),
         }
 
     def resend_notification(
@@ -1064,26 +1986,33 @@ class NotificationService(Generic[A, B]):
         if source.tenant is not None:
             extra_persist_kwargs["tenant"] = source.tenant
 
-        clone = self.notification_backend.persist_notification(
-            user_id=source.user_id,
-            notification_type=source.notification_type,
-            title=source.title,
-            body_template=source.body_template,
-            context_name=source.context_name,
-            context_kwargs=source.context_kwargs,
-            send_after=None,
-            subject_template=source.subject_template,
-            preheader_template=source.preheader_template,
-            adapter_extra_parameters=source.adapter_extra_parameters,
-            **extra_persist_kwargs,
+        clone = self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(
+                user_id=source.user_id,
+                notification_type=source.notification_type,
+                title=source.title,
+                body_template=source.body_template,
+                context_name=source.context_name,
+                context_kwargs=source.context_kwargs,
+                send_after=None,
+                subject_template=source.subject_template,
+                preheader_template=source.preheader_template,
+                adapter_extra_parameters=source.adapter_extra_parameters,
+                **extra_persist_kwargs,
+            ),
+            self._replicate_snapshot_fallback,
         )
 
         if source.attachments:
             clone = cast(
                 Notification,
-                self.notification_backend.persist_notification_update(
-                    notification_id=clone.id,
-                    update_data={"attachments": list(source.attachments)},
+                self._execute_multi_backend_write(
+                    lambda backend: backend.persist_notification_update(
+                        notification_id=clone.id,
+                        update_data={"attachments": list(source.attachments)},
+                    ),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=clone.id,
                 ),
             )
 
@@ -1146,7 +2075,23 @@ class NotificationService(Generic[A, B]):
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
-        return self.notification_backend.cancel_notification(notification_id)
+
+        def _cancel_on_replica(
+            backend: B, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # A cancel deletes the row, so there is no snapshot to apply -- mirror the delete on
+            # the replica. A replica that never held the row is already in the desired (absent)
+            # state, so a not-found is success, not a failure.
+            try:
+                backend.cancel_notification(notification_id)
+            except NotificationNotFoundError:
+                return
+
+        return self._execute_multi_backend_write(
+            lambda backend: backend.cancel_notification(notification_id),
+            _cancel_on_replica,
+            replication_notification_id=notification_id,
+        )
 
     def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -1217,7 +2162,11 @@ class NotificationService(Generic[A, B]):
                         "Failed to generate context for notification %s", notification_id
                     )
                     try:
-                        self.notification_backend.mark_pending_as_failed(notification_id)
+                        self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification_id),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification_id,
+                        )
                     except NotificationUpdateError as e:
                         logger.exception(
                             "Failed to mark notification %s as failed", notification_id
@@ -1237,7 +2186,11 @@ class NotificationService(Generic[A, B]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification_id)
                 try:
-                    self.notification_backend.mark_pending_as_failed(notification_id)
+                    self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification_id),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification_id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification_id)
                     if self.raise_on_failed_send:
@@ -1250,11 +2203,13 @@ class NotificationService(Generic[A, B]):
                 continue
 
             try:
-                self.notification_backend.mark_pending_as_sent(notification_id)
-                self.notification_backend.store_context_used(
-                    notification_id,
-                    context,
-                    adapter.adapter_import_str,
+                self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification_id),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification_id,
+                )
+                self._replicate_store_context_used(
+                    notification_id, context, adapter.adapter_import_str
                 )
             except NotificationUpdateError as e:
                 logger.exception("Failed to mark notification %s as sent", notification_id)
@@ -1281,7 +2236,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     notification_adapters: Iterable[AAIO]
     notification_backend: BAIO
     notification_queue_service: AsyncIOBaseNotificationQueueService | None
+    replication_queue_service: AsyncIOBaseNotificationReplicationQueueService | None
     raise_on_failed_send: bool
+    replication_mode: Literal["inline", "queued"]
+    _backends: dict[str, BAIO]
+    _primary_backend_identifier: str
 
     def __init__(
         self,
@@ -1295,6 +2254,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         attachment_manager: AsyncIOBaseAttachmentManager | str | None = None,
         git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
+        additional_backends: Iterable[BAIO | str] | None = None,
+        replication_queue_service: AsyncIOBaseNotificationReplicationQueueService
+        | str
+        | None = None,
+        replication_mode: Literal["inline", "queued"] | None = None,
     ):
         """
         Build an AsyncIO notification service.
@@ -1314,12 +2278,51 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
+        :param additional_backends: extra backends replicated reads (and, from a later
+            phase, writes) can be routed to. Each entry is a backend instance or its import
+            string, resolved the same way as `notification_backend`. A backend is
+            addressed by its `get_backend_identifier()` when it declares one, or by
+            `backend-{n}` otherwise -- `n` is the backend's position among the additional
+            backends, starting at 1 (the primary is position 0). Absent
+            `additional_backends`, the service behaves exactly as a single-backend 2.0
+            deployment.
+        :param replication_queue_service: the queue service used to push replica writes off
+            the request path when ``replication_mode`` is ``"queued"``. Accepts an instance or
+            an import string; when it is None, `NOTIFICATION_REPLICATION_QUEUE_SERVICE` is
+            used, and queued replication simply falls back to inline if that is unset too.
+        :param replication_mode: how writes fan out to the additional backends. ``"inline"``
+            replicates on the request path, right after the primary write. ``"queued"`` enqueues
+            one replication task per destination backend via ``replication_queue_service``,
+            falling back to inline when the queue is missing or an enqueue fails. When None (the
+            default), `NOTIFICATION_REPLICATION_MODE` is used, itself defaulting to ``"inline"``.
+            Ignored entirely by a single-backend service, which never replicates.
+        :raises DuplicateBackendIdentifierError: if an additional backend's resolved
+            identifier collides with an already-registered backend's identifier --
+            including the primary's.
         """
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
-        NotificationSettings(config)
+        app_settings = NotificationSettings(config)
 
         self.raise_on_failed_send = raise_on_failed_send
+        # An explicit constructor value wins; otherwise fall back to the setting, itself
+        # defaulting to "inline". Under a bare-Python host the setting reads as {} (no
+        # framework), which is falsy and correctly resolves to "inline". Any other value --
+        # a typo like "queded" from an untyped env var/setting -- must fail loud rather than
+        # silently degrade to inline replication.
+        resolved_replication_mode: Any = (
+            replication_mode
+            if replication_mode is not None
+            else app_settings.NOTIFICATION_REPLICATION_MODE
+        )
+        if not resolved_replication_mode:
+            resolved_replication_mode = "inline"
+        if resolved_replication_mode not in ("inline", "queued"):
+            raise NotificationError(
+                f"Invalid replication_mode {resolved_replication_mode!r}; expected 'inline' or "
+                "'queued'"
+            )
+        self.replication_mode = resolved_replication_mode
 
         if isinstance(notification_queue_service, AsyncIOBaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -1336,6 +2339,19 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 # would read as "no queue configured" and silently never deliver.
                 self.notification_queue_service = None
 
+        if isinstance(replication_queue_service, AsyncIOBaseNotificationReplicationQueueService):
+            self.replication_queue_service = replication_queue_service
+        else:
+            try:
+                self.replication_queue_service = get_asyncio_notification_replication_queue_service(
+                    replication_queue_service, None, config
+                )
+            except NotificationQueueServiceMissingError:
+                # Nothing configured: queued replication has no queue and falls back to inline
+                # per backend (see _execute_multi_backend_write). A resolution error -- a
+                # configured but unusable import string -- deliberately propagates instead.
+                self.replication_queue_service = None
+
         if isinstance(notification_backend, AsyncIOBaseNotificationBackend):
             self.notification_backend = cast(BAIO, notification_backend)
         else:
@@ -1346,6 +2362,38 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 ),
             )
         self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        # Build the ordered backend registry: the primary first, then every additional
+        # backend in the order given. A backend's identifier is whatever
+        # `get_backend_identifier()` reports, or `backend-{n}` (n = its position among the
+        # additional backends, 1-indexed; the primary falls back to `backend-0`) when it
+        # does not declare one. Absent `additional_backends`, this is just `{primary: ...}`
+        # and every read below resolves to the primary exactly as in a single-backend 2.0
+        # deployment. `get_backend_identifier` is sync even here, since it needs no I/O and
+        # this constructor cannot await.
+        primary_backend_identifier = self.notification_backend.get_backend_identifier() or (
+            "backend-0"
+        )
+        self._backends = {primary_backend_identifier: self.notification_backend}
+        self._primary_backend_identifier = primary_backend_identifier
+
+        if additional_backends is not None:
+            for index, additional_backend in enumerate(additional_backends, start=1):
+                if isinstance(additional_backend, AsyncIOBaseNotificationBackend):
+                    resolved_additional_backend = cast(BAIO, additional_backend)
+                else:
+                    resolved_additional_backend = cast(
+                        BAIO, get_asyncio_notification_backend(additional_backend, None, config)
+                    )
+                additional_backend_identifier = (
+                    resolved_additional_backend.get_backend_identifier() or f"backend-{index}"
+                )
+                if additional_backend_identifier in self._backends:
+                    raise DuplicateBackendIdentifierError(
+                        f"Two configured backends resolve to the same identifier "
+                        f"'{additional_backend_identifier}'"
+                    )
+                self._backends[additional_backend_identifier] = resolved_additional_backend
 
         # Resolve the attachment manager (instance, dotted path, or the
         # NOTIFICATION_ATTACHMENT_MANAGER setting) and inject it into the backend when the
@@ -1456,6 +2504,629 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         self.notification_queue_service = queue_service
 
+    async def register_replication_queue_service(
+        self, replication_queue_service: AsyncIOBaseNotificationReplicationQueueService
+    ) -> None:
+        """
+        Inject the replication queue service after construction.
+
+        Useful when the queue service cannot exist yet at construction time -- a broker
+        connection built during application startup, for example. Once set, ``"queued"``
+        replication enqueues one task per destination backend instead of replicating inline.
+
+        Parameters:
+            replication_queue_service: AsyncIOBaseNotificationReplicationQueueService - the
+                queue service to use for queued replication from now on
+        """
+        self.replication_queue_service = replication_queue_service
+
+    def get_primary_backend_identifier(self) -> str:
+        """Return the primary backend's identifier."""
+        return self._primary_backend_identifier
+
+    def get_all_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier, primary first, in the order the
+        backends were configured."""
+        return list(self._backends.keys())
+
+    def get_additional_backend_identifiers(self) -> list[str]:
+        """Return every registered backend's identifier except the primary's, in the order
+        the additional backends were configured."""
+        return [
+            identifier
+            for identifier in self._backends
+            if identifier != self._primary_backend_identifier
+        ]
+
+    def has_backend(self, backend_identifier: str) -> bool:
+        """Whether `backend_identifier` names a registered backend (primary or additional)."""
+        return backend_identifier in self._backends
+
+    def _get_backend(self, backend_identifier: str | None = None) -> BAIO:
+        """Resolve a backend by identifier for read routing.
+
+        `None` resolves to the primary backend, preserving every existing call site's
+        behaviour. An identifier that names no registered backend raises
+        `BackendNotFoundError` rather than silently falling back to the primary.
+        """
+        if backend_identifier is None:
+            return self._backends[self._primary_backend_identifier]
+        if backend_identifier not in self._backends:
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{backend_identifier}'"
+            )
+        return self._backends[backend_identifier]
+
+    async def _execute_multi_backend_write(
+        self,
+        primary_write: Callable[[BAIO], Awaitable[_WriteResultT]],
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+        replication_notification_id: int | str | uuid.UUID | None = None,
+    ) -> _WriteResultT:
+        """Run a write on the primary, then fan it out to every additional backend inline.
+
+        The primary write runs first and its result -- and any exception -- is the caller's:
+        the primary is the source of truth, so its failure is the user's failure and
+        propagates unchanged. Only after it succeeds, and only when additional backends are
+        configured, is the write replicated. Each replica is handled in registry order and any
+        replica failure is logged and swallowed, so a rejecting replica never fails the user's
+        operation -- it is reconciled by a later write. A single-backend service short-circuits
+        and never enters the replication loop, staying byte-for-byte identical to a
+        single-backend 2.0 deployment.
+
+        ``primary_write`` performs the mutation on the backend it is handed. ``additional_write``
+        applies the same mutation to a replica when snapshot application is unavailable; it
+        receives the primary's post-write snapshot (or ``None`` when there is no single record
+        to snapshot, e.g. bulk read-marking or a cancel that deleted the row).
+        ``replication_notification_id`` names the record to snapshot when the primary write does
+        not itself return one.
+
+        In ``"queued"`` mode the replica writes are enqueued (one task per destination backend)
+        instead of running inline, degrading to inline per backend when the queue is missing or
+        an enqueue fails -- see ``_replicate_queued``.
+        """
+        result = await primary_write(self.notification_backend)
+
+        additional_backend_identifiers = self.get_additional_backend_identifiers()
+        if not additional_backend_identifiers:
+            return result
+
+        if self.replication_mode == "queued":
+            await self._replicate_queued(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        else:
+            await self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+        return result
+
+    async def _replicate_inline_all(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Read the primary snapshot once and replicate it inline to every named backend."""
+        snapshot = await self._read_replication_snapshot(replication_notification_id, result)
+        for backend_identifier in additional_backend_identifiers:
+            await self._replicate_inline_one(backend_identifier, snapshot, additional_write)
+
+    async def _replicate_inline_one(
+        self,
+        backend_identifier: str,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Replicate one write to one backend inline, logging and swallowing any failure.
+
+        A rejecting replica never fails the user's operation -- it is reconciled by a later
+        write or by ``process_replication``.
+        """
+        replica = self._backends[backend_identifier]
+        try:
+            await self._replicate_write_to_backend(replica, snapshot, additional_write)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to replicate a write to backend %s (notification %s); the primary "
+                "write succeeded and the replica will be reconciled by a later write",
+                backend_identifier,
+                getattr(snapshot, "id", None),
+            )
+
+    async def _replicate_queued(
+        self,
+        additional_backend_identifiers: list[str],
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Enqueue one replication task per destination backend, degrading to inline.
+
+        When there is no replication queue service, or the notification id cannot be resolved,
+        every backend is replicated inline and a warning is logged -- a broken or absent queue
+        must never silently drop replication. When a single backend's ``enqueue_replication``
+        raises, only that backend is replicated inline; the ones already enqueued are left for
+        the worker. Nothing here may fail the user's already-successful primary write.
+        """
+        queued_id = replication_notification_id
+        if queued_id is None and isinstance(result, (Notification, OneOffNotification)):
+            queued_id = result.id
+
+        if self.replication_queue_service is None or queued_id is None:
+            logger.warning(
+                "Queued replication requested but %s; falling back to inline replication for "
+                "notification %s",
+                "no replication queue service is configured"
+                if self.replication_queue_service is None
+                else "the notification id could not be resolved",
+                queued_id if queued_id is not None else replication_notification_id,
+            )
+            await self._replicate_inline_all(
+                additional_backend_identifiers,
+                replication_notification_id,
+                result,
+                additional_write,
+            )
+            return
+
+        snapshot: Notification | OneOffNotification | None = None
+        snapshot_read = False
+        for backend_identifier in additional_backend_identifiers:
+            try:
+                await self.replication_queue_service.enqueue_replication(
+                    queued_id, backend_identifier
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to enqueue replication of notification %s to backend %s; "
+                    "replicating it inline instead",
+                    queued_id,
+                    backend_identifier,
+                )
+                if not snapshot_read:
+                    snapshot = await self._read_replication_snapshot(
+                        replication_notification_id, result
+                    )
+                    snapshot_read = True
+                await self._replicate_inline_one(backend_identifier, snapshot, additional_write)
+
+    async def _read_replication_snapshot(
+        self,
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+    ) -> "Notification | OneOffNotification | None":
+        """Re-read the primary's authoritative record to replicate, or ``None`` if there is none.
+
+        Prefers ``replication_notification_id``; otherwise uses the id of the primary write's
+        result when that result is itself a notification (creates and updates). Returns ``None``
+        when no id resolves (e.g. bulk read-marking) or the record no longer exists on the
+        primary (e.g. a cancel that deleted it) -- the caller then relies on ``additional_write``
+        instead of snapshot application.
+
+        Runs after the primary write has already committed, so it must never fail the caller:
+        any exception raised by the re-read (not just ``NotificationError``, e.g. a transient
+        connection error from a real backend) is logged and swallowed, degrading this replica
+        pass to the ``additional_write`` fallback rather than failing an already-successful
+        primary write.
+        """
+        snapshot_id = replication_notification_id
+        if snapshot_id is None and isinstance(result, (Notification, OneOffNotification)):
+            snapshot_id = result.id
+        if snapshot_id is None:
+            return None
+        try:
+            return await self.notification_backend.get_notification(snapshot_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to re-read notification %s to build a replication snapshot; the "
+                "primary write already succeeded and replication will be reconciled later",
+                snapshot_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _replicate_write_to_backend(
+        self,
+        replica: BAIO,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Apply one write to one replica, preferring snapshot application then falling back.
+
+        When a snapshot is available the replica's ``apply_replication_snapshot_if_newer`` is
+        tried first: a backend that implements it upserts the whole record -- creating the row
+        with the primary's id or refreshing it newer-wins -- in one call. When it declines
+        (``applied=False``, the concrete default) the ``additional_write`` fallback mirrors the
+        mutation with the backend's own primitives. A duplicate/conflict failure -- the replica
+        already holds a created row, or lacks a row being updated -- flips once to converging the
+        replica to the snapshot before the error propagates to the caller's logging.
+        """
+        try:
+            if (
+                snapshot is not None
+                and (await replica.apply_replication_snapshot_if_newer(snapshot)).applied
+            ):
+                return
+            await additional_write(replica, snapshot)
+        except Exception as exc:  # noqa: BLE001
+            if snapshot is None or not _is_likely_duplicate_replication_conflict(exc):
+                raise
+            await self._converge_replica_to_snapshot(replica, snapshot)
+
+    async def _replicate_snapshot_fallback(
+        self, replica: BAIO, snapshot: "Notification | OneOffNotification | None"
+    ) -> None:
+        """Default ``additional_write``: converge a replica to the primary's snapshot.
+
+        Used for every single-record write (create, update, mark, store). It only converges a
+        row the replica already holds; it cannot create a row with the primary's id, because no
+        base primitive assigns a chosen id -- that is exactly what
+        ``apply_replication_snapshot_if_newer`` exists for. A backend that implements snapshot
+        application never reaches this path.
+        """
+        if snapshot is None:
+            return
+        await self._converge_replica_to_snapshot(replica, snapshot)
+
+    async def _converge_replica_to_snapshot(
+        self, replica: BAIO, snapshot: "Notification | OneOffNotification"
+    ) -> None:
+        """Bring an existing replica row into line with the primary's snapshot via primitives.
+
+        Serves as both the read-then-write fallback for a backend that declines snapshot
+        application and the flip target when a replica reports a duplicate/conflict. Requires the
+        row to already exist on the replica; an absent row is logged and skipped, since inline
+        replication cannot create a row with the primary's id without snapshot-apply support.
+
+        Best-effort: this read-then-write fallback does NOT converge attachments or intermediate
+        audit fields (e.g. ``sent_at``) -- ``update_data`` only carries the plain content fields.
+        A backend that needs full-fidelity replication, including attachments, should implement
+        ``apply_replication_snapshot_if_newer`` instead of relying on this fallback.
+        """
+        try:
+            replica_row = await replica.get_notification(snapshot.id)
+        except NotificationNotFoundError:
+            logger.warning(
+                "Replica lacks notification %s and does not implement "
+                "apply_replication_snapshot_if_newer; cannot create it with its primary id "
+                "inline -- it will be reconciled later",
+                snapshot.id,
+            )
+            return
+        update_data: UpdateNotificationKwargs = {
+            "title": snapshot.title,
+            "body_template": snapshot.body_template,
+            "context_name": snapshot.context_name,
+            "context_kwargs": snapshot.context_kwargs,
+            "send_after": snapshot.send_after,
+            "subject_template": snapshot.subject_template,
+            "preheader_template": snapshot.preheader_template,
+            "adapter_extra_parameters": snapshot.adapter_extra_parameters,
+        }
+        await replica.persist_notification_update(
+            notification_id=snapshot.id, update_data=update_data
+        )
+        if snapshot.context_used is not None:
+            await replica.store_context_used(
+                snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
+            )
+        if snapshot.git_commit_sha is not None:
+            await replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        # Reach the snapshot's status through the same intermediate transitions a real backend
+        # requires, rather than forcing a single terminal `mark_*` call: a row still PENDING_SEND
+        # must pass through SENT on its way to READ, matching the state machine every backend
+        # (including strict ones) enforces.
+        current_status = replica_row.status
+        if snapshot.status == NotificationStatus.SENT.value:
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                await replica.mark_pending_as_sent(snapshot.id)
+        elif snapshot.status == NotificationStatus.FAILED.value:
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                await replica.mark_pending_as_failed(snapshot.id)
+        elif snapshot.status == NotificationStatus.READ.value:
+            if current_status == NotificationStatus.PENDING_SEND.value:
+                await replica.mark_pending_as_sent(snapshot.id)
+                await replica.mark_sent_as_read(snapshot.id)
+            elif current_status == NotificationStatus.SENT.value:
+                await replica.mark_sent_as_read(snapshot.id)
+
+    async def _replicate_store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: NotificationContextDict,
+        adapter_import_str: str,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        """Persist ``context_used`` on the primary and fan it out to the replicas.
+
+        Extracted from ``send`` / ``delayed_send`` into its own method so the
+        ``_execute_multi_backend_write`` closure captures these method parameters rather than
+        the send loop's ``adapter`` and ``context`` variables -- a loop-captured closure is a
+        late-binding hazard the linters (rightly) reject.
+        """
+        await self._execute_multi_backend_write(
+            lambda backend: backend.store_context_used(
+                notification_id, context, adapter_import_str, lock
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
+
+    async def process_replication(
+        self,
+        notification_id: int | str | uuid.UUID,
+        target_backend_identifier: str | None = None,
+    ) -> dict[str, list]:
+        """Worker entrypoint: converge one or more replicas to the primary's snapshot.
+
+        This is what a queued-replication worker calls to drain a task enqueued by
+        ``enqueue_replication``. It reads the authoritative record from the primary backend and
+        converges each target to it, preferring the target's ``apply_replication_snapshot_if_newer``
+        and falling back to read-then-write with the duplicate-conflict retry -- the same Phase 2
+        convergence path inline replication uses.
+
+        ``target_backend_identifier`` names a single backend to replicate to; when omitted, every
+        additional backend is targeted. An unknown identifier raises ``BackendNotFoundError``.
+
+        The notification must resolve on the primary: it is the source of truth, and the worker
+        was told to replicate a specific id, so a missing record is a ``ReplicationError`` rather
+        than a silent no-op. A per-target failure is captured, not raised, so one bad replica does
+        not abort the others.
+
+        Returns ``{"successes": [<identifier>, ...], "failures": [{"backend_identifier": ...,
+        "error": ...}, ...]}``.
+        """
+        if target_backend_identifier is not None and not self.has_backend(
+            target_backend_identifier
+        ):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{target_backend_identifier}'"
+            )
+
+        try:
+            snapshot = await self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError as exc:
+            raise ReplicationError(
+                f"Cannot replicate notification {notification_id}: it does not exist on the "
+                "primary backend"
+            ) from exc
+
+        if target_backend_identifier is not None:
+            targets = [target_backend_identifier]
+        else:
+            targets = self.get_additional_backend_identifiers()
+
+        successes: list[str] = []
+        failures: list[dict[str, str]] = []
+        for identifier in targets:
+            target = self._backends[identifier]
+            try:
+                await self._replicate_write_to_backend(
+                    target, snapshot, self._replicate_snapshot_fallback
+                )
+                # `_replicate_write_to_backend` returns normally when a target declines
+                # snapshot application (`apply_replication_snapshot_if_newer` -> applied=False)
+                # and `_converge_replica_to_snapshot` then logs-and-skips because the row is
+                # absent -- it cannot create a row with the primary's id without snapshot-apply
+                # support. That is a legitimate best-effort outcome for the inline path, but
+                # `process_replication` has an explicit success/failure contract a queued worker
+                # relies on, so a target left without the row must be reported as a failure, not
+                # a success.
+                try:
+                    await target.get_notification(notification_id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "backend_identifier": identifier,
+                            "error": (
+                                "replica lacks apply_replication_snapshot_if_newer and could "
+                                "not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    successes.append(identifier)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to replicate notification %s to backend %s during process_replication",
+                    notification_id,
+                    identifier,
+                )
+                failures.append({"backend_identifier": identifier, "error": str(exc)})
+        return {"successes": successes, "failures": failures}
+
+    async def replicate_notification(
+        self, notification_id: int | str | uuid.UUID
+    ) -> dict[str, list]:
+        """Replicate a notification to every additional backend -- the no-target alias for
+        ``process_replication(notification_id, None)``."""
+        return await self.process_replication(notification_id, None)
+
+    async def verify_notification_sync(
+        self, notification_id: int | str | uuid.UUID
+    ) -> NotificationSyncReport:
+        """AsyncIO twin of ``NotificationService.verify_notification_sync``.
+
+        Reads the record from every registered backend (primary and every additional backend).
+        A backend that does not have the record is reported absent, not fatal --
+        ``NotificationNotFoundError`` from any single backend never aborts the check for the
+        others. For backends that do have the record, every comparable field (see
+        ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+        in ``dataclasses.py``) is compared across those backends, reporting per field whether all
+        of them agree and, when they do not, each disagreeing backend's value.
+
+        This is a read-only diagnostic -- it never writes. Use ``process_replication`` /
+        ``replicate_notification`` to reconcile drift this uncovers.
+        """
+        all_backend_identifiers = self.get_all_backend_identifiers()
+        records_by_backend: dict[str, Notification | OneOffNotification] = {}
+        for identifier in all_backend_identifiers:
+            try:
+                records_by_backend[identifier] = await self._backends[identifier].get_notification(
+                    notification_id
+                )
+            except NotificationNotFoundError:
+                continue
+
+        return _build_notification_sync_report(
+            notification_id,
+            self._primary_backend_identifier,
+            all_backend_identifiers,
+            records_by_backend,
+        )
+
+    async def get_backend_sync_stats(self) -> dict[str, BackendSyncStats]:
+        """AsyncIO twin of ``NotificationService.get_backend_sync_stats``.
+
+        Drives ``total_notifications`` from ``count_notifications({})``, which every backend
+        provides (a concrete default derived from ``filter_notifications``, or an efficient
+        ``COUNT``-backed override). A backend that raises while being queried is reported
+        ``status='error'`` with the exception message captured in ``error`` and
+        ``total_notifications`` at ``0`` -- the exception itself never propagates, so one broken
+        backend never fails stats for the others.
+        """
+        stats: dict[str, BackendSyncStats] = {}
+        for identifier in self.get_all_backend_identifiers():
+            try:
+                total_notifications = await self._backends[identifier].count_notifications({})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Backend %s raised while computing sync stats; reporting it as unhealthy "
+                    "rather than failing stats for the other backends",
+                    identifier,
+                )
+                stats[identifier] = {
+                    "total_notifications": 0,
+                    "status": "error",
+                    "error": str(exc),
+                }
+                continue
+            stats[identifier] = {"total_notifications": total_notifications, "status": "healthy"}
+        return stats
+
+    async def migrate_to_backend(
+        self,
+        destination_backend_identifier: str,
+        batch_size: int,
+        source_backend_identifier: str | None = None,
+    ) -> BackendMigrationResult:
+        """AsyncIO twin of ``NotificationService.migrate_to_backend``.
+
+        Copy every notification from one backend to another, in pages. Pages through the source
+        (the primary when ``source_backend_identifier`` is omitted) via ``filter_notifications``,
+        ``batch_size`` rows at a time, writing each record into the destination through the same
+        snapshot-apply / read-then-write convergence path inline and queued replication use
+        (``_replicate_write_to_backend``): a destination implementing
+        ``apply_replication_snapshot_if_newer`` gets an id-preserving upsert in one call; one that
+        does not falls back to converging an existing row and, like ``process_replication``,
+        cannot create a row it lacks -- that is reported as a failure, not a silent success.
+
+        Copies only -- it never deletes from the source. Retiring the source is a separate,
+        operational decision made after verifying the destination.
+
+        Idempotent by re-running: a record already on the destination is converged (or upserted
+        newer-wins), never duplicated, via the same duplicate-conflict retry inline replication
+        relies on. A single record's destination-write failure is captured in the returned
+        ``failures`` list and does not abort the rest of the migration.
+
+        Raises ``BackendNotFoundError`` if either the source or the destination names an
+        unregistered backend, and ``BackendMigrationError`` if they name the same one, or if
+        ``batch_size`` is not a positive integer.
+
+        Assumes the source is quiescent: it pages the source with a stable cursor, so if the
+        source is concurrently receiving writes (for example, it is itself a live replica of
+        another active service), rows inserted mid-run can shift page boundaries and be skipped
+        or seen twice.
+        """
+        if batch_size <= 0:
+            raise BackendMigrationError(
+                f"batch_size must be a positive integer, got {batch_size!r}"
+            )
+        if not self.has_backend(destination_backend_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{destination_backend_identifier}'"
+            )
+        resolved_source_identifier = (
+            source_backend_identifier
+            if source_backend_identifier is not None
+            else self._primary_backend_identifier
+        )
+        if not self.has_backend(resolved_source_identifier):
+            raise BackendNotFoundError(
+                f"No backend registered with identifier '{resolved_source_identifier}'"
+            )
+        if resolved_source_identifier == destination_backend_identifier:
+            raise BackendMigrationError(
+                "Cannot migrate a backend onto itself: source and destination are both "
+                f"'{resolved_source_identifier}'"
+            )
+
+        source = self._backends[resolved_source_identifier]
+        destination = self._backends[destination_backend_identifier]
+
+        migrated = 0
+        failures: list[BackendMigrationFailure] = []
+        page = 1
+        while True:
+            batch = list(await source.filter_notifications({}, page=page, page_size=batch_size))
+            if not batch:
+                break
+            for record in batch:
+                try:
+                    await self._replicate_write_to_backend(
+                        destination, record, self._replicate_snapshot_fallback
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to migrate notification %s from backend %s to backend %s",
+                        record.id,
+                        resolved_source_identifier,
+                        destination_backend_identifier,
+                    )
+                    failures.append({"notification_id": record.id, "error": str(exc)})
+                    continue
+                # As in `process_replication`, `_replicate_write_to_backend` returns normally
+                # when the destination declines snapshot application and lacks the row -- it
+                # cannot be created inline without `apply_replication_snapshot_if_newer` support.
+                # That must be reported as a migration failure, not counted as migrated.
+                try:
+                    await destination.get_notification(record.id)
+                except NotificationNotFoundError:
+                    failures.append(
+                        {
+                            "notification_id": record.id,
+                            "error": (
+                                "destination lacks apply_replication_snapshot_if_newer and "
+                                "could not be populated with the primary id"
+                            ),
+                        }
+                    )
+                else:
+                    migrated += 1
+            if len(batch) < batch_size:
+                break
+            page += 1
+
+        return {"migrated": migrated, "failures": failures}
+
     async def _resolve_and_persist_git_commit_sha(
         self,
         notification: Notification | OneOffNotification,
@@ -1490,7 +3161,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if normalized_sha == notification.git_commit_sha:
             return
 
-        await self.notification_backend.store_git_commit_sha(notification.id, normalized_sha, lock)
+        await self._execute_multi_backend_write(
+            lambda backend: backend.store_git_commit_sha(notification.id, normalized_sha, lock),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification.id,
+        )
         notification.git_commit_sha = normalized_sha
 
     async def send(
@@ -1576,8 +3251,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                         "Failed to generate context for notification %s", notification.id
                     )
                     try:
-                        await self.notification_backend.mark_pending_as_failed(
-                            notification.id, lock
+                        await self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification.id, lock),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification.id,
                         )
                     except NotificationUpdateError as e:
                         logger.exception(
@@ -1603,7 +3280,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification.id)
                 try:
-                    await self.notification_backend.mark_pending_as_failed(notification.id, lock)
+                    await self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification.id, lock),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification.id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification.id)
                     if self.raise_on_failed_send:
@@ -1616,8 +3297,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 continue
 
             try:
-                await self.notification_backend.mark_pending_as_sent(notification.id, lock)
-                await self.notification_backend.store_context_used(
+                await self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification.id, lock),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification.id,
+                )
+                await self._replicate_store_context_used(
                     notification.id, context, adapter.adapter_import_str, lock
                 )
             except NotificationUpdateError as e:
@@ -1685,7 +3370,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = await self.notification_backend.persist_notification(**persist_kwargs)
+        notification = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
+        )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -1757,8 +3445,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = await self.notification_backend.persist_one_off_notification(
-            **persist_kwargs
+        notification = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_one_off_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1795,9 +3484,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             raise GitCommitShaReassignmentError(
                 "A notification's git_commit_sha is system-managed and cannot be set directly"
             )
-        notification = await self.notification_backend.persist_notification_update(
-            notification_id=notification_id,
-            update_data=kwargs,
+        notification = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification_update(
+                notification_id=notification_id,
+                update_data=kwargs,
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1805,31 +3498,45 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             await self.send(notification)
         return notification
 
-    async def get_all_future_notifications(self) -> Iterable[Notification | OneOffNotification]:
+    async def get_all_future_notifications(
+        self, backend_identifier: str | None = None
+    ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
+
+        Parameters:
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return await self.notification_backend.get_all_future_notifications()
+        return await self._get_backend(backend_identifier).get_all_future_notifications()
 
     async def get_all_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
 
         Parameters:
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications from the user
         """
-        return await self.notification_backend.get_all_future_notifications_from_user(user_id)
+        return await self._get_backend(backend_identifier).get_all_future_notifications_from_user(
+            user_id
+        )
 
     async def get_future_notifications_from_user(
-        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+        self,
+        user_id: int | str | uuid.UUID,
+        page: int,
+        page_size: int,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -1838,16 +3545,18 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of the future notifications from the user
         """
-        return await self.notification_backend.get_future_notifications_from_user(
+        return await self._get_backend(backend_identifier).get_future_notifications_from_user(
             user_id, page, page_size
         )
 
     async def get_future_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get future notifications from the backend.
@@ -1856,11 +3565,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the future notifications
         """
-        return await self.notification_backend.get_future_notifications(page, page_size)
+        return await self._get_backend(backend_identifier).get_future_notifications(page, page_size)
 
     async def get_notification_context(
         self, notification: Notification | OneOffNotification
@@ -1951,7 +3662,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         logger.info("Failed to send %s notifications", notifications_failed)
 
     async def get_pending_notifications(
-        self, page: int, page_size: int
+        self, page: int, page_size: int, backend_identifier: str | None = None
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Get pending notifications from the backend.
@@ -1959,25 +3670,31 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Parameters:
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the pending notifications
         """
-        return await self.notification_backend.get_pending_notifications(page, page_size)
+        return await self._get_backend(backend_identifier).get_pending_notifications(
+            page, page_size
+        )
 
     async def get_notification(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, backend_identifier: str | None = None
     ) -> Notification | OneOffNotification:
         """
         Get a notification from the backend.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to get
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Notification | OneOffNotification - the notification
         """
-        return await self.notification_backend.get_notification(notification_id)
+        return await self._get_backend(backend_identifier).get_notification(notification_id)
 
     async def mark_read(
         self, notification_id: int | str | uuid.UUID
@@ -1994,7 +3711,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Returns:
             Notification | OneOffNotification - the updated notification
         """
-        return await self.notification_backend.mark_sent_as_read(notification_id)
+        return await self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read(notification_id),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
 
     async def mark_read_bulk(
         self,
@@ -2016,8 +3737,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Returns:
             Iterable[Notification] - the requested notifications that are read after the operation
         """
-        return await self.notification_backend.mark_sent_as_read_bulk(
-            notification_ids, user_id=user_id
+        # Materialize once: the id iterable may be a single-use generator, and both the primary
+        # write and every replica mirror need to consume it.
+        ids = list(notification_ids)
+        return await self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+            lambda backend, snapshot: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
         )
 
     async def get_in_app_unread(
@@ -2025,6 +3750,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get unread in-app notifications for a user.
@@ -2036,6 +3762,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the unread in-app notifications
@@ -2044,7 +3772,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.filter_in_app_unread_notifications(
+        return await self._get_backend(backend_identifier).filter_in_app_unread_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
@@ -2053,6 +3781,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         user_id: int | str | uuid.UUID,
         page: int = 1,
         page_size: int = 10,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification]:
         """
         Get all in-app notifications (read + unread) for a user, paginated.
@@ -2064,6 +3793,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             user_id: int | str | uuid.UUID - the user ID to get the notifications for
             page: int - the page number to get
             page_size: int - the number of notifications per page
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification] - the in-app notifications
@@ -2072,11 +3803,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.filter_in_app_notifications(
+        return await self._get_backend(backend_identifier).filter_in_app_notifications(
             user_id=user_id, page=page, page_size=page_size
         )
 
-    async def get_in_app_notifications_count(self, user_id: int | str | uuid.UUID) -> int:
+    async def get_in_app_notifications_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of in-app notifications (read + unread) for a user.
 
@@ -2087,9 +3820,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.count_in_app_notifications(user_id)
+        return await self._get_backend(backend_identifier).count_in_app_notifications(user_id)
 
-    async def get_in_app_unread_count(self, user_id: int | str | uuid.UUID) -> int:
+    async def get_in_app_unread_count(
+        self, user_id: int | str | uuid.UUID, backend_identifier: str | None = None
+    ) -> int:
         """
         Get the total count of unread in-app notifications for a user.
 
@@ -2100,7 +3835,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             a.notification_type == NotificationTypes.IN_APP for a in self.notification_adapters
         ):
             raise NotificationError("No in-app notification adapter found")
-        return await self.notification_backend.count_in_app_unread_notifications(user_id)
+        return await self._get_backend(backend_identifier).count_in_app_unread_notifications(
+            user_id
+        )
 
     async def filter_notifications(
         self,
@@ -2108,6 +3845,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         page: int,
         page_size: int,
         order_by: NotificationOrderBy | None = None,
+        backend_identifier: str | None = None,
     ) -> Iterable[Notification | OneOffNotification]:
         """
         Query notifications with a composable filter, ordering and pagination.
@@ -2122,15 +3860,21 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             page: int - the 1-indexed page number to get
             page_size: int - the number of notifications per page
             order_by: NotificationOrderBy | None - the primary sort field and direction
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             Iterable[Notification | OneOffNotification] - the selected page of matches
         """
-        return await self.notification_backend.filter_notifications(
+        return await self._get_backend(backend_identifier).filter_notifications(
             filter, page=page, page_size=page_size, order_by=order_by
         )
 
-    async def count_notifications(self, filter: NotificationFilter) -> int:  # noqa: A002
+    async def count_notifications(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        backend_identifier: str | None = None,
+    ) -> int:
         """
         Count notifications matching ``filter``, ignoring pagination.
 
@@ -2139,13 +3883,17 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         Parameters:
             filter: NotificationFilter - the composable filter (``{}`` counts everything)
+            backend_identifier: str | None - which registered backend to read from; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
 
         Returns:
             int - the number of matching notifications
         """
-        return await self.notification_backend.count_notifications(filter)
+        return await self._get_backend(backend_identifier).count_notifications(filter)
 
-    async def get_backend_supported_filter_capabilities(self) -> dict[str, bool]:
+    async def get_backend_supported_filter_capabilities(
+        self, backend_identifier: str | None = None
+    ) -> dict[str, bool]:
         """
         Report which filter capabilities the configured backend supports.
 
@@ -2154,12 +3902,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ``True``. Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``),
         kept byte-identical to the TypeScript sibling so one dashboard consumes either.
 
+        Parameters:
+            backend_identifier: str | None - which registered backend to report on; the
+                primary backend when omitted. Raises BackendNotFoundError if unknown.
+
         Returns:
             dict[str, bool] - the merged capability report
         """
         return {
             **DEFAULT_BACKEND_FILTER_CAPABILITIES,
-            **await self.notification_backend.get_filter_capabilities(),
+            **await self._get_backend(backend_identifier).get_filter_capabilities(),
         }
 
     async def resend_notification(
@@ -2206,26 +3958,33 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if source.tenant is not None:
             extra_persist_kwargs["tenant"] = source.tenant
 
-        clone = await self.notification_backend.persist_notification(
-            user_id=source.user_id,
-            notification_type=source.notification_type,
-            title=source.title,
-            body_template=source.body_template,
-            context_name=source.context_name,
-            context_kwargs=source.context_kwargs,
-            send_after=None,
-            subject_template=source.subject_template,
-            preheader_template=source.preheader_template,
-            adapter_extra_parameters=source.adapter_extra_parameters,
-            **extra_persist_kwargs,
+        clone = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(
+                user_id=source.user_id,
+                notification_type=source.notification_type,
+                title=source.title,
+                body_template=source.body_template,
+                context_name=source.context_name,
+                context_kwargs=source.context_kwargs,
+                send_after=None,
+                subject_template=source.subject_template,
+                preheader_template=source.preheader_template,
+                adapter_extra_parameters=source.adapter_extra_parameters,
+                **extra_persist_kwargs,
+            ),
+            self._replicate_snapshot_fallback,
         )
 
         if source.attachments:
             clone = cast(
                 Notification,
-                await self.notification_backend.persist_notification_update(
-                    notification_id=clone.id,
-                    update_data={"attachments": list(source.attachments)},
+                await self._execute_multi_backend_write(
+                    lambda backend: backend.persist_notification_update(
+                        notification_id=clone.id,
+                        update_data={"attachments": list(source.attachments)},
+                    ),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=clone.id,
                 ),
             )
 
@@ -2288,7 +4047,23 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
-        return await self.notification_backend.cancel_notification(notification_id)
+
+        async def _cancel_on_replica(
+            backend: BAIO, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # A cancel deletes the row, so there is no snapshot to apply -- mirror the delete on
+            # the replica. A replica that never held the row is already in the desired (absent)
+            # state, so a not-found is success, not a failure.
+            try:
+                await backend.cancel_notification(notification_id)
+            except NotificationNotFoundError:
+                return
+
+        return await self._execute_multi_backend_write(
+            lambda backend: backend.cancel_notification(notification_id),
+            _cancel_on_replica,
+            replication_notification_id=notification_id,
+        )
 
     async def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -2359,7 +4134,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                         "Failed to generate context for notification %s", notification_id
                     )
                     try:
-                        await self.notification_backend.mark_pending_as_failed(notification_id)
+                        await self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification_id),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification_id,
+                        )
                     except NotificationUpdateError as e:
                         logger.exception(
                             "Failed to mark notification %s as failed", notification_id
@@ -2379,7 +4158,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification_id)
                 try:
-                    await self.notification_backend.mark_pending_as_failed(notification_id)
+                    await self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification_id),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification_id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification_id)
                     if self.raise_on_failed_send:
@@ -2392,11 +4175,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 continue
 
             try:
-                await self.notification_backend.mark_pending_as_sent(notification_id)
-                await self.notification_backend.store_context_used(
-                    notification_id,
-                    context,
-                    adapter.adapter_import_str,
+                await self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification_id),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification_id,
+                )
+                await self._replicate_store_context_used(
+                    notification_id, context, adapter.adapter_import_str
                 )
             except NotificationUpdateError as e:
                 logger.exception("Failed to mark notification %s as sent", notification_id)
