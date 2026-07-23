@@ -5,7 +5,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, BinaryIO, TypedDict, TypeGuard
+from typing import Any, BinaryIO, Literal, TypedDict, TypeGuard
 
 
 # Type alias for supported file inputs (for creating notifications)
@@ -327,6 +327,22 @@ class NotificationSyncReport(TypedDict):
     backends_missing_record: list[str]
     in_sync: bool
     fields: list[NotificationSyncFieldReport]
+
+
+class _BackendSyncStatsRequired(TypedDict):
+    total_notifications: int
+    status: Literal["healthy", "error"]
+
+
+class BackendSyncStats(_BackendSyncStatsRequired, total=False):
+    """Per-backend entry in ``NotificationService.get_backend_sync_stats``'s return dict.
+
+    ``error`` is present only when ``status == "error"`` -- the backend raised while being
+    queried, and ``total_notifications`` is reported as ``0`` rather than the exception
+    propagating, so one broken backend never fails stats for the others.
+    """
+
+    error: str
 
 
 @dataclass(frozen=True)

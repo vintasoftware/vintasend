@@ -45,6 +45,7 @@ from vintasend.services.dataclasses import (
     NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     AnyNotificationAttachment,
+    BackendSyncStats,
     Notification,
     NotificationContextDict,
     NotificationSyncFieldReport,
@@ -1022,6 +1023,35 @@ class NotificationService(Generic[A, B]):
             self.get_all_backend_identifiers(),
             records_by_backend,
         )
+
+    def get_backend_sync_stats(self) -> dict[str, BackendSyncStats]:
+        """Per-backend health snapshot: notification count and whether the backend is reachable.
+
+        Drives ``total_notifications`` from ``count_notifications({})``, which every backend
+        provides (a concrete default derived from ``filter_notifications``, or an efficient
+        ``COUNT``-backed override). A backend that raises while being queried is reported
+        ``status='error'`` with the exception message captured in ``error`` and
+        ``total_notifications`` at ``0`` -- the exception itself never propagates, so one broken
+        backend never fails stats for the others.
+        """
+        stats: dict[str, BackendSyncStats] = {}
+        for identifier in self.get_all_backend_identifiers():
+            try:
+                total_notifications = self._backends[identifier].count_notifications({})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Backend %s raised while computing sync stats; reporting it as unhealthy "
+                    "rather than failing stats for the other backends",
+                    identifier,
+                )
+                stats[identifier] = {
+                    "total_notifications": 0,
+                    "status": "error",
+                    "error": str(exc),
+                }
+                continue
+            stats[identifier] = {"total_notifications": total_notifications, "status": "healthy"}
+        return stats
 
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
@@ -2829,6 +2859,35 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             self.get_all_backend_identifiers(),
             records_by_backend,
         )
+
+    async def get_backend_sync_stats(self) -> dict[str, BackendSyncStats]:
+        """AsyncIO twin of ``NotificationService.get_backend_sync_stats``.
+
+        Drives ``total_notifications`` from ``count_notifications({})``, which every backend
+        provides (a concrete default derived from ``filter_notifications``, or an efficient
+        ``COUNT``-backed override). A backend that raises while being queried is reported
+        ``status='error'`` with the exception message captured in ``error`` and
+        ``total_notifications`` at ``0`` -- the exception itself never propagates, so one broken
+        backend never fails stats for the others.
+        """
+        stats: dict[str, BackendSyncStats] = {}
+        for identifier in self.get_all_backend_identifiers():
+            try:
+                total_notifications = await self._backends[identifier].count_notifications({})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Backend %s raised while computing sync stats; reporting it as unhealthy "
+                    "rather than failing stats for the other backends",
+                    identifier,
+                )
+                stats[identifier] = {
+                    "total_notifications": 0,
+                    "status": "error",
+                    "error": str(exc),
+                }
+                continue
+            stats[identifier] = {"total_notifications": total_notifications, "status": "healthy"}
+        return stats
 
     async def _resolve_and_persist_git_commit_sha(
         self,
