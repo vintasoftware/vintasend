@@ -180,7 +180,7 @@ class MultiBackendWriteFanoutTestCase(TestCase):
         service = self.build_service(additional_backends=[self.replica_one, raising])
 
         # Immediate send exercises persist + mark_sent + store_context, each of which hits the
-        # raising replica; none of them may surface as a user-visible failure.
+        # raising replica; none of them may show up as a user-visible failure.
         notification = self._create(service)
 
         primary = self.primary_backend.get_notification(notification.id)

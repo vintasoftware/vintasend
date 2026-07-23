@@ -313,7 +313,7 @@ class GetNotificationReplicationQueueServiceTestCase(TestCase):
 
     def test_raises_typed_error_when_no_import_string_and_no_framework_detected(self):
         """With no import string and no framework detected,
-        NOTIFICATION_REPLICATION_QUEUE_SERVICE resolves to `{}` rather than `None`, so the guard
+        NOTIFICATION_REPLICATION_QUEUE_SERVICE resolves to `{}` rather than `None`, so this check
         must treat any non-`str` value as "not configured" instead of only checking for `None`.
         """
         _reset_notification_settings_singleton(self)
@@ -350,7 +350,7 @@ class GetAsyncioNotificationReplicationQueueServiceTestCase(TestCase):
 
     def test_raises_typed_error_when_no_import_string_and_no_framework_detected(self):
         """With no import string and no framework detected,
-        NOTIFICATION_REPLICATION_QUEUE_SERVICE resolves to `{}` rather than `None`, so the guard
+        NOTIFICATION_REPLICATION_QUEUE_SERVICE resolves to `{}` rather than `None`, so this check
         must treat any non-`str` value as "not configured" instead of only checking for `None`.
         """
         _reset_notification_settings_singleton(self)

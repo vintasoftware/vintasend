@@ -211,7 +211,7 @@ def _build_notification_sync_report(
     # concrete dataclass types (a Notification on one, a OneOffNotification on another) for
     # what should be the same logical record. `_comparable_fields_for_sync` only looks at the
     # reference record's type, so without this check the mismatch is invisible and the report
-    # could claim `in_sync=True`. Surface it as a synthetic field entry rather than changing
+    # could claim `in_sync=True`. Report it as a synthetic field entry rather than changing
     # the public TypedDict shapes.
     record_types_by_backend = {
         identifier: type(record).__name__ for identifier, record in records_by_backend.items()

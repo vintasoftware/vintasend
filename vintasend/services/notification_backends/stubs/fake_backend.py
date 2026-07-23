@@ -787,7 +787,8 @@ class FakeFileBackend(BaseNotificationBackend):
         replaces it when the snapshot's ``modified`` is at least as new as the stored row's,
         and declines when the stored row is strictly newer. A defensive copy is stored so the
         primary and this replica never share a mutable record. Downstream backends (e.g.
-        ``vintasend-django``) mirror this as an ``update_or_create`` guarded by ``modified``.
+        ``vintasend-django``) mirror this as an ``update_or_create`` that only overwrites when
+        ``modified`` is newer.
         """
         incoming = dataclasses.replace(snapshot)
         for index, existing in enumerate(self.notifications):
@@ -1553,7 +1554,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         replaces it when the snapshot's ``modified`` is at least as new as the stored row's,
         and declines when the stored row is strictly newer. A defensive copy is stored so the
         primary and this replica never share a mutable record. Downstream backends (e.g.
-        ``vintasend-django``) mirror this as an ``update_or_create`` guarded by ``modified``.
+        ``vintasend-django``) mirror this as an ``update_or_create`` that only overwrites when
+        ``modified`` is newer.
         """
         incoming = dataclasses.replace(snapshot)
         for index, existing in enumerate(self.notifications):
