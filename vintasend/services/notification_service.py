@@ -33,21 +33,20 @@ from vintasend.exceptions import (
     NotificationUpdateError,
     TenantReassignmentError,
 )
-from vintasend.services.attachment_managers.base import (
-    download_from_url,
-    is_url,
-    read_file_data,
-)
+from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
+from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.dataclasses import (
+    AnyNotificationAttachment,
     Notification,
-    NotificationAttachment,
     NotificationContextDict,
     OneOffNotification,
     UpdateNotificationKwargs,
 )
 from vintasend.services.helpers import (
+    get_asyncio_attachment_manager,
     get_asyncio_notification_adapters,
     get_asyncio_notification_backend,
+    get_attachment_manager,
     get_notification_adapters,
     get_notification_backend,
     get_notification_queue_service,
@@ -55,7 +54,13 @@ from vintasend.services.helpers import (
 from vintasend.services.notification_adapters.async_base import AsyncBaseNotificationAdapter
 from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNotificationAdapter
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
-from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_backends.asyncio_base import (
+    supports_attachments as asyncio_supports_attachments,
+)
+from vintasend.services.notification_backends.base import (
+    BaseNotificationBackend,
+    supports_attachments,
+)
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
     NotificationFilter,
@@ -162,6 +167,7 @@ class NotificationService(Generic[A, B]):
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
         notification_queue_service: BaseNotificationQueueService | str | None = None,
+        attachment_manager: BaseAttachmentManager | str | None = None,
         raise_on_failed_send: bool = False,
     ):
         """
@@ -208,6 +214,16 @@ class NotificationService(Generic[A, B]):
                 get_notification_backend(notification_backend, notification_backend_kwargs, config),
             )
         self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        # Resolve the attachment manager (instance, dotted path, or the
+        # NOTIFICATION_ATTACHMENT_MANAGER setting) and inject it into the backend when the
+        # backend accepts one. A backend that does not do attachments is left untouched.
+        if isinstance(attachment_manager, BaseAttachmentManager):
+            self.attachment_manager: BaseAttachmentManager | None = attachment_manager
+        else:
+            self.attachment_manager = get_attachment_manager(attachment_manager, None, config)
+        if self.attachment_manager is not None and supports_attachments(self.notification_backend):
+            self.notification_backend.inject_attachment_manager(self.attachment_manager)
 
         if notification_adapters is None or self._check_is_adapters_tuple_iterable(
             notification_adapters
@@ -272,22 +288,10 @@ class NotificationService(Generic[A, B]):
         )
 
     def _validate_attachments(
-        self, attachments: list[NotificationAttachment]
-    ) -> list[NotificationAttachment]:
+        self, attachments: list[AnyNotificationAttachment]
+    ) -> list[AnyNotificationAttachment]:
         """Validate attachments and return the validated list."""
         return validate_attachments(attachments)
-
-    def _read_file_data(self, file) -> bytes:
-        """Read file data from a path, URL, `Path` object, or file-like object."""
-        return read_file_data(file)
-
-    def _is_url(self, file_str: str) -> bool:
-        """Check whether a string is a URL rather than a local file path."""
-        return is_url(file_str)
-
-    def _download_from_url(self, url: str) -> bytes:
-        """Download file content from a URL."""
-        return download_from_url(url)
 
     def register_queue_service(self, queue_service: BaseNotificationQueueService) -> None:
         """
@@ -434,7 +438,7 @@ class NotificationService(Generic[A, B]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
     ) -> Notification:
         """
@@ -456,30 +460,33 @@ class NotificationService(Generic[A, B]):
             send_after: datetime.datetime | None - the date and time to send the notification
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
-            attachments: list[NotificationAttachment] | None - the list of attachments to include
+            attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
 
-        extra_persist_kwargs: dict[str, Any] = {}
-        if tenant is not None:
-            extra_persist_kwargs["tenant"] = tenant
+        persist_kwargs: dict[str, Any] = {
+            "user_id": user_id,
+            "notification_type": notification_type,
+            "title": title,
+            "body_template": body_template,
+            "context_name": context_name,
+            "context_kwargs": context_kwargs,
+            "send_after": send_after,
+            "subject_template": subject_template,
+            "preheader_template": preheader_template,
+            "adapter_extra_parameters": adapter_extra_parameters,
+        }
+        # Only pass ``attachments`` when there is something to attach: backends that do
+        # not accept the keyword (e.g. attachment-unaware backends) then keep working.
+        if validated_attachments:
+            persist_kwargs["attachments"] = validated_attachments
 
-        notification = self.notification_backend.persist_notification(
-            user_id=user_id,
-            notification_type=notification_type,
-            title=title,
-            body_template=body_template,
-            context_name=context_name,
-            context_kwargs=context_kwargs,
-            send_after=send_after,
-            subject_template=subject_template,
-            preheader_template=preheader_template,
-            adapter_extra_parameters=adapter_extra_parameters,
-            attachments=validated_attachments,
-            **extra_persist_kwargs,
-        )
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
+
+        notification = self.notification_backend.persist_notification(**persist_kwargs)
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -500,7 +507,7 @@ class NotificationService(Generic[A, B]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
     ) -> "OneOffNotification":
         """
@@ -514,32 +521,44 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
+            email_or_phone: str - the email or phone that the one-off notification will be
+                sent to
+            notification_type: str - the type of notification to send
+            title: str - the title of the notification
+            body_template: str - the string that represents the body template
+            context_name: str - the name of the context function to generate the context
+            context_kwargs: NotificationContextDict - the context kwargs to generate the context
+            send_after: datetime.datetime | None - the date and time to send the notification
+            subject_template: str - the  string that represents the subject template
+            preheader_template: str - the string that represents the preheader template
+            attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
 
-        extra_persist_kwargs: dict[str, Any] = {}
-        if tenant is not None:
-            extra_persist_kwargs["tenant"] = tenant
+        persist_kwargs: dict[str, Any] = {
+            "email_or_phone": email_or_phone,
+            "first_name": first_name,
+            "last_name": last_name,
+            "notification_type": notification_type,
+            "title": title,
+            "body_template": body_template,
+            "context_name": context_name,
+            "context_kwargs": context_kwargs,
+            "send_after": send_after,
+            "subject_template": subject_template,
+            "preheader_template": preheader_template,
+            "adapter_extra_parameters": adapter_extra_parameters,
+        }
+        if validated_attachments:
+            persist_kwargs["attachments"] = validated_attachments
 
-        notification = self.notification_backend.persist_one_off_notification(
-            email_or_phone=email_or_phone,
-            first_name=first_name,
-            last_name=last_name,
-            notification_type=notification_type,
-            title=title,
-            body_template=body_template,
-            context_name=context_name,
-            context_kwargs=context_kwargs,
-            send_after=send_after,
-            subject_template=subject_template,
-            preheader_template=preheader_template,
-            adapter_extra_parameters=adapter_extra_parameters,
-            attachments=validated_attachments,
-            **extra_persist_kwargs,
-        )
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
+
+        notification = self.notification_backend.persist_one_off_notification(**persist_kwargs)
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -1134,6 +1153,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         notification_backend: BAIO | str | None = None,
         notification_backend_kwargs: dict | None = None,
         config: Any = None,
+        attachment_manager: AsyncIOBaseAttachmentManager | str | None = None,
     ):
         # initialize the notification settings singleton for the first time
         # to ensure all components have access to the same settings
@@ -1149,6 +1169,20 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 ),
             )
         self.notification_backend_import_str = get_class_path(self.notification_backend)
+
+        # Resolve the attachment manager (instance, dotted path, or the
+        # NOTIFICATION_ATTACHMENT_MANAGER setting) and inject it into the backend when the
+        # backend accepts one. A backend that does not do attachments is left untouched.
+        if isinstance(attachment_manager, AsyncIOBaseAttachmentManager):
+            self.attachment_manager: AsyncIOBaseAttachmentManager | None = attachment_manager
+        else:
+            self.attachment_manager = get_asyncio_attachment_manager(
+                attachment_manager, None, config
+            )
+        if self.attachment_manager is not None and asyncio_supports_attachments(
+            self.notification_backend
+        ):
+            self.notification_backend.inject_attachment_manager(self.attachment_manager)
 
         if notification_adapters is None or self._check_is_adapters_tuple_iterable(
             notification_adapters
@@ -1213,22 +1247,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         )
 
     def _validate_attachments(
-        self, attachments: list[NotificationAttachment]
-    ) -> list[NotificationAttachment]:
+        self, attachments: list[AnyNotificationAttachment]
+    ) -> list[AnyNotificationAttachment]:
         """Validate attachments and return the validated list."""
         return validate_attachments(attachments)
-
-    def _read_file_data(self, file) -> bytes:
-        """Read file data from a path, URL, `Path` object, or file-like object."""
-        return read_file_data(file)
-
-    def _is_url(self, file_str: str) -> bool:
-        """Check whether a string is a URL rather than a local file path."""
-        return is_url(file_str)
-
-    def _download_from_url(self, url: str) -> bytes:
-        """Download file content from a URL."""
-        return download_from_url(url)
 
     async def send(
         self,
@@ -1310,7 +1332,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
     ) -> Notification:
         """
@@ -1332,30 +1354,33 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             send_after: datetime.datetime | None - the date and time to send the notification
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
-            attachments: list[NotificationAttachment] | None - the list of attachments to include
+            attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
 
-        extra_persist_kwargs: dict[str, Any] = {}
-        if tenant is not None:
-            extra_persist_kwargs["tenant"] = tenant
+        persist_kwargs: dict[str, Any] = {
+            "user_id": user_id,
+            "notification_type": notification_type,
+            "title": title,
+            "body_template": body_template,
+            "context_name": context_name,
+            "context_kwargs": context_kwargs,
+            "send_after": send_after,
+            "subject_template": subject_template,
+            "preheader_template": preheader_template,
+            "adapter_extra_parameters": adapter_extra_parameters,
+        }
+        # Only pass ``attachments`` when there is something to attach: backends that do
+        # not accept the keyword (e.g. attachment-unaware backends) then keep working.
+        if validated_attachments:
+            persist_kwargs["attachments"] = validated_attachments
 
-        notification = await self.notification_backend.persist_notification(
-            user_id=user_id,
-            notification_type=notification_type,
-            title=title,
-            body_template=body_template,
-            context_name=context_name,
-            context_kwargs=context_kwargs,
-            send_after=send_after,
-            subject_template=subject_template,
-            preheader_template=preheader_template,
-            adapter_extra_parameters=adapter_extra_parameters,
-            attachments=validated_attachments,
-            **extra_persist_kwargs,
-        )
+        if tenant is not None:
+            persist_kwargs["tenant"] = tenant
+
+        notification = await self.notification_backend.persist_notification(**persist_kwargs)
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -1376,7 +1401,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         subject_template: str = "",
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
-        attachments: list[NotificationAttachment] | None = None,
+        attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
     ) -> OneOffNotification:
         """
@@ -1390,31 +1415,45 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
+            email_or_phone: str - the email or phone that the one-off notification will be
+                sent to
+            notification_type: str - the type of notification to send
+            title: str - the title of the notification
+            body_template: str - the string that represents the body template
+            context_name: str - the name of the context function to generate the context
+            context_kwargs: NotificationContextDict - the context kwargs to generate the context
+            send_after: datetime.datetime | None - the date and time to send the notification
+            subject_template: str - the  string that represents the subject template
+            preheader_template: str - the string that represents the preheader template
+            attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
 
-        extra_persist_kwargs: dict[str, Any] = {}
+        persist_kwargs: dict[str, Any] = {
+            "email_or_phone": email_or_phone,
+            "first_name": first_name,
+            "last_name": last_name,
+            "notification_type": notification_type,
+            "title": title,
+            "body_template": body_template,
+            "context_name": context_name,
+            "context_kwargs": context_kwargs,
+            "send_after": send_after,
+            "subject_template": subject_template,
+            "preheader_template": preheader_template,
+            "adapter_extra_parameters": adapter_extra_parameters,
+        }
+        if validated_attachments:
+            persist_kwargs["attachments"] = validated_attachments
+
         if tenant is not None:
-            extra_persist_kwargs["tenant"] = tenant
+            persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_one_off_notification(
-            email_or_phone=email_or_phone,
-            first_name=first_name,
-            last_name=last_name,
-            notification_type=notification_type,
-            title=title,
-            body_template=body_template,
-            context_name=context_name,
-            context_kwargs=context_kwargs,
-            send_after=send_after,
-            subject_template=subject_template,
-            preheader_template=preheader_template,
-            adapter_extra_parameters=adapter_extra_parameters,
-            attachments=validated_attachments,
-            **extra_persist_kwargs,
+            **persist_kwargs
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
