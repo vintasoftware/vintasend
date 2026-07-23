@@ -1,0 +1,121 @@
+[project]
+name = "vintasend-implementation-template"
+version = "0.1.0"
+description = "Starting point for a new vintasend-* implementation package: one TODO stub per seam, ready to clone."
+authors = [{ name = "Your Name", email = "you@example.com" }]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+# Constraints stay under [tool.poetry.dependencies] to keep caret syntax, which
+# is not valid PEP 621. 'dynamic' tells build tooling the real list lives there.
+dynamic = ["dependencies"]
+
+[tool.poetry]
+packages = [{ include = "vintasend_implementation_template" }]
+include = [
+  { path = "vintasend_implementation_template/py.typed", format = "wheel" }
+]
+
+[tool.poetry.dependencies]
+# Pinned to the current vintasend line (2.0) so a freshly cloned package starts
+# with a correct, working pin against the seams this template's stubs subclass.
+vintasend = "^2.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.3"
+pytest-asyncio = "^1.4.0"
+ruff = "^0.15.22"
+mypy = "^2.3.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+indent-width = 4
+# Must track the MINIMUM Python this template supports. Setting this higher lets
+# pyupgrade rewrite code into syntax that breaks older interpreters.
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pep8-naming
+    "N",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-bandit
+    "S",
+    # flake8-blind-except
+    "BLE",
+    # flake8-builtins
+    "A",
+    # isort
+    "I",
+    # flake8-logging-format
+    "G",
+    # flake8-no-pep420
+    "INP",
+    # Ruff-specific rules
+    "RUF",
+]
+ignore = [
+    # Disable Conflicting lint rules,
+    # see https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+    "W191",
+    "E501",
+    "E111",
+    "E117",
+    "D206",
+    "D300",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "COM812",
+    "COM819",
+    "ISC001",
+    "ISC002",
+    # Allow `except Exception`:
+    "BLE001",
+    # Disable unused `noqa` directive
+    "RUF100",
+]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.pycodestyle]
+ignore-overlong-task-comments = true
+
+[tool.ruff.lint.isort]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
+lines-after-imports = 2
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F403", "F405"]
+"**/{tests,docs}/*" = ["E402", "F403", "F405", "S", "N802"]
+"**/*test*.py" = ["E402", "F403", "F405", "S", "N802"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+
+[tool.mypy]
+files = ["vintasend_implementation_template", "tests"]
+# Must track the MINIMUM Python this template supports.
+python_version = "3.10"
+show_error_codes = true
+no_implicit_reexport = true
+strict_equality = true
+warn_no_return = true
