@@ -272,6 +272,25 @@ class OneOffNotification:
     git_commit_sha: str | None = None
 
 
+@dataclass(frozen=True)
+class ApplyResult:
+    """Outcome of a backend's ``apply_replication_snapshot_if_newer`` call.
+
+    This is the contract between the service's inline replication and a backend's optional
+    newer-wins upsert. ``applied`` is ``True`` when the backend accepted the primary's
+    snapshot -- creating the replica row with the primary's id, or refreshing an existing row
+    because the snapshot was newer -- so the service need do nothing further for that backend.
+    It is ``False`` when the backend declined: either because it does not implement snapshot
+    application at all (the concrete ``BaseNotificationBackend`` default) or because the row it
+    already holds is newer than the snapshot. On ``False`` the service falls back to a
+    read-then-write replica mutation. ``reason`` is an optional, human-readable note for logs;
+    it never drives control flow.
+    """
+
+    applied: bool
+    reason: str | None = None
+
+
 class UpdateNotificationKwargs(TypedDict, total=False):
     title: str
     body_template: str

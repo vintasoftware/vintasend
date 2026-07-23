@@ -4,6 +4,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable
 
+from vintasend.services.dataclasses import ApplyResult
 from vintasend.services.utils import get_class_path
 
 
@@ -292,6 +293,29 @@ class AsyncIOBaseNotificationBackend(ABC):
         keeping it sync lets the constructor call it without an event loop.
         """
         return None
+
+    async def apply_replication_snapshot_if_newer(
+        self, snapshot: "Notification | OneOffNotification"
+    ) -> ApplyResult:
+        """Upsert the primary's snapshot into this backend when it is the newer record.
+
+        Concrete default that declines every snapshot (``ApplyResult(applied=False)``): a
+        backend that does not override this makes the owning ``AsyncIONotificationService``
+        fall back to a read-then-write replica mutation. Override to implement an id-keyed,
+        newer-wins upsert (comparing ``modified``) so inline replication can create a replica's
+        copy with the primary's id, or refresh it, in a single call -- return
+        ``ApplyResult(applied=True)`` once applied so the service skips the fallback, and
+        ``applied=False`` (optionally with a ``reason``) to defer to it.
+
+        ``snapshot`` is the primary backend's authoritative record for a notification; it must
+        be written with its existing id, never a freshly assigned one. Concrete rather than
+        abstract on purpose: multi-backend replication is opt-in, so forcing every backend to
+        implement it would break single-backend deployments that never use it.
+        """
+        return ApplyResult(
+            applied=False,
+            reason="apply_replication_snapshot_if_newer is not implemented by this backend",
+        )
 
     async def get_all_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         """
