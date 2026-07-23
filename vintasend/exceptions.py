@@ -118,6 +118,17 @@ class DuplicateBackendIdentifierError(NotificationError):
     """Raised when two configured backends resolve to the same identifier."""
 
 
+class ReplicationError(NotificationError):
+    """Raised when a replication worker cannot carry out a replication it was told to do --
+    for example ``process_replication`` is handed a notification id that does not resolve on
+    the primary backend, so there is no authoritative snapshot to replicate.
+
+    Distinct from a best-effort replica write failing during inline or queued fan-out: those
+    are logged and reconciled later, never raised, because the primary write is the source of
+    truth. A ``ReplicationError`` means the reconciliation entrypoint itself was given something
+    it cannot act on."""
+
+
 class NotificationRenderError(NotificationError):
     """Raised when a notification has no email renderer available to render it: either no
     adapter is configured for its notification type, or the configured adapter's template
