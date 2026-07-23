@@ -4,8 +4,8 @@ import logging
 import sys
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable
-from typing import Any, ClassVar, Coroutine, Generic, TypeGuard, TypeVar, cast
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, ClassVar, Coroutine, Generic, Literal, TypeGuard, TypeVar, cast
 
 from vintasend.app_settings import NotificationSettings
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
@@ -30,6 +30,7 @@ from vintasend.exceptions import (
     NotificationError,
     NotificationMarkFailedError,
     NotificationMarkSentError,
+    NotificationNotFoundError,
     NotificationQueueServiceMissingError,
     NotificationResendError,
     NotificationSendError,
@@ -109,6 +110,44 @@ ALREADY_DELIVERED_NOTIFICATION_STATUSES = frozenset(
 )
 
 
+# Substrings that mark a replica write failure as a normal, reconcilable replication conflict
+# rather than a genuine error. Under a best-effort fan-out with retries, two states are
+# expected and self-healing: the replica already holds the row a create is replicating
+# ("duplicate"/"unique"/"conflict"/"already exists"), or it lacks the row an update is
+# replicating ("not found"/"does not exist"/...). Either way the service flips to the opposite
+# operation -- converging the replica to the primary's snapshot -- before giving up. Matched
+# case-insensitively against ``str(exc)``; mirrors vintasend-ts's
+# ``isLikelyDuplicateReplicationConflict`` and widens it to the missing-row direction the flip
+# also needs. Substring matching is deliberately loose: a false positive only triggers one
+# extra idempotent reconcile attempt, never data loss.
+_REPLICATION_CONFLICT_MARKERS = (
+    "duplicate",
+    "unique",
+    "conflict",
+    "already exists",
+    "not found",
+    "does not exist",
+    "no notification",
+    "matching query does not exist",
+)
+
+
+def _is_likely_duplicate_replication_conflict(exc: BaseException) -> bool:
+    """Whether ``exc`` from a replica write looks like a reconcilable replication conflict.
+
+    See ``_REPLICATION_CONFLICT_MARKERS``: a ``True`` result tells the service the failure is
+    the expected create-collides / update-missing race and it should flip to converging the
+    replica to the snapshot, rather than logging the write off as a hard failure.
+    """
+    message = str(exc).lower()
+    return any(marker in message for marker in _REPLICATION_CONFLICT_MARKERS)
+
+
+# The return type of the primary write passed to ``_execute_multi_backend_write``, propagated
+# so a create returns a ``Notification`` and a mark returns whatever its backend method does.
+_WriteResultT = TypeVar("_WriteResultT")
+
+
 def validate_unique_adapter_notification_types(
     adapters: Iterable[BaseNotificationAdapter | AsyncIOBaseNotificationAdapter],
 ) -> None:
@@ -174,6 +213,7 @@ class NotificationService(Generic[A, B]):
     notification_backend: B
     notification_queue_service: BaseNotificationQueueService | None
     raise_on_failed_send: bool
+    replication_mode: Literal["inline", "queued"]
     _backends: dict[str, B]
     _primary_backend_identifier: str
 
@@ -190,6 +230,7 @@ class NotificationService(Generic[A, B]):
         git_commit_sha_provider: BaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
         additional_backends: Iterable[B | str] | None = None,
+        replication_mode: Literal["inline", "queued"] = "inline",
     ):
         """
         Build a notification service.
@@ -217,6 +258,11 @@ class NotificationService(Generic[A, B]):
             backends, starting at 1 (the primary is position 0). Absent
             `additional_backends`, the service behaves exactly as a single-backend 2.0
             deployment.
+        :param replication_mode: how writes fan out to the additional backends. ``"inline"``
+            (the default) replicates on the request path, right after the primary write.
+            ``"queued"`` is accepted now for forward compatibility but only wired in a later
+            phase; until then it behaves as ``"inline"``. Ignored entirely by a single-backend
+            service, which never replicates.
         :raises DuplicateBackendIdentifierError: if an additional backend's resolved
             identifier collides with an already-registered backend's identifier --
             including the primary's.
@@ -226,6 +272,7 @@ class NotificationService(Generic[A, B]):
         NotificationSettings(config)
 
         self.raise_on_failed_send = raise_on_failed_send
+        self.replication_mode = replication_mode
 
         if isinstance(notification_queue_service, BaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -420,6 +467,181 @@ class NotificationService(Generic[A, B]):
             )
         return self._backends[backend_identifier]
 
+    def _execute_multi_backend_write(
+        self,
+        primary_write: Callable[[B], _WriteResultT],
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+        replication_notification_id: int | str | uuid.UUID | None = None,
+    ) -> _WriteResultT:
+        """Run a write on the primary, then fan it out to every additional backend inline.
+
+        The primary write runs first and its result -- and any exception -- is the caller's:
+        the primary is the source of truth, so its failure is the user's failure and
+        propagates unchanged. Only after it succeeds, and only when additional backends are
+        configured, is the write replicated. Each replica is handled in registry order and any
+        replica failure is logged and swallowed, so a rejecting replica never fails the user's
+        operation -- it is reconciled by a later write. A single-backend service short-circuits
+        and never enters the replication loop, staying byte-for-byte identical to a
+        single-backend 2.0 deployment.
+
+        ``primary_write`` performs the mutation on the backend it is handed. ``additional_write``
+        applies the same mutation to a replica when snapshot application is unavailable; it
+        receives the primary's post-write snapshot (or ``None`` when there is no single record
+        to snapshot, e.g. bulk read-marking or a cancel that deleted the row).
+        ``replication_notification_id`` names the record to snapshot when the primary write does
+        not itself return one.
+        """
+        result = primary_write(self.notification_backend)
+
+        additional_backend_identifiers = self.get_additional_backend_identifiers()
+        if not additional_backend_identifiers:
+            return result
+
+        snapshot = self._read_replication_snapshot(replication_notification_id, result)
+        for backend_identifier in additional_backend_identifiers:
+            replica = self._backends[backend_identifier]
+            try:
+                self._replicate_write_to_backend(replica, snapshot, additional_write)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to replicate a write to backend %s (notification %s); the primary "
+                    "write succeeded and the replica will be reconciled by a later write",
+                    backend_identifier,
+                    getattr(snapshot, "id", replication_notification_id),
+                )
+        return result
+
+    def _read_replication_snapshot(
+        self,
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+    ) -> "Notification | OneOffNotification | None":
+        """Re-read the primary's authoritative record to replicate, or ``None`` if there is none.
+
+        Prefers ``replication_notification_id``; otherwise uses the id of the primary write's
+        result when that result is itself a notification (creates and updates). Returns ``None``
+        when no id resolves (e.g. bulk read-marking) or the record no longer exists on the
+        primary (e.g. a cancel that deleted it) -- the caller then relies on ``additional_write``
+        instead of snapshot application.
+        """
+        snapshot_id = replication_notification_id
+        if snapshot_id is None and isinstance(result, (Notification, OneOffNotification)):
+            snapshot_id = result.id
+        if snapshot_id is None:
+            return None
+        try:
+            return self.notification_backend.get_notification(snapshot_id)
+        except NotificationError:
+            return None
+
+    def _replicate_write_to_backend(
+        self,
+        replica: B,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[[B, "Notification | OneOffNotification | None"], Any],
+    ) -> None:
+        """Apply one write to one replica, preferring snapshot application then falling back.
+
+        When a snapshot is available the replica's ``apply_replication_snapshot_if_newer`` is
+        tried first: a backend that implements it upserts the whole record -- creating the row
+        with the primary's id or refreshing it newer-wins -- in one call. When it declines
+        (``applied=False``, the concrete default) the ``additional_write`` fallback mirrors the
+        mutation with the backend's own primitives. A duplicate/conflict failure -- the replica
+        already holds a created row, or lacks a row being updated -- flips once to converging the
+        replica to the snapshot before the error propagates to the caller's logging.
+        """
+        try:
+            if (
+                snapshot is not None
+                and replica.apply_replication_snapshot_if_newer(snapshot).applied
+            ):
+                return
+            additional_write(replica, snapshot)
+        except Exception as exc:  # noqa: BLE001
+            if snapshot is None or not _is_likely_duplicate_replication_conflict(exc):
+                raise
+            self._converge_replica_to_snapshot(replica, snapshot)
+
+    def _replicate_snapshot_fallback(
+        self, replica: B, snapshot: "Notification | OneOffNotification | None"
+    ) -> None:
+        """Default ``additional_write``: converge a replica to the primary's snapshot.
+
+        Used for every single-record write (create, update, mark, store). It only converges a
+        row the replica already holds; it cannot create a row with the primary's id, because no
+        base primitive assigns a chosen id -- that is exactly what
+        ``apply_replication_snapshot_if_newer`` exists for. A backend that implements snapshot
+        application never reaches this path.
+        """
+        if snapshot is None:
+            return
+        self._converge_replica_to_snapshot(replica, snapshot)
+
+    def _converge_replica_to_snapshot(
+        self, replica: B, snapshot: "Notification | OneOffNotification"
+    ) -> None:
+        """Bring an existing replica row into line with the primary's snapshot via primitives.
+
+        Serves as both the read-then-write fallback for a backend that declines snapshot
+        application and the flip target when a replica reports a duplicate/conflict. Requires the
+        row to already exist on the replica; an absent row is logged and skipped, since inline
+        replication cannot create a row with the primary's id without snapshot-apply support.
+        """
+        try:
+            replica.get_notification(snapshot.id)
+        except NotificationNotFoundError:
+            logger.warning(
+                "Replica lacks notification %s and does not implement "
+                "apply_replication_snapshot_if_newer; cannot create it with its primary id "
+                "inline -- it will be reconciled later",
+                snapshot.id,
+            )
+            return
+        update_data: UpdateNotificationKwargs = {
+            "title": snapshot.title,
+            "body_template": snapshot.body_template,
+            "context_name": snapshot.context_name,
+            "context_kwargs": snapshot.context_kwargs,
+            "send_after": snapshot.send_after,
+            "subject_template": snapshot.subject_template,
+            "preheader_template": snapshot.preheader_template,
+            "adapter_extra_parameters": snapshot.adapter_extra_parameters,
+        }
+        replica.persist_notification_update(notification_id=snapshot.id, update_data=update_data)
+        if snapshot.context_used is not None:
+            replica.store_context_used(
+                snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
+            )
+        if snapshot.git_commit_sha is not None:
+            replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        if snapshot.status == NotificationStatus.SENT.value:
+            replica.mark_pending_as_sent(snapshot.id)
+        elif snapshot.status == NotificationStatus.FAILED.value:
+            replica.mark_pending_as_failed(snapshot.id)
+        elif snapshot.status == NotificationStatus.READ.value:
+            replica.mark_sent_as_read(snapshot.id)
+
+    def _replicate_store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: NotificationContextDict,
+        adapter_import_str: str,
+    ) -> None:
+        """Persist ``context_used`` on the primary and fan it out to the replicas.
+
+        Extracted from ``send`` / ``delayed_send`` into its own method so the
+        ``_execute_multi_backend_write`` closure captures these method parameters rather than
+        the send loop's ``adapter`` and ``context`` variables -- a loop-captured closure is a
+        late-binding hazard the linters (rightly) reject.
+        """
+        self._execute_multi_backend_write(
+            lambda backend: backend.store_context_used(
+                notification_id, context, adapter_import_str
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
+
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
     ) -> None:
@@ -452,7 +674,11 @@ class NotificationService(Generic[A, B]):
         if normalized_sha == notification.git_commit_sha:
             return
 
-        self.notification_backend.store_git_commit_sha(notification.id, normalized_sha)
+        self._execute_multi_backend_write(
+            lambda backend: backend.store_git_commit_sha(notification.id, normalized_sha),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification.id,
+        )
         notification.git_commit_sha = normalized_sha
 
     def send(
@@ -532,7 +758,11 @@ class NotificationService(Generic[A, B]):
                         "Failed to generate context for notification %s", notification.id
                     )
                     try:
-                        self.notification_backend.mark_pending_as_failed(notification.id)
+                        self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification.id),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification.id,
+                        )
                     except NotificationUpdateError as e:
                         logger.exception(
                             "Failed to mark notification %s as failed", notification.id
@@ -557,7 +787,11 @@ class NotificationService(Generic[A, B]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification.id)
                 try:
-                    self.notification_backend.mark_pending_as_failed(notification.id)
+                    self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification.id),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification.id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification.id)
                     if self.raise_on_failed_send:
@@ -570,11 +804,13 @@ class NotificationService(Generic[A, B]):
                 continue
 
             try:
-                self.notification_backend.mark_pending_as_sent(notification.id)
-                self.notification_backend.store_context_used(
-                    notification.id,
-                    context,
-                    adapter.adapter_import_str,
+                self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification.id),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification.id,
+                )
+                self._replicate_store_context_used(
+                    notification.id, context, adapter.adapter_import_str
                 )
             except NotificationUpdateError as e:
                 logger.exception("Failed to mark notification %s as sent", notification.id)
@@ -641,7 +877,10 @@ class NotificationService(Generic[A, B]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = self.notification_backend.persist_notification(**persist_kwargs)
+        notification = self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
+        )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -713,7 +952,10 @@ class NotificationService(Generic[A, B]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = self.notification_backend.persist_one_off_notification(**persist_kwargs)
+        notification = self._execute_multi_backend_write(
+            lambda backend: backend.persist_one_off_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
+        )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -749,9 +991,13 @@ class NotificationService(Generic[A, B]):
             raise GitCommitShaReassignmentError(
                 "A notification's git_commit_sha is system-managed and cannot be set directly"
             )
-        notification = self.notification_backend.persist_notification_update(
-            notification_id=notification_id,
-            update_data=kwargs,
+        notification = self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification_update(
+                notification_id=notification_id,
+                update_data=kwargs,
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -952,7 +1198,11 @@ class NotificationService(Generic[A, B]):
         Returns:
             Notification | OneOffNotification - the updated notification
         """
-        return self.notification_backend.mark_sent_as_read(notification_id)
+        return self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read(notification_id),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
 
     def mark_read_bulk(
         self,
@@ -974,7 +1224,13 @@ class NotificationService(Generic[A, B]):
         Returns:
             Iterable[Notification] - the requested notifications that are read after the operation
         """
-        return self.notification_backend.mark_sent_as_read_bulk(notification_ids, user_id=user_id)
+        # Materialize once: the id iterable may be a single-use generator, and both the primary
+        # write and every replica mirror need to consume it.
+        ids = list(notification_ids)
+        return self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+            lambda backend, snapshot: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+        )
 
     def get_in_app_unread(
         self,
@@ -1187,26 +1443,33 @@ class NotificationService(Generic[A, B]):
         if source.tenant is not None:
             extra_persist_kwargs["tenant"] = source.tenant
 
-        clone = self.notification_backend.persist_notification(
-            user_id=source.user_id,
-            notification_type=source.notification_type,
-            title=source.title,
-            body_template=source.body_template,
-            context_name=source.context_name,
-            context_kwargs=source.context_kwargs,
-            send_after=None,
-            subject_template=source.subject_template,
-            preheader_template=source.preheader_template,
-            adapter_extra_parameters=source.adapter_extra_parameters,
-            **extra_persist_kwargs,
+        clone = self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(
+                user_id=source.user_id,
+                notification_type=source.notification_type,
+                title=source.title,
+                body_template=source.body_template,
+                context_name=source.context_name,
+                context_kwargs=source.context_kwargs,
+                send_after=None,
+                subject_template=source.subject_template,
+                preheader_template=source.preheader_template,
+                adapter_extra_parameters=source.adapter_extra_parameters,
+                **extra_persist_kwargs,
+            ),
+            self._replicate_snapshot_fallback,
         )
 
         if source.attachments:
             clone = cast(
                 Notification,
-                self.notification_backend.persist_notification_update(
-                    notification_id=clone.id,
-                    update_data={"attachments": list(source.attachments)},
+                self._execute_multi_backend_write(
+                    lambda backend: backend.persist_notification_update(
+                        notification_id=clone.id,
+                        update_data={"attachments": list(source.attachments)},
+                    ),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=clone.id,
                 ),
             )
 
@@ -1227,7 +1490,23 @@ class NotificationService(Generic[A, B]):
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
-        return self.notification_backend.cancel_notification(notification_id)
+
+        def _cancel_on_replica(
+            backend: B, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # A cancel deletes the row, so there is no snapshot to apply -- mirror the delete on
+            # the replica. A replica that never held the row is already in the desired (absent)
+            # state, so a not-found is success, not a failure.
+            try:
+                backend.cancel_notification(notification_id)
+            except NotificationNotFoundError:
+                return
+
+        return self._execute_multi_backend_write(
+            lambda backend: backend.cancel_notification(notification_id),
+            _cancel_on_replica,
+            replication_notification_id=notification_id,
+        )
 
     def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -1298,7 +1577,11 @@ class NotificationService(Generic[A, B]):
                         "Failed to generate context for notification %s", notification_id
                     )
                     try:
-                        self.notification_backend.mark_pending_as_failed(notification_id)
+                        self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification_id),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification_id,
+                        )
                     except NotificationUpdateError as e:
                         logger.exception(
                             "Failed to mark notification %s as failed", notification_id
@@ -1318,7 +1601,11 @@ class NotificationService(Generic[A, B]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification_id)
                 try:
-                    self.notification_backend.mark_pending_as_failed(notification_id)
+                    self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification_id),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification_id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification_id)
                     if self.raise_on_failed_send:
@@ -1331,11 +1618,13 @@ class NotificationService(Generic[A, B]):
                 continue
 
             try:
-                self.notification_backend.mark_pending_as_sent(notification_id)
-                self.notification_backend.store_context_used(
-                    notification_id,
-                    context,
-                    adapter.adapter_import_str,
+                self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification_id),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification_id,
+                )
+                self._replicate_store_context_used(
+                    notification_id, context, adapter.adapter_import_str
                 )
             except NotificationUpdateError as e:
                 logger.exception("Failed to mark notification %s as sent", notification_id)
@@ -1363,6 +1652,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     notification_backend: BAIO
     notification_queue_service: AsyncIOBaseNotificationQueueService | None
     raise_on_failed_send: bool
+    replication_mode: Literal["inline", "queued"]
     _backends: dict[str, BAIO]
     _primary_backend_identifier: str
 
@@ -1379,6 +1669,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
         additional_backends: Iterable[BAIO | str] | None = None,
+        replication_mode: Literal["inline", "queued"] = "inline",
     ):
         """
         Build an AsyncIO notification service.
@@ -1406,6 +1697,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             backends, starting at 1 (the primary is position 0). Absent
             `additional_backends`, the service behaves exactly as a single-backend 2.0
             deployment.
+        :param replication_mode: how writes fan out to the additional backends. ``"inline"``
+            (the default) replicates on the request path, right after the primary write.
+            ``"queued"`` is accepted now for forward compatibility but only wired in a later
+            phase; until then it behaves as ``"inline"``. Ignored entirely by a single-backend
+            service, which never replicates.
         :raises DuplicateBackendIdentifierError: if an additional backend's resolved
             identifier collides with an already-registered backend's identifier --
             including the primary's.
@@ -1415,6 +1711,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         NotificationSettings(config)
 
         self.raise_on_failed_send = raise_on_failed_send
+        self.replication_mode = replication_mode
 
         if isinstance(notification_queue_service, AsyncIOBaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -1620,6 +1917,188 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             )
         return self._backends[backend_identifier]
 
+    async def _execute_multi_backend_write(
+        self,
+        primary_write: Callable[[BAIO], Awaitable[_WriteResultT]],
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+        replication_notification_id: int | str | uuid.UUID | None = None,
+    ) -> _WriteResultT:
+        """Run a write on the primary, then fan it out to every additional backend inline.
+
+        The primary write runs first and its result -- and any exception -- is the caller's:
+        the primary is the source of truth, so its failure is the user's failure and
+        propagates unchanged. Only after it succeeds, and only when additional backends are
+        configured, is the write replicated. Each replica is handled in registry order and any
+        replica failure is logged and swallowed, so a rejecting replica never fails the user's
+        operation -- it is reconciled by a later write. A single-backend service short-circuits
+        and never enters the replication loop, staying byte-for-byte identical to a
+        single-backend 2.0 deployment.
+
+        ``primary_write`` performs the mutation on the backend it is handed. ``additional_write``
+        applies the same mutation to a replica when snapshot application is unavailable; it
+        receives the primary's post-write snapshot (or ``None`` when there is no single record
+        to snapshot, e.g. bulk read-marking or a cancel that deleted the row).
+        ``replication_notification_id`` names the record to snapshot when the primary write does
+        not itself return one.
+        """
+        result = await primary_write(self.notification_backend)
+
+        additional_backend_identifiers = self.get_additional_backend_identifiers()
+        if not additional_backend_identifiers:
+            return result
+
+        snapshot = await self._read_replication_snapshot(replication_notification_id, result)
+        for backend_identifier in additional_backend_identifiers:
+            replica = self._backends[backend_identifier]
+            try:
+                await self._replicate_write_to_backend(replica, snapshot, additional_write)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Failed to replicate a write to backend %s (notification %s); the primary "
+                    "write succeeded and the replica will be reconciled by a later write",
+                    backend_identifier,
+                    getattr(snapshot, "id", replication_notification_id),
+                )
+        return result
+
+    async def _read_replication_snapshot(
+        self,
+        replication_notification_id: int | str | uuid.UUID | None,
+        result: Any,
+    ) -> "Notification | OneOffNotification | None":
+        """Re-read the primary's authoritative record to replicate, or ``None`` if there is none.
+
+        Prefers ``replication_notification_id``; otherwise uses the id of the primary write's
+        result when that result is itself a notification (creates and updates). Returns ``None``
+        when no id resolves (e.g. bulk read-marking) or the record no longer exists on the
+        primary (e.g. a cancel that deleted it) -- the caller then relies on ``additional_write``
+        instead of snapshot application.
+        """
+        snapshot_id = replication_notification_id
+        if snapshot_id is None and isinstance(result, (Notification, OneOffNotification)):
+            snapshot_id = result.id
+        if snapshot_id is None:
+            return None
+        try:
+            return await self.notification_backend.get_notification(snapshot_id)
+        except NotificationError:
+            return None
+
+    async def _replicate_write_to_backend(
+        self,
+        replica: BAIO,
+        snapshot: "Notification | OneOffNotification | None",
+        additional_write: Callable[
+            [BAIO, "Notification | OneOffNotification | None"], Awaitable[Any]
+        ],
+    ) -> None:
+        """Apply one write to one replica, preferring snapshot application then falling back.
+
+        When a snapshot is available the replica's ``apply_replication_snapshot_if_newer`` is
+        tried first: a backend that implements it upserts the whole record -- creating the row
+        with the primary's id or refreshing it newer-wins -- in one call. When it declines
+        (``applied=False``, the concrete default) the ``additional_write`` fallback mirrors the
+        mutation with the backend's own primitives. A duplicate/conflict failure -- the replica
+        already holds a created row, or lacks a row being updated -- flips once to converging the
+        replica to the snapshot before the error propagates to the caller's logging.
+        """
+        try:
+            if (
+                snapshot is not None
+                and (await replica.apply_replication_snapshot_if_newer(snapshot)).applied
+            ):
+                return
+            await additional_write(replica, snapshot)
+        except Exception as exc:  # noqa: BLE001
+            if snapshot is None or not _is_likely_duplicate_replication_conflict(exc):
+                raise
+            await self._converge_replica_to_snapshot(replica, snapshot)
+
+    async def _replicate_snapshot_fallback(
+        self, replica: BAIO, snapshot: "Notification | OneOffNotification | None"
+    ) -> None:
+        """Default ``additional_write``: converge a replica to the primary's snapshot.
+
+        Used for every single-record write (create, update, mark, store). It only converges a
+        row the replica already holds; it cannot create a row with the primary's id, because no
+        base primitive assigns a chosen id -- that is exactly what
+        ``apply_replication_snapshot_if_newer`` exists for. A backend that implements snapshot
+        application never reaches this path.
+        """
+        if snapshot is None:
+            return
+        await self._converge_replica_to_snapshot(replica, snapshot)
+
+    async def _converge_replica_to_snapshot(
+        self, replica: BAIO, snapshot: "Notification | OneOffNotification"
+    ) -> None:
+        """Bring an existing replica row into line with the primary's snapshot via primitives.
+
+        Serves as both the read-then-write fallback for a backend that declines snapshot
+        application and the flip target when a replica reports a duplicate/conflict. Requires the
+        row to already exist on the replica; an absent row is logged and skipped, since inline
+        replication cannot create a row with the primary's id without snapshot-apply support.
+        """
+        try:
+            await replica.get_notification(snapshot.id)
+        except NotificationNotFoundError:
+            logger.warning(
+                "Replica lacks notification %s and does not implement "
+                "apply_replication_snapshot_if_newer; cannot create it with its primary id "
+                "inline -- it will be reconciled later",
+                snapshot.id,
+            )
+            return
+        update_data: UpdateNotificationKwargs = {
+            "title": snapshot.title,
+            "body_template": snapshot.body_template,
+            "context_name": snapshot.context_name,
+            "context_kwargs": snapshot.context_kwargs,
+            "send_after": snapshot.send_after,
+            "subject_template": snapshot.subject_template,
+            "preheader_template": snapshot.preheader_template,
+            "adapter_extra_parameters": snapshot.adapter_extra_parameters,
+        }
+        await replica.persist_notification_update(
+            notification_id=snapshot.id, update_data=update_data
+        )
+        if snapshot.context_used is not None:
+            await replica.store_context_used(
+                snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
+            )
+        if snapshot.git_commit_sha is not None:
+            await replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        if snapshot.status == NotificationStatus.SENT.value:
+            await replica.mark_pending_as_sent(snapshot.id)
+        elif snapshot.status == NotificationStatus.FAILED.value:
+            await replica.mark_pending_as_failed(snapshot.id)
+        elif snapshot.status == NotificationStatus.READ.value:
+            await replica.mark_sent_as_read(snapshot.id)
+
+    async def _replicate_store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: NotificationContextDict,
+        adapter_import_str: str,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        """Persist ``context_used`` on the primary and fan it out to the replicas.
+
+        Extracted from ``send`` / ``delayed_send`` into its own method so the
+        ``_execute_multi_backend_write`` closure captures these method parameters rather than
+        the send loop's ``adapter`` and ``context`` variables -- a loop-captured closure is a
+        late-binding hazard the linters (rightly) reject.
+        """
+        await self._execute_multi_backend_write(
+            lambda backend: backend.store_context_used(
+                notification_id, context, adapter_import_str, lock
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
+
     async def _resolve_and_persist_git_commit_sha(
         self,
         notification: Notification | OneOffNotification,
@@ -1654,7 +2133,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if normalized_sha == notification.git_commit_sha:
             return
 
-        await self.notification_backend.store_git_commit_sha(notification.id, normalized_sha, lock)
+        await self._execute_multi_backend_write(
+            lambda backend: backend.store_git_commit_sha(notification.id, normalized_sha, lock),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification.id,
+        )
         notification.git_commit_sha = normalized_sha
 
     async def send(
@@ -1740,8 +2223,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                         "Failed to generate context for notification %s", notification.id
                     )
                     try:
-                        await self.notification_backend.mark_pending_as_failed(
-                            notification.id, lock
+                        await self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification.id, lock),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification.id,
                         )
                     except NotificationUpdateError as e:
                         logger.exception(
@@ -1767,7 +2252,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification.id)
                 try:
-                    await self.notification_backend.mark_pending_as_failed(notification.id, lock)
+                    await self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification.id, lock),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification.id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification.id)
                     if self.raise_on_failed_send:
@@ -1780,8 +2269,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 continue
 
             try:
-                await self.notification_backend.mark_pending_as_sent(notification.id, lock)
-                await self.notification_backend.store_context_used(
+                await self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification.id, lock),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification.id,
+                )
+                await self._replicate_store_context_used(
                     notification.id, context, adapter.adapter_import_str, lock
                 )
             except NotificationUpdateError as e:
@@ -1849,7 +2342,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = await self.notification_backend.persist_notification(**persist_kwargs)
+        notification = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
+        )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
         ):
@@ -1921,8 +2417,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
-        notification = await self.notification_backend.persist_one_off_notification(
-            **persist_kwargs
+        notification = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_one_off_notification(**persist_kwargs),
+            self._replicate_snapshot_fallback,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1959,9 +2456,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             raise GitCommitShaReassignmentError(
                 "A notification's git_commit_sha is system-managed and cannot be set directly"
             )
-        notification = await self.notification_backend.persist_notification_update(
-            notification_id=notification_id,
-            update_data=kwargs,
+        notification = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification_update(
+                notification_id=notification_id,
+                update_data=kwargs,
+            ),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -2182,7 +2683,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Returns:
             Notification | OneOffNotification - the updated notification
         """
-        return await self.notification_backend.mark_sent_as_read(notification_id)
+        return await self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read(notification_id),
+            self._replicate_snapshot_fallback,
+            replication_notification_id=notification_id,
+        )
 
     async def mark_read_bulk(
         self,
@@ -2204,8 +2709,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Returns:
             Iterable[Notification] - the requested notifications that are read after the operation
         """
-        return await self.notification_backend.mark_sent_as_read_bulk(
-            notification_ids, user_id=user_id
+        # Materialize once: the id iterable may be a single-use generator, and both the primary
+        # write and every replica mirror need to consume it.
+        ids = list(notification_ids)
+        return await self._execute_multi_backend_write(
+            lambda backend: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+            lambda backend, snapshot: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
         )
 
     async def get_in_app_unread(
@@ -2421,26 +2930,33 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if source.tenant is not None:
             extra_persist_kwargs["tenant"] = source.tenant
 
-        clone = await self.notification_backend.persist_notification(
-            user_id=source.user_id,
-            notification_type=source.notification_type,
-            title=source.title,
-            body_template=source.body_template,
-            context_name=source.context_name,
-            context_kwargs=source.context_kwargs,
-            send_after=None,
-            subject_template=source.subject_template,
-            preheader_template=source.preheader_template,
-            adapter_extra_parameters=source.adapter_extra_parameters,
-            **extra_persist_kwargs,
+        clone = await self._execute_multi_backend_write(
+            lambda backend: backend.persist_notification(
+                user_id=source.user_id,
+                notification_type=source.notification_type,
+                title=source.title,
+                body_template=source.body_template,
+                context_name=source.context_name,
+                context_kwargs=source.context_kwargs,
+                send_after=None,
+                subject_template=source.subject_template,
+                preheader_template=source.preheader_template,
+                adapter_extra_parameters=source.adapter_extra_parameters,
+                **extra_persist_kwargs,
+            ),
+            self._replicate_snapshot_fallback,
         )
 
         if source.attachments:
             clone = cast(
                 Notification,
-                await self.notification_backend.persist_notification_update(
-                    notification_id=clone.id,
-                    update_data={"attachments": list(source.attachments)},
+                await self._execute_multi_backend_write(
+                    lambda backend: backend.persist_notification_update(
+                        notification_id=clone.id,
+                        update_data={"attachments": list(source.attachments)},
+                    ),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=clone.id,
                 ),
             )
 
@@ -2461,7 +2977,23 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
-        return await self.notification_backend.cancel_notification(notification_id)
+
+        async def _cancel_on_replica(
+            backend: BAIO, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # A cancel deletes the row, so there is no snapshot to apply -- mirror the delete on
+            # the replica. A replica that never held the row is already in the desired (absent)
+            # state, so a not-found is success, not a failure.
+            try:
+                await backend.cancel_notification(notification_id)
+            except NotificationNotFoundError:
+                return
+
+        return await self._execute_multi_backend_write(
+            lambda backend: backend.cancel_notification(notification_id),
+            _cancel_on_replica,
+            replication_notification_id=notification_id,
+        )
 
     async def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -2532,7 +3064,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                         "Failed to generate context for notification %s", notification_id
                     )
                     try:
-                        await self.notification_backend.mark_pending_as_failed(notification_id)
+                        await self._execute_multi_backend_write(
+                            lambda backend: backend.mark_pending_as_failed(notification_id),
+                            self._replicate_snapshot_fallback,
+                            replication_notification_id=notification_id,
+                        )
                     except NotificationUpdateError as e:
                         logger.exception(
                             "Failed to mark notification %s as failed", notification_id
@@ -2552,7 +3088,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification_id)
                 try:
-                    await self.notification_backend.mark_pending_as_failed(notification_id)
+                    await self._execute_multi_backend_write(
+                        lambda backend: backend.mark_pending_as_failed(notification_id),
+                        self._replicate_snapshot_fallback,
+                        replication_notification_id=notification_id,
+                    )
                 except NotificationUpdateError:
                     logger.exception("Failed to mark notification %s as failed", notification_id)
                     if self.raise_on_failed_send:
@@ -2565,11 +3105,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 continue
 
             try:
-                await self.notification_backend.mark_pending_as_sent(notification_id)
-                await self.notification_backend.store_context_used(
-                    notification_id,
-                    context,
-                    adapter.adapter_import_str,
+                await self._execute_multi_backend_write(
+                    lambda backend: backend.mark_pending_as_sent(notification_id),
+                    self._replicate_snapshot_fallback,
+                    replication_notification_id=notification_id,
+                )
+                await self._replicate_store_context_used(
+                    notification_id, context, adapter.adapter_import_str
                 )
             except NotificationUpdateError as e:
                 logger.exception("Failed to mark notification %s as sent", notification_id)
