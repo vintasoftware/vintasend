@@ -1,5 +1,47 @@
 # Release Notes
 
+## Version 2.1.0 (2026-07-23)
+
+### Features
+
+#### Git commit SHA tracking
+- New injected component: `BaseGitCommitShaProvider` (`vintasend.services.git_commit_sha_providers`)
+  and its AsyncIO twin `AsyncIOBaseGitCommitShaProvider` expose a single method,
+  `get_current_git_commit_sha() -> str | None`, that a host implements to report the git commit
+  SHA of the revision currently running. It follows the same injection pattern as the queue
+  service and attachment manager: an instance, a dotted import string, or the new
+  `NOTIFICATION_GIT_COMMIT_SHA_PROVIDER` setting. Core ships the ABCs plus a reference fake,
+  `FakeGitCommitShaProvider` / `FakeAsyncIOGitCommitShaProvider`; no default provider ships in
+  core, and with none configured the feature is entirely off -- no SHA is ever resolved or
+  written, and existing send/delayed_send flows are byte-for-byte unchanged.
+- `Notification` and `OneOffNotification` gained a system-managed `git_commit_sha: str | None`
+  field. Both `NotificationService` and `AsyncIONotificationService` resolve it at **send** time
+  (not creation time) at the top of both `send()` and `delayed_send()`, so a scheduled
+  notification records the revision that actually delivered it -- foreground or from a
+  background worker. The provider is called on every send, but the resolved, normalized SHA
+  (trimmed, lowercased, 40 hex characters) is only persisted when it differs from what is
+  already stored, through a new dedicated backend method, `store_git_commit_sha`.
+- A provider that raises is caught and logged, then treated exactly like a `None` return --
+  audit metadata is never allowed to block a delivery. A provider returning a non-`None`,
+  malformed value (not 40 hex characters once trimmed) raises `InvalidGitCommitShaError`.
+- `git_commit_sha` is system-managed: it cannot be set through `create_notification`, and
+  `update_notification` raises the new `GitCommitShaReassignmentError` if a caller passes it,
+  mirroring the existing `tenant` reassignment guard. It is only ever written by the service
+  itself, through `store_git_commit_sha`, while the row is still pending.
+- See the README's "Git Commit SHA Tracking" section.
+
+### Backwards compatibility
+- **New abstract method**: `store_git_commit_sha(notification_id, git_commit_sha)` was added to
+  `BaseNotificationBackend` and `AsyncIOBaseNotificationBackend`. Every downstream backend
+  implementation MUST implement it before it can be instantiated -- a subclass missing it raises
+  `TypeError` at construction. This repo releases first; `vintasend-django` follows with a
+  matching release that widens its `vintasend` pin. `vintasend-sqlalchemy` adopts it as part of
+  its ongoing catch-up plan.
+- No existing method signature or semantic changed, and no other seam gained an abstract method.
+  With no `git_commit_sha_provider` configured (the default), `send()`, `delayed_send()`,
+  `create_notification()`, and `update_notification()` behave exactly as in 2.0 -- this is an
+  additive minor release for every caller who does not opt in.
+
 ## Version 2.0.0 (2026-07-23)
 
 2.0 is a major release that bundles three feature sets: background notification sending through a
