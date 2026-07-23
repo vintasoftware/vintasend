@@ -278,6 +278,40 @@ class AsyncIOBaseNotificationBackend(ABC):
         """
         ...
 
+    def get_backend_identifier(self) -> str | None:
+        """
+        Return this backend's stable identifier for multi-backend routing.
+
+        Concrete default returning ``None``: the owning ``AsyncIONotificationService``
+        falls back to ``backend-{n}`` (``n`` being this backend's position among the
+        service's configured backends) when a backend does not declare its own
+        identifier. Override to return a stable, host-chosen identifier (e.g. a region or
+        database alias) so routing does not shift if backends are reordered.
+
+        Sync (not a coroutine) on purpose: resolving an identifier never needs I/O, and
+        keeping it sync lets the constructor call it without an event loop.
+        """
+        return None
+
+    async def get_all_notifications(self) -> Iterable["Notification | OneOffNotification"]:
+        """
+        Return every notification the backend holds, across all pages.
+
+        Concrete default derived from ``filter_notifications({})`` by exhausting every
+        page, so a backend that only implements the abstract ``filter_notifications``
+        keeps working. Backends SHOULD override this for efficiency (e.g. an unpaginated
+        query or a streaming cursor). Feeds multi-backend sync stats and migration.
+        """
+        results: "list[Notification | OneOffNotification]" = []
+        page = 1
+        page_size = 100
+        while True:
+            batch = list(await self.filter_notifications({}, page=page, page_size=page_size))
+            results.extend(batch)
+            if len(batch) < page_size:
+                return results
+            page += 1
+
     async def get_filter_capabilities(self) -> dict[str, bool]:
         """
         Report which filter fields, string lookups and sort fields this backend supports.
