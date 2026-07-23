@@ -42,9 +42,13 @@ from vintasend.exceptions import (
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.dataclasses import (
+    NOTIFICATION_SYNC_COMPARABLE_FIELDS,
+    ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     AnyNotificationAttachment,
     Notification,
     NotificationContextDict,
+    NotificationSyncFieldReport,
+    NotificationSyncReport,
     OneOffNotification,
     UpdateNotificationKwargs,
 )
@@ -156,6 +160,74 @@ def _is_likely_duplicate_replication_conflict(exc: BaseException) -> bool:
     """
     message = str(exc).lower()
     return any(marker in message for marker in _REPLICATION_CONFLICT_MARKERS)
+
+
+def _comparable_fields_for_sync(record: "Notification | OneOffNotification") -> tuple[str, ...]:
+    """Which comparable-field list applies to ``record`` for ``verify_notification_sync``.
+
+    A one-off notification has no ``user_id`` -- it carries ``email_or_phone`` / ``first_name`` /
+    ``last_name`` instead -- so it compares against ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+    rather than the regular ``Notification``'s list.
+    """
+    if isinstance(record, OneOffNotification):
+        return ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS
+    return NOTIFICATION_SYNC_COMPARABLE_FIELDS
+
+
+def _build_notification_sync_report(
+    notification_id: int | str | uuid.UUID,
+    primary_backend_identifier: str,
+    all_backend_identifiers: list[str],
+    records_by_backend: dict[str, "Notification | OneOffNotification"],
+) -> NotificationSyncReport:
+    """Turn per-backend reads into the field-by-field agreement report a dashboard consumes.
+
+    Shared by the sync and AsyncIO services -- both read each backend themselves (one awaits,
+    the other does not) and hand the resulting ``records_by_backend`` map here, so the diffing
+    logic itself, which does no I/O, is written once.
+    """
+    backends_with_record = [
+        identifier for identifier in all_backend_identifiers if identifier in records_by_backend
+    ]
+    backends_missing_record = [
+        identifier for identifier in all_backend_identifiers if identifier not in records_by_backend
+    ]
+
+    reference_record = records_by_backend.get(primary_backend_identifier) or next(
+        iter(records_by_backend.values()), None
+    )
+    comparable_fields = (
+        _comparable_fields_for_sync(reference_record) if reference_record is not None else ()
+    )
+
+    field_reports: list[NotificationSyncFieldReport] = []
+    all_fields_agree = True
+    for field_name in comparable_fields:
+        values_by_backend = {
+            identifier: getattr(record, field_name)
+            for identifier, record in records_by_backend.items()
+            if hasattr(record, field_name)
+        }
+        values = list(values_by_backend.values())
+        in_agreement = all(value == values[0] for value in values) if values else True
+        if not in_agreement:
+            all_fields_agree = False
+        field_reports.append(
+            {
+                "field": field_name,
+                "in_agreement": in_agreement,
+                "differing_values": {} if in_agreement else values_by_backend,
+            }
+        )
+
+    return {
+        "notification_id": notification_id,
+        "primary_backend_identifier": primary_backend_identifier,
+        "backends_with_record": backends_with_record,
+        "backends_missing_record": backends_missing_record,
+        "in_sync": not backends_missing_record and all_fields_agree,
+        "fields": field_reports,
+    }
 
 
 # The return type of the primary write passed to ``_execute_multi_backend_write``, propagated
@@ -918,6 +990,38 @@ class NotificationService(Generic[A, B]):
         """Replicate a notification to every additional backend -- the no-target alias for
         ``process_replication(notification_id, None)``."""
         return self.process_replication(notification_id, None)
+
+    def verify_notification_sync(
+        self, notification_id: int | str | uuid.UUID
+    ) -> NotificationSyncReport:
+        """Report, for one notification id, which backends hold it and whether they agree.
+
+        Reads the record from every registered backend (primary and every additional backend).
+        A backend that does not have the record is reported absent, not fatal --
+        ``NotificationNotFoundError`` from any single backend never aborts the check for the
+        others. For backends that do have the record, every comparable field (see
+        ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+        in ``dataclasses.py``) is compared across those backends, reporting per field whether all
+        of them agree and, when they do not, each disagreeing backend's value.
+
+        This is a read-only diagnostic -- it never writes. Use ``process_replication`` /
+        ``replicate_notification`` to reconcile drift this uncovers.
+        """
+        records_by_backend: dict[str, Notification | OneOffNotification] = {}
+        for identifier in self.get_all_backend_identifiers():
+            try:
+                records_by_backend[identifier] = self._backends[identifier].get_notification(
+                    notification_id
+                )
+            except NotificationNotFoundError:
+                continue
+
+        return _build_notification_sync_report(
+            notification_id,
+            self._primary_backend_identifier,
+            self.get_all_backend_identifiers(),
+            records_by_backend,
+        )
 
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
@@ -2693,6 +2797,38 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """Replicate a notification to every additional backend -- the no-target alias for
         ``process_replication(notification_id, None)``."""
         return await self.process_replication(notification_id, None)
+
+    async def verify_notification_sync(
+        self, notification_id: int | str | uuid.UUID
+    ) -> NotificationSyncReport:
+        """AsyncIO twin of ``NotificationService.verify_notification_sync``.
+
+        Reads the record from every registered backend (primary and every additional backend).
+        A backend that does not have the record is reported absent, not fatal --
+        ``NotificationNotFoundError`` from any single backend never aborts the check for the
+        others. For backends that do have the record, every comparable field (see
+        ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+        in ``dataclasses.py``) is compared across those backends, reporting per field whether all
+        of them agree and, when they do not, each disagreeing backend's value.
+
+        This is a read-only diagnostic -- it never writes. Use ``process_replication`` /
+        ``replicate_notification`` to reconcile drift this uncovers.
+        """
+        records_by_backend: dict[str, Notification | OneOffNotification] = {}
+        for identifier in self.get_all_backend_identifiers():
+            try:
+                records_by_backend[identifier] = await self._backends[identifier].get_notification(
+                    notification_id
+                )
+            except NotificationNotFoundError:
+                continue
+
+        return _build_notification_sync_report(
+            notification_id,
+            self._primary_backend_identifier,
+            self.get_all_backend_identifiers(),
+            records_by_backend,
+        )
 
     async def _resolve_and_persist_git_commit_sha(
         self,

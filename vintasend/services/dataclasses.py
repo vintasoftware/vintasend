@@ -3,7 +3,7 @@ import io
 import mimetypes
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, BinaryIO, TypedDict, TypeGuard
 
@@ -270,6 +270,63 @@ class OneOffNotification:
     # injected BaseGitCommitShaProvider. Never set on creation, and update_notification
     # rejects it in raw kwargs -- see GitCommitShaReassignmentError.
     git_commit_sha: str | None = None
+
+
+# Fields deliberately excluded from cross-backend sync comparison (see
+# ``NOTIFICATION_SYNC_COMPARABLE_FIELDS`` / ``ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS``
+# below) because they legitimately differ per backend rather than signalling replication drift:
+# - ``created`` / ``modified``: write-time timestamps each backend assigns independently. The
+#   primary and a replica commit at different instants, so these never agree even when the
+#   record's content is perfectly in sync.
+# - ``attachments``: a ``StoredAttachment``'s ``id`` and ``storage_identifiers`` are assigned by
+#   whichever storage backend wrote it, so the same logical file has different, backend-specific
+#   values on every backend -- not a single comparable value the way a scalar field is.
+_VOLATILE_NOTIFICATION_SYNC_FIELDS = frozenset({"created", "modified", "attachments"})
+
+# Every persisted, comparable field on ``Notification``, derived from the dataclass itself (minus
+# the volatile fields above) so a newly added dataclass field is automatically picked up by
+# ``NotificationService.verify_notification_sync`` without this constant needing an edit.
+NOTIFICATION_SYNC_COMPARABLE_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(Notification) if f.name not in _VOLATILE_NOTIFICATION_SYNC_FIELDS
+)
+
+# AsyncIO/one-off twin of the above. ``OneOffNotification`` has no ``user_id`` -- it carries
+# ``email_or_phone`` / ``first_name`` / ``last_name`` instead -- so its comparable-field list is
+# derived separately rather than reusing ``NOTIFICATION_SYNC_COMPARABLE_FIELDS``.
+ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(OneOffNotification) if f.name not in _VOLATILE_NOTIFICATION_SYNC_FIELDS
+)
+
+
+class NotificationSyncFieldReport(TypedDict):
+    """One comparable field's cross-backend agreement, part of ``NotificationSyncReport``.
+
+    ``differing_values`` is populated only when ``in_agreement`` is ``False`` -- keyed by backend
+    identifier, holding that backend's value for this field. Only backends that hold the record
+    at all, and whose record type declares this field (see the ``Notification`` /
+    ``OneOffNotification`` split above), contribute a value; a backend missing the record
+    entirely is already reported once at ``NotificationSyncReport.backends_missing_record``, not
+    repeated per field.
+    """
+
+    field: str
+    in_agreement: bool
+    differing_values: dict[str, Any]
+
+
+class NotificationSyncReport(TypedDict):
+    """Return type of ``NotificationService.verify_notification_sync`` / its AsyncIO twin.
+
+    Answers, for one notification id, which registered backends hold the record and whether they
+    agree on its content field by field -- what a dashboard needs to flag replication drift.
+    """
+
+    notification_id: int | str | uuid.UUID
+    primary_backend_identifier: str
+    backends_with_record: list[str]
+    backends_missing_record: list[str]
+    in_sync: bool
+    fields: list[NotificationSyncFieldReport]
 
 
 @dataclass(frozen=True)
