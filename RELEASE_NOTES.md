@@ -1,6 +1,11 @@
 # Release Notes
 
-## Version 2.1.0 (2026-07-23)
+## Version 2.0.0 (2026-07-23)
+
+2.0 is a major release that bundles three feature sets: background notification sending through a
+queue service, a composable filtering / ordering API, and a dedicated attachment manager seam. The
+breaking changes come from the background-sending rework and from new abstract methods that every
+downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade guidance.
 
 ### Features
 
@@ -29,27 +34,6 @@
   mirroring the existing `tenant` reassignment guard. It is only ever written by the service
   itself, through `store_git_commit_sha`, while the row is still pending.
 - See the README's "Git Commit SHA Tracking" section.
-
-### Backwards compatibility
-- **New abstract method**: `store_git_commit_sha(notification_id, git_commit_sha)` was added to
-  `BaseNotificationBackend` and `AsyncIOBaseNotificationBackend`. Every downstream backend
-  implementation MUST implement it before it can be instantiated -- a subclass missing it raises
-  `TypeError` at construction. This repo releases first; `vintasend-django` follows with a
-  matching release that widens its `vintasend` pin. `vintasend-sqlalchemy` adopts it as part of
-  its ongoing catch-up plan.
-- No existing method signature or semantic changed, and no other seam gained an abstract method.
-  With no `git_commit_sha_provider` configured (the default), `send()`, `delayed_send()`,
-  `create_notification()`, and `update_notification()` behave exactly as in 2.0 -- this is an
-  additive minor release for every caller who does not opt in.
-
-## Version 2.0.0 (2026-07-23)
-
-2.0 is a major release that bundles three feature sets: background notification sending through a
-queue service, a composable filtering / ordering API, and a dedicated attachment manager seam. The
-breaking changes come from the background-sending rework and from new abstract methods that every
-downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step upgrade guidance.
-
-### Features
 
 #### Background sending via a queue service
 - Adapters opt in to background delivery by subclassing `BackgroundNotificationAdapter` (sync) or
@@ -178,6 +162,16 @@ downstream backend must implement. See `MIGRATION_TO_2.0.0.md` for step-by-step 
   migration for the new attachment table) before it can pin `vintasend>=2.0.0`. `vintasend-sqlalchemy`
   cannot adopt this release until its own catch-up plan lands, since it is already missing methods
   from 1.2.0.
+- **New abstract method**: `store_git_commit_sha(notification_id, git_commit_sha)` was added to
+  `BaseNotificationBackend` and `AsyncIOBaseNotificationBackend`. Every downstream backend
+  implementation MUST implement it before it can be instantiated -- a subclass missing it raises
+  `TypeError` at construction. This repo releases first; `vintasend-django` follows with a
+  matching release that widens its `vintasend` pin. `vintasend-sqlalchemy` adopts it as part of
+  its ongoing catch-up plan.
+- No existing method signature or semantic changed, and no other seam gained an abstract method.
+  With no `git_commit_sha_provider` configured (the default), `send()`, `delayed_send()`,
+  `create_notification()`, and `update_notification()` behave exactly as in 2.0 -- this is an
+  additive minor release for every caller who does not opt in.
 
 ### Operational Requirements
 - **Drain or dual-register the Celery queue before deploying.** Tasks queued under 1.x carry a
