@@ -620,13 +620,80 @@ class CeleryEmailAdapter(BackgroundNotificationAdapter):
 
 File attachments now work on the background path because the worker reloads the real notification from the backend, not from a serialized payload.
 
-## Queued Replication
+## Multi-Backend Configuration
 
-When a service is configured with additional backends, every write is replicated to them. By default this happens **inline** -- on the request path, right after the primary write. Hosts already running the background worker can move replica writes off the request path by switching to **queued** replication, which enqueues one task per destination backend:
+A service can hold one primary backend plus zero or more **additional backends** -- extra
+copies of the same data, kept in sync by replication. This is for hosts that want a hot standby,
+a region-local read replica, or a bridge while migrating from one storage backend to another. A
+service configured with no `additional_backends` behaves exactly like a single-backend
+deployment; every read, write, and setting below is inert until you pass at least one.
+
+### Configuring additional backends
+
+Pass extra backend instances (or import strings) through `additional_backends`:
 
 ```python
 from vintasend.services.notification_service import NotificationService
 
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=primary_backend,
+    additional_backends=[replica_backend, another_replica_backend],
+)
+```
+
+Each configured backend -- primary and additional -- gets a stable string identifier used to
+address it later. A backend can declare its own identifier by implementing
+`get_backend_identifier() -> str | None`; if it returns `None` (the concrete default every
+backend gets for free), the service assigns `backend-{n}`, where `n` is the backend's position
+(the primary is always `backend-0`; the first additional backend is `backend-1`, and so on).
+Two configured backends that resolve to the same identifier raise
+`DuplicateBackendIdentifierError` at construction -- fix a colliding custom
+`get_backend_identifier()` or drop the duplicate entry.
+
+```python
+service.get_primary_backend_identifier()      # "backend-0" (or the primary's own identifier)
+service.get_all_backend_identifiers()          # every identifier, primary first, in order
+service.get_additional_backend_identifiers()   # every identifier except the primary's
+service.has_backend("backend-1")               # True / False
+```
+
+### Read routing
+
+Every read method (`get_notification`, `filter_notifications`, `get_future_notifications`, and
+the rest of the getters) takes an optional trailing `backend_identifier` keyword:
+
+```python
+# Reads the primary (the default -- identical to a single-backend service)
+service.get_notification(notification_id)
+
+# Reads a specific replica directly
+service.get_notification(notification_id, backend_identifier="backend-1")
+
+# Unknown identifier -- raises BackendNotFoundError
+service.get_notification(notification_id, backend_identifier="does-not-exist")
+```
+
+There is no fan-out read that queries every backend and merges the result -- a read always
+targets exactly one backend. Comparing backends is what `verify_notification_sync` (below) is
+for.
+
+### Inline vs. queued replication
+
+With additional backends configured, every write -- create, update, mark sent/failed/read,
+cancel, store context, and so on -- replicates to them after the primary write succeeds.
+`replication_mode` controls how:
+
+* **`"inline"` (the default).** Replication happens on the request path, right after the
+  primary write returns. No extra infrastructure needed; the right choice unless the added
+  request latency of replicating to every backend matters.
+* **`"queued"`.** The write enqueues one replication task per destination backend and returns
+  immediately; a background worker (the same host-factory worker model background sending
+  uses) drains the queue and applies the replication. Pick this once you already run that
+  worker and want replica writes off the request path -- at the cost of replicas converging
+  slightly later and of one task per additional backend per write.
+
+```python
 service = NotificationService(
     notification_adapters=[...],
     notification_backend=primary_backend,
@@ -645,13 +712,65 @@ export NOTIFICATION_REPLICATION_QUEUE_SERVICE="myapp.queue_services.MyReplicatio
 
 `NOTIFICATION_REPLICATION_MODE` defaults to `"inline"`; `NOTIFICATION_REPLICATION_QUEUE_SERVICE` defaults to unset. As with every setting, an environment variable overrides the framework config value, and an instance or import string passed to the constructor overrides both.
 
-A replication queue service implements `BaseNotificationReplicationQueueService` (sync) or `AsyncIOBaseNotificationReplicationQueueService` (AsyncIO) -- a single method, `enqueue_replication(notification_id, backend_identifier)`. The worker drains the queue by calling `service.process_replication(notification_id, backend_identifier)`, which converges that replica to the primary's current snapshot.
+A replication queue service implements `BaseNotificationReplicationQueueService` (sync) or `AsyncIOBaseNotificationReplicationQueueService` (AsyncIO) -- a single method, `enqueue_replication(notification_id, backend_identifier)`. A worker drains the queue by calling `service.process_replication(notification_id, backend_identifier)`, which converges that replica to the primary's current snapshot. You can also call `register_replication_queue_service(...)` to inject the queue service after construction, the same way `register_queue_service` works for background sending.
 
 Key semantics:
 
 * **A broken queue never silently drops replication.** If no replication queue service is configured, or the record's id cannot be resolved, queued mode logs a warning and falls back to inline replication for every backend. If enqueueing a single backend raises, only that backend is replicated inline; the ones that enqueued successfully are left to the worker.
 * **Single-backend services never replicate**, regardless of `replication_mode`.
 * **The worker and web process must share settings** -- the same `NOTIFICATION_BACKEND`, `NOTIFICATION_REPLICATION_QUEUE_SERVICE`, and `NOTIFICATION_SERVICE_FACTORY`, exactly as background sending requires.
+
+### Monitoring and repair
+
+Four methods give a dashboard everything it needs to watch replication and fix drift:
+
+```python
+# Per-field, per-backend agreement report for one notification
+report = service.verify_notification_sync(notification_id)
+report["in_sync"]                  # True only if every backend holds the record and every
+                                    # comparable field agrees across all of them
+report["backends_with_record"]     # identifiers that have the record at all
+report["backends_missing_record"]  # identifiers that don't
+report["fields"]                   # per-field {"field", "in_agreement", "differing_values"}
+
+# Per-backend health: total notification count, or the error if a backend is unreachable
+stats = service.get_backend_sync_stats()
+stats["backend-1"]  # {"total_notifications": 1234, "status": "healthy"}
+
+# Converge one notification to every additional backend, or a single named one
+service.replicate_notification(notification_id)
+service.process_replication(notification_id, target_backend_identifier="backend-1")
+
+# Copy every notification from one backend to another, batch_size rows at a time
+result = service.migrate_to_backend(
+    destination_backend_identifier="backend-2",
+    batch_size=500,
+    source_backend_identifier=None,  # defaults to the primary
+)
+result["migrated"]   # count of records confirmed present on the destination
+result["failures"]   # [{"notification_id": ..., "error": ...}, ...] -- doesn't abort the batch
+```
+
+`migrate_to_backend` is copy-only -- it never deletes from the source, and re-running it is
+idempotent (an already-migrated record is converged, never duplicated). Retiring the source is
+a separate, deliberate step you take after verifying the destination, not something this method
+does for you.
+
+### Failure semantics
+
+Multi-backend replication is **not** synchronous multi-master, and it makes no
+read-your-writes guarantee across backends. Be precise about what it actually promises:
+
+* **The primary write commits first, and its failure is the caller's failure.** If the primary
+  rejects a write, the exception propagates exactly as it would on a single-backend service.
+* **Replica writes are best-effort.** A replica that rejects a write is logged, not raised --
+  the primary write already succeeded and is never rolled back. A rejected replica write is
+  reconciled by the next write to that record, or by calling `process_replication` /
+  `verify_notification_sync` yourself.
+* **No automatic failover.** A down primary is an error, full stop -- this library never
+  promotes a replica to primary for you. Promoting a replica is an operational decision a human
+  or an external tool makes, not something `NotificationService` does automatically.
+* **Reading right after writing can see a stale replica.** A read against `backend_identifier="backend-1"` immediately after a write may not yet reflect that write, especially in `"queued"` mode. Read the primary (the default, no `backend_identifier`) when you need the current state.
 
 ## Git Commit SHA Tracking
 
