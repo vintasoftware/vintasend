@@ -233,6 +233,9 @@ class Notification:
     attachments: list[StoredAttachment] = field(default_factory=list)
     created: datetime.datetime | None = None
     modified: datetime.datetime | None = None
+    sent_at: datetime.datetime | None = None
+    read_at: datetime.datetime | None = None
+    tenant: str | None = None
 
 
 @dataclass
@@ -256,6 +259,9 @@ class OneOffNotification:
     attachments: list[StoredAttachment] = field(default_factory=list)
     created: datetime.datetime | None = None
     modified: datetime.datetime | None = None
+    sent_at: datetime.datetime | None = None
+    read_at: datetime.datetime | None = None
+    tenant: str | None = None
 
 
 class UpdateNotificationKwargs(TypedDict, total=False):

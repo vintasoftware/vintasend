@@ -29,6 +29,7 @@ from vintasend.exceptions import (
     NotificationMarkSentError,
     NotificationSendError,
     NotificationUpdateError,
+    TenantReassignmentError,
 )
 from vintasend.services.attachment_managers.base import (
     download_from_url,
@@ -302,6 +303,7 @@ class NotificationService(Generic[A, B]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -323,8 +325,14 @@ class NotificationService(Generic[A, B]):
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
             attachments: list[NotificationAttachment] | None - the list of attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = self.notification_backend.persist_notification(
             user_id=user_id,
@@ -338,6 +346,7 @@ class NotificationService(Generic[A, B]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -360,6 +369,7 @@ class NotificationService(Generic[A, B]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> "OneOffNotification":
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -371,9 +381,16 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
+        Parameters:
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
@@ -389,6 +406,7 @@ class NotificationService(Generic[A, B]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -405,6 +423,8 @@ class NotificationService(Generic[A, B]):
         Update a notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * TenantReassignmentError if ``tenant`` is present in kwargs -- a
+              notification's tenant cannot be reassigned after creation.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -414,6 +434,8 @@ class NotificationService(Generic[A, B]):
             notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
+        if "tenant" in kwargs:
+            raise TenantReassignmentError("A notification's tenant cannot be reassigned")
         notification = self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,
@@ -944,6 +966,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -965,8 +988,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             subject_template: str - the  string that represents the subject template
             preheader_template: str - the string that represents the preheader template
             attachments: list[NotificationAttachment] | None - the list of attachments to include
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_notification(
             user_id=user_id,
@@ -980,6 +1009,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1002,6 +1032,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         preheader_template: str = "",
         adapter_extra_parameters: dict | None = None,
         attachments: list[NotificationAttachment] | None = None,
+        tenant: str | None = None,
     ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -1013,9 +1044,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
+        Parameters:
+            tenant: str | None - the tenant this notification belongs to. Cannot be changed
+                after creation -- see ``update_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
+
+        extra_persist_kwargs: dict[str, Any] = {}
+        if tenant is not None:
+            extra_persist_kwargs["tenant"] = tenant
 
         notification = await self.notification_backend.persist_one_off_notification(
             email_or_phone=email_or_phone,
@@ -1031,6 +1069,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             preheader_template=preheader_template,
             adapter_extra_parameters=adapter_extra_parameters,
             attachments=validated_attachments,
+            **extra_persist_kwargs,
         )
         if notification.send_after is None or notification.send_after <= datetime.datetime.now(
             tz=datetime.timezone.utc
@@ -1047,6 +1086,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Update a notification and send it if it is due to be sent immediately.
 
         This method may raise the following exceptions:
+            * TenantReassignmentError if ``tenant`` is present in kwargs -- a
+              notification's tenant cannot be reassigned after creation.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
@@ -1056,6 +1097,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification_id: int | str | uuid.UUID - the ID of the notification to update
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
+        if "tenant" in kwargs:
+            raise TenantReassignmentError("A notification's tenant cannot be reassigned")
         notification = await self.notification_backend.persist_notification_update(
             notification_id=notification_id,
             update_data=kwargs,

@@ -66,6 +66,10 @@ class UnsupportedAttachmentFileTypeError(NotificationError):
     """Raised when an attachment manager is given a file input it cannot read."""
 
 
+class TenantReassignmentError(NotificationError):
+    """Raised when an update attempts to change a notification's tenant after creation."""
+
+
 class NotificationQueueServiceMissingError(NotificationError):
     """Raised when no queue service import string is configured, and no default is set either."""
 
