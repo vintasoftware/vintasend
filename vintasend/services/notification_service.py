@@ -61,6 +61,7 @@ from vintasend.services.notification_backends.asyncio_base import (
 from vintasend.services.notification_backends.base import (
     BaseNotificationBackend,
     supports_attachments,
+)
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
     NotificationFilter,
@@ -405,7 +406,7 @@ class NotificationService(Generic[A, B]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            email_or_phone: str - the email or phone that the one-off notification will be 
+            email_or_phone: str - the email or phone that the one-off notification will be
                 sent to
             notification_type: str - the type of notification to send
             title: str - the title of the notification
@@ -438,7 +439,7 @@ class NotificationService(Generic[A, B]):
         }
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
-  
+
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
@@ -1194,7 +1195,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         # not accept the keyword (e.g. attachment-unaware backends) then keep working.
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
-  
+
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
@@ -1233,7 +1234,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * NotificationMarkSentError if the notification fails to be marked as sent.
 
         Parameters:
-            email_or_phone: str - the email or phone that the one-off notification will be 
+            email_or_phone: str - the email or phone that the one-off notification will be
                 sent to
             notification_type: str - the type of notification to send
             title: str - the title of the notification
@@ -1266,7 +1267,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         }
         if validated_attachments:
             persist_kwargs["attachments"] = validated_attachments
-  
+
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
