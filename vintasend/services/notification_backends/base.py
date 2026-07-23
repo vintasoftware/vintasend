@@ -345,6 +345,20 @@ class BaseNotificationBackend(ABC):
         adapter_import_str: str,
     ) -> None: ...
 
+    @abstractmethod
+    def store_git_commit_sha(
+        self,
+        notification_id: int | str | uuid.UUID,
+        git_commit_sha: str,
+    ) -> None:
+        """Persist the git commit SHA that rendered and sent this notification.
+
+        Called by NotificationService at send time, only when the resolved SHA differs from
+        what is already stored -- so an implementation need not deduplicate writes itself.
+        ``git_commit_sha`` always arrives already normalized (40 lowercase hex characters).
+        """
+        ...
+
     def inject_attachment_manager(self, manager: "BaseAttachmentManager") -> None:
         """Store the attachment manager the service resolved for this backend.
 

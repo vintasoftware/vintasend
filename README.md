@@ -573,6 +573,43 @@ class CeleryEmailAdapter(BackgroundNotificationAdapter):
 
 File attachments now work on the background path because the worker reloads the real notification from the backend, not from a serialized payload.
 
+## Git Commit SHA Tracking
+
+Every notification can record which source-code revision rendered and sent it. This is opt-in: with no provider configured, nothing changes -- no SHA is ever resolved or written, and `git_commit_sha` stays `None` on every notification.
+
+To turn it on, implement `BaseGitCommitShaProvider` (sync) or `AsyncIOBaseGitCommitShaProvider` (AsyncIO) -- a single method, `get_current_git_commit_sha() -> str | None`, that returns the commit SHA of the revision currently running:
+
+```python
+from vintasend.services.git_commit_sha_providers.base import BaseGitCommitShaProvider
+
+class EnvVarGitCommitShaProvider(BaseGitCommitShaProvider):
+    def get_current_git_commit_sha(self) -> str | None:
+        return os.environ.get("GIT_COMMIT_SHA")
+```
+
+Then configure it on the service, the same way as the queue service or attachment manager -- an instance, a dotted import string, or the `NOTIFICATION_GIT_COMMIT_SHA_PROVIDER` setting:
+
+```python
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=...,
+    git_commit_sha_provider=EnvVarGitCommitShaProvider(),  # or as an import string
+)
+```
+
+```bash
+export NOTIFICATION_GIT_COMMIT_SHA_PROVIDER="myapp.git.EnvVarGitCommitShaProvider"
+```
+
+Key semantics:
+
+* **Resolved at send time, not creation time.** The provider is called at the top of both `send()` and `delayed_send()`, so a scheduled notification records the revision that actually delivered it -- foreground or from a background worker -- not the one that enqueued it.
+* **One SHA per notification**, not a history: `git_commit_sha` holds the revision that last sent it.
+* **Written only when it changes.** The provider is called on every send, but the backend is only asked to persist a new value when it differs from what is already stored, so re-sending under the same revision is a no-op write.
+* **Normalized and validated.** A returned SHA is trimmed, lowercased, and must match 40 hexadecimal characters; a malformed non-`None` value raises `InvalidGitCommitShaError` rather than being silently stored. A `None` return means "unknown this call" and is simply skipped.
+* **Provider failures never block a send.** If the provider raises, the exception is caught and logged, and treated exactly like a `None` return -- audit metadata is never worth failing a delivery over.
+* **System-managed.** `git_commit_sha` is never settable through `create_notification` or `update_notification` -- passing it to `update_notification` raises `GitCommitShaReassignmentError`. It is only ever written by the service itself, at send time.
+
 ## Glossary
 
 * **Notification Backend**: It is a class that implements the methods necessary for VintaSend services to create, update, and retrieve Notifications from da database.
@@ -585,6 +622,7 @@ File attachments now work on the background path because the worker reloads the 
 * **Notification Attachment**: Files that can be attached to notifications, supporting various input types including file paths, URLs, bytes data, and file-like objects.
 * **Attachment Manager**: It is a class that implements the methods necessary to store, read, and delete the bytes behind a notification attachment, so the notification backend only ever handles rows, never files.
 * **One-off Notification**: A notification sent directly to an email address or phone number without requiring a user ID from your database. 
+* **Git Commit SHA Provider**: A class that implements a single method returning the current git commit SHA, so a notification records which source-code revision sent it.
 
 
 ## Community

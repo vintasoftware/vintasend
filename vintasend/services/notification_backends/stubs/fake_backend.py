@@ -185,6 +185,7 @@ class FakeFileBackend(BaseNotificationBackend):
                 "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
                 "read_at": notification.read_at.isoformat() if notification.read_at else None,
                 "tenant": notification.tenant,
+                "git_commit_sha": notification.git_commit_sha,
             }
         else:
             return {
@@ -209,6 +210,7 @@ class FakeFileBackend(BaseNotificationBackend):
                 "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
                 "read_at": notification.read_at.isoformat() if notification.read_at else None,
                 "tenant": notification.tenant,
+                "git_commit_sha": notification.git_commit_sha,
             }
 
     def _convert_json_to_notification(
@@ -257,6 +259,7 @@ class FakeFileBackend(BaseNotificationBackend):
                     else None
                 ),
                 tenant=notification.get("tenant"),
+                git_commit_sha=notification.get("git_commit_sha"),
             )
         else:
             return Notification(
@@ -298,6 +301,7 @@ class FakeFileBackend(BaseNotificationBackend):
                     else None
                 ),
                 tenant=notification.get("tenant"),
+                git_commit_sha=notification.get("git_commit_sha"),
             )
 
     def _store_notifications(self):
@@ -763,6 +767,15 @@ class FakeFileBackend(BaseNotificationBackend):
         notification.adapter_used = adapter_import_str
         self._store_notifications()
 
+    def store_git_commit_sha(
+        self,
+        notification_id: int | str | uuid.UUID,
+        git_commit_sha: str,
+    ) -> None:
+        notification = self.get_notification(notification_id)
+        notification.git_commit_sha = git_commit_sha
+        self._store_notifications()
+
 
 class Config:
     def __init__(self, config_a: Decimal | None = None, config_b: datetime.datetime | None = None):
@@ -1084,6 +1097,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             "sent_at": notification.sent_at.isoformat() if notification.sent_at else None,
             "read_at": notification.read_at.isoformat() if notification.read_at else None,
             "tenant": notification.tenant,
+            "git_commit_sha": notification.git_commit_sha,
         }
 
         if isinstance(notification, OneOffNotification):
@@ -1145,6 +1159,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                     else None
                 ),
                 tenant=notification.get("tenant"),
+                git_commit_sha=notification.get("git_commit_sha"),
             )
         else:
             return Notification(
@@ -1186,6 +1201,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                     else None
                 ),
                 tenant=notification.get("tenant"),
+                git_commit_sha=notification.get("git_commit_sha"),
             )
 
     async def _store_notifications(self, lock: asyncio.Lock | None = None):
@@ -1486,4 +1502,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification = await self.get_notification(notification_id)
         notification.context_used = context
         notification.adapter_used = adapter_import_str
+        await self._store_notifications(lock)
+
+    async def store_git_commit_sha(
+        self,
+        notification_id: int | str | uuid.UUID,
+        git_commit_sha: str,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        notification = await self.get_notification(notification_id)
+        notification.git_commit_sha = git_commit_sha
         await self._store_notifications(lock)

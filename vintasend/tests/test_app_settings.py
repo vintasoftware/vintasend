@@ -13,7 +13,7 @@ from vintasend.app_settings import (
     NotificationSettings,
     NotificationSettingsDict,
 )
-from vintasend.services.helpers import get_attachment_manager
+from vintasend.services.helpers import get_attachment_manager, get_git_commit_sha_provider
 from vintasend.tests.utils import _reset_notification_settings_singleton
 
 
@@ -249,3 +249,89 @@ class NotificationServiceFactorySettingTestCase(TestCase):
             settings = NotificationSettings(_FakeFastAPIConfig())
 
         assert settings.NOTIFICATION_SERVICE_FACTORY is None
+
+
+class GitCommitShaProviderSettingDictTestCase(TestCase):
+    """Static checks that don't require framework detection at all."""
+
+    def test_new_setting_key_is_declared_on_the_typed_dict(self):
+        assert "NOTIFICATION_GIT_COMMIT_SHA_PROVIDER" in NotificationSettingsDict.__annotations__
+
+    def test_default_settings_has_no_git_commit_sha_provider(self):
+        assert DEFAULT_SETTINGS["NOTIFICATION_GIT_COMMIT_SHA_PROVIDER"] is None
+
+    def test_framework_defaults_do_not_override_the_shared_default(self):
+        # No provider ships in core, and the correct default doesn't differ per framework,
+        # so none of the three dicts should override DEFAULT_SETTINGS here.
+        assert DJANGO_DEFAULT_SETTINGS["NOTIFICATION_GIT_COMMIT_SHA_PROVIDER"] is None
+        assert FLASK_DEFAULT_SETTINGS["NOTIFICATION_GIT_COMMIT_SHA_PROVIDER"] is None
+        assert FASTAPI_DEFAULT_SETTINGS["NOTIFICATION_GIT_COMMIT_SHA_PROVIDER"] is None
+
+
+class GitCommitShaProviderSettingTestCase(TestCase):
+    def setUp(self):
+        _reset_notification_settings_singleton(self)
+
+    def test_unset_reads_as_empty_dict_when_no_framework_is_detected(self):
+        """`get_config` returns `{}`, not `None`, when no framework is detected."""
+        with patch("vintasend.app_settings.detect_framework", return_value="Unknown"):
+            settings = NotificationSettings()
+
+        assert settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER == {}
+
+    def test_resolves_from_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER = "myapp.git.MyGitCommitShaProvider"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER == "myapp.git.MyGitCommitShaProvider"
+
+    def test_resolves_from_env_var_when_framework_config_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ,
+                {"NOTIFICATION_GIT_COMMIT_SHA_PROVIDER": "env.git.EnvGitCommitShaProvider"},
+            ):
+                settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER == "env.git.EnvGitCommitShaProvider"
+
+    def test_env_var_wins_over_framework_config(self):
+        config = _FakeFastAPIConfig()
+        config.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER = "myapp.git.MyGitCommitShaProvider"  # type: ignore[attr-defined]
+
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            with patch.dict(
+                os.environ,
+                {"NOTIFICATION_GIT_COMMIT_SHA_PROVIDER": "env.git.EnvGitCommitShaProvider"},
+            ):
+                settings = NotificationSettings(config)
+
+        assert settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER == "env.git.EnvGitCommitShaProvider"
+
+    def test_defaults_to_none_when_framework_detected_but_setting_is_unset(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="FastAPI"):
+            settings = NotificationSettings(_FakeFastAPIConfig())
+
+        assert settings.NOTIFICATION_GIT_COMMIT_SHA_PROVIDER is None
+
+
+class UnknownFrameworkGitCommitShaProviderTestCase(TestCase):
+    """Bare-env (no Django/Flask/FastAPI detected) is a supported deployment mode. `get_config`
+    returns `{}` for this path rather than `None`, so `get_git_commit_sha_provider` must treat
+    any falsy value (`None`, `{}`, or `""`) as "unset" and return `None` rather than crashing --
+    the feature is simply off.
+    """
+
+    def setUp(self):
+        _reset_notification_settings_singleton(self)
+
+    def test_get_git_commit_sha_provider_returns_none_without_raising(self):
+        with patch("vintasend.app_settings.detect_framework", return_value="Unknown"):
+            with patch.dict(os.environ, clear=False):
+                os.environ.pop("NOTIFICATION_GIT_COMMIT_SHA_PROVIDER", None)
+                result = get_git_commit_sha_provider(None)
+
+        assert result is None
