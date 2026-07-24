@@ -16,3 +16,6 @@
 [submodule "implementations/vintasend-jinja"]
 	path = implementations/vintasend-jinja
 	url = git@github.com:vintasoftware/vintasend-jinja.git
+[submodule "implementations/vintasend-s3-attachments"]
+	path = implementations/vintasend-s3-attachments
+	url = git@github.com:vintasoftware/vintasend-s3-attachments.git

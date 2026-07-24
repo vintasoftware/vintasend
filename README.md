@@ -846,6 +846,9 @@ VintaSend has many backend, adapter, and template renderer implementations. If y
 * **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)**: Renders emails using Django's templating system.
 * **[vintasend-jinja](https://github.com/vintasoftware/vintasend-jinja/)**: Renders emails using Jinja2.
 
+#### Attachment Managers
+* **[vintasend-s3-attachments](https://github.com/vintasoftware/vintasend-s3-attachments/)**: Stores attachment files as objects in an AWS S3 bucket using boto3. Supports both sync and AsyncIO.
+
 #### Working on them from this repo
 
 Each officially supported package lives in its own repository and is linked here as a git

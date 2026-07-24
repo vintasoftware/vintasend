@@ -339,15 +339,48 @@ rows, the manager owns the bytes. See `ATTACHMENTS.md` for the full seam and a r
 
 ### 9.3 Downstream package status
 
-- **`vintasend-django`** must implement the new filter and attachment seams — plus a schema migration
-  for the new attachment table — before it can pin `vintasend>=2.0.0`. That work ships in its own PR
-  in the `vintasend-django` repository after this release lands.
+- **`vintasend-django` 2.0.0** implements the new filter and attachment seams and stores attachment
+  bytes through a Django-storage-backed `DjangoAttachmentManager`. Its upgrade is covered by that
+  package's own `RELEASE_NOTES.md`; the attachment-data handling is summarized in 9.4 below.
 - **`vintasend-sqlalchemy`** cannot adopt 2.0 yet. It is already missing methods added in 1.2.0
   (`persist_one_off_notification`, `mark_sent_as_read_bulk`, the in-app filter methods) and needs its
   own catch-up release before it can implement the new methods here.
-- **No data migration ships with this release, and none is needed** for attachments: the old Django
-  attachment path never actually wrote a row for a real `NotificationAttachment`, so there is no
-  production data to carry forward.
+
+### 9.4 `vintasend-django` attachment data migration
+
+The old `Attachment` model (a single row owning both the file and the notification link) is replaced
+by `AttachmentFileRecord` (a checksum-indexed stored blob) plus a `NotificationAttachment` join row.
+An earlier draft of this guide claimed no data migration was needed because "the old Django
+attachment path never wrote a row for a real `NotificationAttachment`." **That is not safe to rely
+on:** the `Attachment` table is a real table with a `FileField`, and rows can exist from the Django
+admin, direct ORM use, or the pre-2.0 duck-typed `file_path` / `file_bytes` / `file_obj` write path.
+Dropping it blindly would destroy those rows and orphan their files.
+
+`vintasend-django` 2.0.0 therefore ships a **non-destructive, three-step migration** instead of a
+bare `DeleteModel`:
+
+1. `0004` — additive only: adds the new `Notification` columns (`sent_at`, `read_at`, `tenant`,
+   `git_commit_sha`) and creates the two new attachment tables. Nothing is deleted.
+2. `0005` — a data migration that bulk-copies every legacy `Attachment` into `AttachmentFileRecord`
+   + `NotificationAttachment`. It **never reads a file** — the blob is left exactly where it is and
+   the new record's `storage_identifiers` point at the same storage path — so it runs identically on
+   local disk or a remote backend like S3 and cannot fail on a momentarily unreachable object. The
+   trade-off is that migrated records start with an empty `checksum` and do not participate in the
+   (checksum, size) dedup until re-uploaded. It is reversible.
+3. `0006` — drops the now-empty `Attachment` table, only after the copy has run.
+
+Because the migration skips file reads, a separate **opt-in** management command backfills checksums
+on the operator's schedule (off-peak, in a worker, in chunks), keeping the storage-touching work out
+of the deploy:
+
+```bash
+python manage.py backfill_attachment_checksums            # rows missing a checksum
+python manage.py backfill_attachment_checksums --all      # recompute every record
+python manage.py backfill_attachment_checksums --dry-run --limit 1000
+```
+
+It reads each file through the configured attachment manager, computes the sha256 and real size, and
+is safe to re-run and to interrupt. Take a database backup before migrating, as always.
 
 ## Summary Checklist
 
