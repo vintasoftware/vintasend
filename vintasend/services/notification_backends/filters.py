@@ -124,6 +124,16 @@ NotificationFilter: TypeAlias = NotificationFilterFields | AndFilter | OrFilter 
 # every backend to re-declare support. Keys are camelCase dotted, byte-identical to the TS
 # sibling. See the module docstring for the snake_case-fields / camelCase-keys rationale.
 DEFAULT_BACKEND_FILTER_CAPABILITIES: dict[str, bool] = {
+    # Composition. A backend that can evaluate field filters but not assemble them into
+    # ``and`` / ``or`` / ``not`` groups declines these. ``notNested`` is the separate,
+    # narrower question of whether ``not`` may wrap a *group* rather than a single field
+    # filter (``{"not": {"or": [...]}}``): a query builder able to negate one predicate
+    # cannot always negate a whole subtree, so a backend may support ``logical.not`` and
+    # decline ``logical.notNested``.
+    "logical.and": True,
+    "logical.or": True,
+    "logical.not": True,
+    "logical.notNested": True,
     "fields.status": True,
     "fields.notificationType": True,
     "fields.adapterUsed": True,
@@ -136,16 +146,58 @@ DEFAULT_BACKEND_FILTER_CAPABILITIES: dict[str, bool] = {
     "fields.createdAtRange": True,
     "fields.sentAtRange": True,
     "fields.readAtRange": True,
+    # Negating a date range specifically. Scoped to ranges because that is where backends
+    # actually struggle: a negated membership or string lookup is a plain ``NOT IN`` /
+    # ``NOT LIKE``, whereas a negated range has to include NULL rows to satisfy this
+    # library's negation semantics (see the module docstring -- ``{"not": {...}}`` returns
+    # rows whose value is anything-but, *plus* rows whose value is ``None``), which not
+    # every query builder expresses. A backend supporting ``fields.sentAtRange`` may
+    # therefore still decline ``negation.sentAtRange``.
+    "negation.sendAfterRange": True,
+    "negation.createdAtRange": True,
+    "negation.sentAtRange": True,
+    "negation.readAtRange": True,
     "stringLookups.exact": True,
     "stringLookups.startsWith": True,
     "stringLookups.endsWith": True,
     "stringLookups.includes": True,
+    # These two are separate capabilities, not one flag and its negation. A backend can
+    # lack either:
+    #
+    # * ``caseSensitive: False`` -- everything is forced case-insensitive, which is what a
+    #   store on a case-insensitive collation (MySQL's ``*_ci``) does. It cannot honour
+    #   ``case_sensitive: True``, nor a bare ``str`` filter, which means the same thing.
+    # * ``caseInsensitive: False`` -- only exact-case matching is available, e.g. a store
+    #   with ``LIKE`` but no ``ILIKE`` and no way to fold case. It cannot honour
+    #   ``case_sensitive: False``.
+    #
+    # Most backends support both, hence both default to ``True``. A backend supporting
+    # *neither* cannot match strings at all and should decline the lookups above instead.
+    # Reading one as the inverse of the other silently inverts the answer for exactly the
+    # backends that have a constraint worth reporting.
     "stringLookups.caseSensitive": True,
+    "stringLookups.caseInsensitive": True,
     "orderBy.sendAfter": True,
     "orderBy.sentAt": True,
     "orderBy.readAt": True,
     "orderBy.createdAt": True,
     "orderBy.updatedAt": True,
+    # Whether ``page`` is 1-indexed, i.e. whether page 1 is the first page. Every backend
+    # in this library is, which is why the default is ``True`` and reads naturally under
+    # the declare-only-what-you-cannot-do rule above.
+    #
+    # This is a *convention*, not a feature, and it is reported because getting it wrong
+    # is silent: a caller that assumes the wrong base does not raise, it just serves the
+    # wrong page, skips the first record, or returns an empty first page. A caller that
+    # paginates a backend it did not write should read this key rather than assume --
+    # notably an HTTP layer converting between its own page numbering and a backend's.
+    # The `vintasend-ts` sibling library's backends are 0-indexed, so anything consuming
+    # both ecosystems cannot hardcode either answer.
+    #
+    # It covers every paginated backend method -- ``filter_notifications``,
+    # ``get_pending_notifications``, ``get_future_notifications`` and the rest -- not just
+    # the filter API, since a backend has one pagination convention throughout.
+    "pagination.oneIndexed": True,
 }
 
 

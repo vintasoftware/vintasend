@@ -382,6 +382,13 @@ There's no enforced maximum `page_size`; the library leaves that decision to the
 application. A caller that passes an unreasonably large `page_size` loads that many rows into
 memory in one call, so an endpoint that exposes this to a client should apply its own cap.
 
+**Pages are 1-indexed: `page=1` is the first page.** Every backend in this library follows that,
+and so does every paginated method, not just `filter_notifications`. Don't hardcode it if you're
+writing something that paginates a backend you didn't write -- read `pagination.oneIndexed` from
+the capability report below. Getting this wrong is silent: nothing raises, you just serve the
+wrong page or an empty first one. It matters most when crossing ecosystems, because the
+`vintasend-ts` sibling library's backends are 0-indexed.
+
 #### Capability introspection
 
 A backend doesn't have to support every filter field, string lookup and sort field.
@@ -393,6 +400,41 @@ capabilities = notification_service.get_backend_supported_filter_capabilities()
 capabilities["fields.tenant"]          # True unless the backend declines it
 capabilities["stringLookups.startsWith"]
 capabilities["orderBy.sentAt"]
+capabilities["logical.or"]             # can it assemble `or` groups?
+capabilities["negation.sentAtRange"]   # can it negate a date range?
+capabilities["pagination.oneIndexed"]  # True when page 1 is the first page
+```
+
+The namespaces are:
+
+| Namespace | Reports |
+| --- | --- |
+| `fields.*` | Whether a filter field can be used at all |
+| `stringLookups.*` | Which string lookups, and which case sensitivities, are available |
+| `logical.*` | Whether `and` / `or` / `not` groups can be assembled |
+| `negation.*` | Whether a date range specifically can be negated |
+| `orderBy.*` | Which sort fields are available |
+| `pagination.*` | The backend's pagination convention |
+
+`logical.not` and `logical.notNested` are separate questions: a query builder that can
+negate a single predicate can't always negate a whole subtree, so a backend may support
+`{"not": {"tenant": "acme"}}` and decline `{"not": {"or": [...]}}`.
+
+`negation.*` covers only date ranges because that's where backends actually struggle. A
+negated membership or string lookup is a plain `NOT IN` / `NOT LIKE`, but a negated range
+has to include `None` rows to satisfy this library's negation semantics (see above), and
+not every query builder expresses that. So `fields.sentAtRange: True` with
+`negation.sentAtRange: False` is a coherent, expected combination.
+
+`pagination.oneIndexed` is the odd one out: it reports a *convention* rather than a feature, and
+it's there because that convention is invisible when you get it wrong. A caller that assumes the
+wrong base doesn't get an exception, it gets the wrong rows. Anything translating between its own
+page numbers and a backend's -- an HTTP layer, a report exporter, a sync job -- should read this
+key instead of assuming:
+
+```python
+caps = notification_service.get_backend_supported_filter_capabilities()
+backend_page = page if caps["pagination.oneIndexed"] else page - 1
 ```
 
 A backend declares only what it *cannot* do. Its report is merged over an all-`True` default, so a
@@ -421,8 +463,32 @@ Notice that capability keys are camelCase and dotted (`'fields.notificationType'
 `send_after_range`). This is deliberate, not an inconsistency: filter fields are an in-process
 Python API that `mypy` checks and that you type by hand, so snake_case is correct there.
 Capability keys are data a client reads over the wire, and they're kept byte-identical to the
-`vintasend-ts` sibling library's keys, so one dashboard can consume a capability report from a
-Python backend or a TypeScript one without a translation table in between.
+`vintasend-ts` sibling library's keys wherever both libraries have the key, so one dashboard can
+consume a capability report from a Python backend or a TypeScript one without a translation table
+in between.
+
+One key means different things by default in the two ecosystems, which matters if you're
+writing something that consumes both:
+
+| Key | Note |
+| --- | --- |
+| `pagination.oneIndexed` | Defined by both, but the **defaults differ because the backends do**: `True` here, `false` in `vintasend-ts`, whose backends page from 0. Never assume a value across ecosystems — read it. |
+
+The only remaining difference is `read_at`: this library defines `fields.readAtRange` and
+`negation.readAtRange`, which `vintasend-ts` has no equivalent for. Since a missing key
+reads as supported, a client written against either map is safe in both directions.
+
+`stringLookups.caseSensitive` and `stringLookups.caseInsensitive` are **two independent
+capabilities, not one flag and its negation.** Don't derive either from the other:
+
+- A backend on a case-insensitive collation (MySQL's `*_ci`) reports
+  `caseSensitive: False` — it matches case-insensitively and cannot do anything else.
+- A backend with no way to fold case reports `caseInsensitive: False` — the opposite
+  constraint.
+
+Reading one as the inverse of the other inverts the answer for exactly the backends that
+had a constraint worth reporting, and the failure is silent: you decline the one lookup
+the backend actually supports.
 
 #### Resending a notification
 

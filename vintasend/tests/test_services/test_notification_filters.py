@@ -659,6 +659,46 @@ class _TenantUnsupportedAsyncBackend(FakeAsyncIOFileBackend):
         return {"fields.tenant": False}
 
 
+class _NoNestedNegationBackend(FakeFileBackend):
+    """A backend able to negate one predicate but not a whole subtree."""
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"logical.notNested": False}
+
+
+class _NoRangeNegationBackend(FakeFileBackend):
+    """A backend that filters on date ranges but cannot negate them."""
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"negation.sentAtRange": False}
+
+
+class _ForcedCaseInsensitiveBackend(FakeFileBackend):
+    """A backend on a case-insensitive collation: it cannot match case-sensitively."""
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"stringLookups.caseSensitive": False}
+
+
+class _NoCaseFoldingBackend(FakeFileBackend):
+    """A backend with no way to fold case: it cannot match case-insensitively."""
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"stringLookups.caseInsensitive": False}
+
+
+class _ZeroIndexedBackend(FakeFileBackend):
+    """A backend whose pages start at 0, to prove the convention is reportable."""
+
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"pagination.oneIndexed": False}
+
+
+class _ZeroIndexedAsyncBackend(FakeAsyncIOFileBackend):
+    async def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"pagination.oneIndexed": False}
+
+
 class FilterNotificationsServiceTestCase(TestCase):
     """Exercise the sync service surface: filter, count and capability merging."""
 
@@ -703,6 +743,144 @@ class FilterNotificationsServiceTestCase(TestCase):
             assert value is True, key
         assert set(caps) == set(DEFAULT_BACKEND_FILTER_CAPABILITIES)
 
+    def test_logical_and_negation_capabilities_default_to_supported(self):
+        caps = self.service.get_backend_supported_filter_capabilities()
+        for key in (
+            "logical.and",
+            "logical.or",
+            "logical.not",
+            "logical.notNested",
+            "negation.sendAfterRange",
+            "negation.createdAtRange",
+            "negation.sentAtRange",
+            "negation.readAtRange",
+        ):
+            assert caps[key] is True, key
+
+    def test_nested_negation_can_be_declined_without_declining_negation(self):
+        """``logical.not`` and ``logical.notNested`` are different questions: negating one
+        predicate is not the same as negating a whole subtree."""
+        service: NotificationService = NotificationService(
+            notification_adapters=[],
+            notification_backend=_NoNestedNegationBackend(
+                database_file_name=self.database_file_name
+            ),
+        )
+        caps = service.get_backend_supported_filter_capabilities()
+        assert caps["logical.notNested"] is False
+        assert caps["logical.not"] is True
+
+    def test_range_negation_can_be_declined_without_declining_the_range_field(self):
+        """Filtering on a range and negating one are separate capabilities: the negated
+        form has to include NULL rows, which not every query builder expresses."""
+        service: NotificationService = NotificationService(
+            notification_adapters=[],
+            notification_backend=_NoRangeNegationBackend(
+                database_file_name=self.database_file_name
+            ),
+        )
+        caps = service.get_backend_supported_filter_capabilities()
+        assert caps["negation.sentAtRange"] is False
+        assert caps["fields.sentAtRange"] is True
+        assert caps["negation.createdAtRange"] is True
+
+    def test_the_reference_evaluator_really_composes(self):
+        """Guards the defaults: the fakes claim all of these, so all of them have to work
+        -- including ``not`` wrapping a group, and a negated date range."""
+        self.backend.notifications = [
+            _build_notification("a", tenant="acme", sent_at=_dt(1)),
+            _build_notification("b", tenant="beta", sent_at=_dt(9)),
+        ]
+
+        def ids(f):
+            return sorted(n.id for n in self.service.filter_notifications(f, 1, 10))
+
+        assert ids({"and": [{"tenant": "acme"}, {"status": NotificationStatus.PENDING_SEND}]}) == [
+            "a"
+        ]
+        assert ids({"or": [{"tenant": "acme"}, {"tenant": "beta"}]}) == ["a", "b"]
+        assert ids({"not": {"tenant": "acme"}}) == ["b"]
+        # not wrapping a group -> logical.notNested
+        assert ids({"not": {"or": [{"tenant": "acme"}, {"tenant": "beta"}]}}) == []
+        # negated date range -> negation.sentAtRange
+        assert ids({"not": {"sent_at_range": {"from": _dt(5)}}}) == ["a"]
+
+    def test_both_case_sensitivity_capabilities_default_to_supported(self):
+        caps = self.service.get_backend_supported_filter_capabilities()
+        assert caps["stringLookups.caseSensitive"] is True
+        assert caps["stringLookups.caseInsensitive"] is True
+
+    def test_the_two_case_sensitivity_capabilities_are_independent(self):
+        """They are separate capabilities, not a flag and its negation: a backend on a
+        case-insensitive collation cannot match case-sensitively, and one with no case
+        folding cannot match case-insensitively. Reading either as the inverse of the
+        other inverts the answer for exactly the backends that have something to report.
+        """
+        forced_ci: NotificationService = NotificationService(
+            notification_adapters=[],
+            notification_backend=_ForcedCaseInsensitiveBackend(
+                database_file_name=self.database_file_name
+            ),
+        )
+        no_folding: NotificationService = NotificationService(
+            notification_adapters=[],
+            notification_backend=_NoCaseFoldingBackend(database_file_name=self.database_file_name),
+        )
+
+        forced_ci_caps = forced_ci.get_backend_supported_filter_capabilities()
+        assert forced_ci_caps["stringLookups.caseSensitive"] is False
+        assert forced_ci_caps["stringLookups.caseInsensitive"] is True
+
+        no_folding_caps = no_folding.get_backend_supported_filter_capabilities()
+        assert no_folding_caps["stringLookups.caseSensitive"] is True
+        assert no_folding_caps["stringLookups.caseInsensitive"] is False
+
+    def test_the_reference_evaluator_really_does_both(self):
+        """Guards the defaults: the fakes claim both, so both have to actually work."""
+        self.backend.notifications = [_build_notification("a", body_template="Welcome")]
+
+        sensitive = list(self.service.filter_notifications({"body_template": "welcome"}, 1, 10))
+        insensitive = list(
+            self.service.filter_notifications(
+                {"body_template": {"lookup": "exact", "value": "welcome", "case_sensitive": False}},
+                1,
+                10,
+            )
+        )
+
+        assert [n.id for n in sensitive] == []
+        assert [n.id for n in insensitive] == ["a"]
+
+    def test_pagination_is_reported_as_one_indexed_by_default(self):
+        caps = self.service.get_backend_supported_filter_capabilities()
+        assert caps["pagination.oneIndexed"] is True
+
+    def test_a_zero_indexed_backend_can_declare_it(self):
+        """The convention is silent when wrong -- a caller gets the wrong rows, not an
+        error -- so a backend that pages from 0 has to be able to say so."""
+        service: NotificationService = NotificationService(
+            notification_adapters=[],
+            notification_backend=_ZeroIndexedBackend(database_file_name=self.database_file_name),
+        )
+        caps = service.get_backend_supported_filter_capabilities()
+        assert caps["pagination.oneIndexed"] is False
+        # Declining the pagination convention declines nothing else.
+        assert caps["fields.tenant"] is True
+        assert caps["orderBy.sentAt"] is True
+
+    def test_the_fake_backends_really_are_one_indexed(self):
+        """Guards the default itself: if the fakes ever changed base, the reported
+        capability would be a lie and every caller trusting it would break."""
+        self.backend.notifications = [
+            _build_notification("a", created=_dt(1)),
+            _build_notification("b", created=_dt(2)),
+        ]
+        order = {"field": "created_at", "direction": "asc"}
+
+        first_page = list(self.service.filter_notifications({}, 1, 1, order_by=order))
+
+        assert [n.id for n in first_page] == ["a"]
+
 
 class FilterNotificationsAsyncServiceTestCase(IsolatedAsyncioTestCase):
     """AsyncIO mirror of the service-level filtering surface."""
@@ -744,6 +922,47 @@ class FilterNotificationsAsyncServiceTestCase(IsolatedAsyncioTestCase):
             if key == "fields.tenant":
                 continue
             assert value is True, key
+
+    async def test_logical_and_negation_capabilities_default_to_supported(self):
+        caps = await self.service.get_backend_supported_filter_capabilities()
+        for key in (
+            "logical.and",
+            "logical.or",
+            "logical.not",
+            "logical.notNested",
+            "negation.sendAfterRange",
+            "negation.createdAtRange",
+            "negation.sentAtRange",
+            "negation.readAtRange",
+        ):
+            assert caps[key] is True, key
+
+    async def test_pagination_is_reported_as_one_indexed_by_default(self):
+        caps = await self.service.get_backend_supported_filter_capabilities()
+        assert caps["pagination.oneIndexed"] is True
+
+    async def test_a_zero_indexed_backend_can_declare_it(self):
+        service: AsyncIONotificationService = AsyncIONotificationService(
+            notification_adapters=[],
+            notification_backend=_ZeroIndexedAsyncBackend(
+                database_file_name=self.database_file_name
+            ),
+        )
+        caps = await service.get_backend_supported_filter_capabilities()
+        assert caps["pagination.oneIndexed"] is False
+        assert caps["fields.tenant"] is True
+        assert caps["orderBy.sentAt"] is True
+
+    async def test_the_fake_backends_really_are_one_indexed(self):
+        self.backend.notifications = [
+            _build_notification("a", created=_dt(1)),
+            _build_notification("b", created=_dt(2)),
+        ]
+        order = {"field": "created_at", "direction": "asc"}
+
+        first_page = list(await self.service.filter_notifications({}, 1, 1, order_by=order))
+
+        assert [n.id for n in first_page] == ["a"]
 
 
 class TimestampStampingServiceTestCase(TestCase):
