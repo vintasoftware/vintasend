@@ -390,14 +390,27 @@ submodule directory, and one PR per repository.
 
 | Tool | Path | Purpose |
 |---|---|---|
-| `vintasend-api` | `tools/vintasend-api` | Django + django-ninja REST API serving the VintaSend dashboard |
+| `vintasend-api` | `tools/vintasend-api` | Django + django-ninja REST API serving the dashboard |
+| `vintasend-dashboard` | `tools/vintasend-dashboard` | Next.js UI for browsing, previewing, resending and cancelling notifications |
 
-`vintasend-api` implements the same HTTP contract as
-[`vintasend-ts-api`](https://github.com/vintasoftware/vintasend-ts-api); its `openapi.yaml`
-is the normative document and is byte-identical in both. It consumes this library's public
-API — notably `get_backend_supported_filter_capabilities`, whose keys it negotiates rather
-than assumes — so a change to the filter or capability surface is a change that affects it.
-Treat it like an implementation package when working out downstream impact.
+The two are separated by one HTTP contract, `openapi.yaml`, which is the normative document
+and ships byte-identical in `vintasend-api` and in its TypeScript sibling
+[`vintasend-ts-api`](https://github.com/vintasoftware/vintasend-ts-api):
+
+```
+vintasend-dashboard  ──HTTPS + API key──▶  vintasend-api (Python)   ──▶  this library
+                                    or ──▶  vintasend-ts-api (TS)   ──▶  vintasend-ts
+```
+
+The dashboard holds no backend, no database credentials and no template rendering — it
+reads and writes everything through that contract, which is why the same UI serves both
+ecosystems and why it is not tied to this repo's release cycle at all.
+
+`vintasend-api` is the one that consumes this library directly, notably
+`get_backend_supported_filter_capabilities`, whose keys it negotiates rather than assumes.
+**A change to the filter or capability surface affects it**, so treat it like an
+implementation package when working out downstream impact. A change to this library reaches
+the dashboard only if it changes the wire contract, which is a separate, deliberate decision.
 
 Run `git submodule update --init` if `tools/` is empty.
 
