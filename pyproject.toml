@@ -52,7 +52,10 @@ build-backend = "poetry.core.masonry.api"
 # pyproject.toml, its own ruff config, and its own release cadence (none - it's
 # copied, not published) - linting it from here would apply this repo's rules to
 # a package this repo does not release either.
-extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts", "implementations", "templates"]
+# `tools/` holds applications built on top of the library, as git submodules - currently
+# `vintasend-api`, a Django project. Same reasoning as `implementations/`: each has its
+# own ruff config, its own dependencies and its own CI, and this repo does not release it.
+extend-exclude = ["htmlcov", "ai-tools/skills/*/scripts", "implementations", "templates", "tools"]
 line-length = 100
 indent-width = 4
 # Must track the MINIMUM Python in [tool.poetry.dependencies]. Setting this higher

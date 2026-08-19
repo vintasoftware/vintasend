@@ -348,6 +348,26 @@ When a change to this repo affects them:
 
 `MIGRATION_TO_1.0.0.md` is the worked example of how a breaking release is documented.
 
+## Tools
+
+`tools/` holds applications built on top of the library, rather than implementations of its
+seams. Like `implementations/`, each is a git submodule with its own repository, release
+cycle, dependencies and CI — the same rules above apply: branch, commit and push inside the
+submodule directory, and one PR per repository.
+
+| Tool | Path | Purpose |
+|---|---|---|
+| `vintasend-api` | `tools/vintasend-api` | Django + django-ninja REST API serving the VintaSend dashboard |
+
+`vintasend-api` implements the same HTTP contract as
+[`vintasend-ts-api`](https://github.com/vintasoftware/vintasend-ts-api); its `openapi.yaml`
+is the normative document and is byte-identical in both. It consumes this library's public
+API — notably `get_backend_supported_filter_capabilities`, whose keys it negotiates rather
+than assumes — so a change to the filter or capability surface is a change that affects it.
+Treat it like an implementation package when working out downstream impact.
+
+Run `git submodule update --init` if `tools/` is empty.
+
 ## Pull requests and commits
 
 - **Branches:** `feat/<kebab-case-description>`. Never commit directly to `main`.
