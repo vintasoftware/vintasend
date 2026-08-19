@@ -309,6 +309,7 @@ linked here as a git submodule so one checkout holds every package that has to s
 | `vintasend-fastapi-mail` | `implementations/vintasend-fastapi-mail` | AsyncIO email adapter |
 | `vintasend-flask-mail` | `implementations/vintasend-flask-mail` | sync email adapter |
 | `vintasend-jinja` | `implementations/vintasend-jinja` | Jinja2 template renderer |
+| `vintasend-s3-attachments` | `implementations/vintasend-s3-attachments` | attachment manager (AWS S3 via boto3, sync and AsyncIO) |
 
 Run `git submodule update --init` if `implementations/` is empty.
 
