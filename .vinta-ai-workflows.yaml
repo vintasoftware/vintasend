@@ -10,8 +10,10 @@ project:
   code_host: github
   stack_summary: >-
     Poetry-managed Python library (3.10-3.14) for transactional notifications.
-    Pluggable architecture with three ABC seams - notification backends, adapters,
-    and template renderers - each shipping a stub/fake implementation. Sync and
+    Pluggable architecture with seven ABC seams - three required (notification
+    backends, adapters, template renderers) and four optional (attachment manager,
+    queue service, replication queue service, git commit SHA provider) - each
+    shipping a stub/fake implementation. Sync and
     AsyncIO service classes are maintained in parallel. No database, no frontend,
     no web server; published to PyPI. Concrete integrations (Django, SQLAlchemy,
     Celery, Jinja, FastAPI-Mail, Flask-Mail) live in separate vintasend-* repos.
