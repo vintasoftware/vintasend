@@ -2,8 +2,8 @@
 
 VintaSend is a Python library for transactional notifications. It records every notification in a
 data store, renders it from a template at send time, and dispatches it through a pluggable adapter
-(email, SMS, push, in-app). The library itself is deliberately incomplete: it defines three abstract
-seams and ships fakes for them, but every real backend, adapter, and template renderer lives in a
+(email, SMS, push, in-app). The library itself is deliberately incomplete: it defines abstract seams
+and ships fakes for them, but every real backend, adapter, and template renderer lives in a
 separate `vintasend-*` package. This repository owns the interfaces, the orchestration, and the
 contract — not the integrations.
 
@@ -22,6 +22,9 @@ Single package, no monorepo tooling.
   gets sent.
 - **`vintasend/services/notification_template_renderers/`** — the rendering seam. How a notification
   body is produced from a template plus context.
+- **`vintasend/services/attachment_managers/`**, **`notification_queue_services/`**,
+  **`git_commit_sha_providers/`** — the four optional seams. Each gates a feature that is off until
+  a host configures it. See **The seams** below.
 - **`vintasend/tasks/`** — `background_tasks.py` and `periodic_tasks.py`, the hooks a host app wires
   into Celery, cron, or similar to drain pending notifications.
 - **`vintasend/app_settings.py`** — settings resolution across Django, Flask, FastAPI, and bare env
@@ -107,10 +110,10 @@ interpreter you happen to be running:
 
 ## Architecture
 
-### The three seams
+### The seams
 
-Everything in this library is organized around three abstract base classes. A host application
-supplies one concrete implementation of each.
+Everything in this library is organized around abstract base classes a host application implements.
+Three are required — without one of each, the library cannot record, render or deliver anything:
 
 | Seam | Base class | Responsibility |
 |---|---|---|
@@ -118,9 +121,33 @@ supplies one concrete implementation of each.
 | Adapter | `notification_adapters/base.py` `BaseNotificationAdapter` | Deliver a rendered notification |
 | Renderer | `notification_template_renderers/base.py` `BaseNotificationTemplateRenderer` | Turn a template plus context into a sendable body |
 
-Adapters are generic over the other two — `BaseNotificationAdapter(Generic[B, T], ABC)`, where `B` is
-the backend type and `T` the renderer type — and accept either live instances or dotted import
-strings, which is what the `@overload`-ed `__init__` is for.
+Four more are optional. Each gates a feature and no default ships in core, so leaving one
+unconfigured turns that feature off:
+
+| Seam | Base class | Unset means |
+|---|---|---|
+| Attachment manager | `attachment_managers/base.py` `BaseAttachmentManager` | Attachments are unsupported |
+| Queue service | `notification_queue_services/base.py` `BaseNotificationQueueService` | A background adapter has nothing to enqueue to, and `send()` raises `NotificationQueueServiceMissingError`. Harmless if no background adapter is configured — this is the one optional seam that does not fail silently |
+| Replication queue service | `notification_queue_services/replication_base.py` `BaseNotificationReplicationQueueService` | Queued replication falls back to inline |
+| Git commit SHA provider | `git_commit_sha_providers/base.py` `BaseGitCommitShaProvider` | No SHA is ever resolved or written |
+
+Six of the seven have an `AsyncIO*` twin in the sibling `asyncio_base.py` (or
+`asyncio_replication_base.py`). **The renderer is the exception and has none** — rendering is
+in-memory work with nothing to await, so `AsyncIONotificationService` calls the same sync
+`BaseNotificationTemplateRenderer` directly. Don't add an `AsyncIOBaseNotificationTemplateRenderer`
+reaching for parity; there is nothing for it to do.
+
+Every seam ships a fake — see **Stubs are a deliverable** below. The optional four are injected the
+same way as the required three: an instance, a dotted import string, or their `NOTIFICATION_*`
+setting.
+
+Adapters are generic over the required other two — `BaseNotificationAdapter(Generic[B, T], ABC)`,
+where `B` is the backend type and `T` the renderer type — and accept either live instances or dotted
+import strings, which is what the `@overload`-ed `__init__` is for.
+
+**Optional does not mean unversioned.** The rules below apply to all seven: each optional seam has
+downstream implementers too (`vintasend-s3-attachments` implements the attachment manager), so
+adding an `@abstractmethod` to one breaks them exactly the same way.
 
 **Changing a seam is a breaking change.** Every `vintasend-*` package implements these classes, and
 `@abstractmethod` is enforced at instantiation: a downstream class missing a method raises
@@ -191,10 +218,15 @@ those imports local to their functions and never import a framework at module sc
 
 ### Stubs are a deliverable
 
-`stubs/` directories under each seam hold `FakeFileBackend`, `FakeEmailAdapter`,
-`FakeInAppAdapter`, `FakeTemplateRenderer`, and their AsyncIO twins. These serve two audiences: the
-test suite (they are the only backend the tests run against) and downstream authors, who read them as
-the reference implementation.
+`stubs/` directories under each seam hold a working fake for every one of the seven — required and
+optional alike — each with an AsyncIO twin:
+
+- Required: `FakeFileBackend`, `FakeEmailAdapter`, `FakeInAppAdapter`, `FakeTemplateRenderer`
+- Optional: `FakeAttachmentManager`, `FakeQueueService`, `FakeReplicationQueueService`,
+  `FakeGitCommitShaProvider`
+
+These serve two audiences: the test suite (they are the only backend the tests run against) and
+downstream authors, who read them as the reference implementation.
 
 **Keep them complete.** A new seam method gets a working fake in the same commit — not a stub that
 raises. `fake_backend.py` running to ~1,000 lines, second only to `notification_service.py`, is
@@ -309,6 +341,7 @@ linked here as a git submodule so one checkout holds every package that has to s
 | `vintasend-fastapi-mail` | `implementations/vintasend-fastapi-mail` | AsyncIO email adapter |
 | `vintasend-flask-mail` | `implementations/vintasend-flask-mail` | sync email adapter |
 | `vintasend-jinja` | `implementations/vintasend-jinja` | Jinja2 template renderer |
+| `vintasend-s3-attachments` | `implementations/vintasend-s3-attachments` | attachment manager (AWS S3 via boto3, sync and AsyncIO) |
 
 Run `git submodule update --init` if `implementations/` is empty.
 
@@ -347,6 +380,39 @@ When a change to this repo affects them:
    downstream module was renamed or moved.
 
 `MIGRATION_TO_1.0.0.md` is the worked example of how a breaking release is documented.
+
+## Tools
+
+`tools/` holds applications built on top of the library, rather than implementations of its
+seams. Like `implementations/`, each is a git submodule with its own repository, release
+cycle, dependencies and CI — the same rules above apply: branch, commit and push inside the
+submodule directory, and one PR per repository.
+
+| Tool | Path | Purpose |
+|---|---|---|
+| `vintasend-api` | `tools/vintasend-api` | Django + django-ninja REST API serving the dashboard |
+| `vintasend-dashboard` | `tools/vintasend-dashboard` | Next.js UI for browsing, previewing, resending and cancelling notifications |
+
+The two are separated by one HTTP contract, `openapi.yaml`, which is the normative document
+and ships byte-identical in `vintasend-api` and in its TypeScript sibling
+[`vintasend-ts-api`](https://github.com/vintasoftware/vintasend-ts-api):
+
+```
+vintasend-dashboard  ──HTTPS + API key──▶  vintasend-api (Python)   ──▶  this library
+                                    or ──▶  vintasend-ts-api (TS)   ──▶  vintasend-ts
+```
+
+The dashboard holds no backend, no database credentials and no template rendering — it
+reads and writes everything through that contract, which is why the same UI serves both
+ecosystems and why it is not tied to this repo's release cycle at all.
+
+`vintasend-api` is the one that consumes this library directly, notably
+`get_backend_supported_filter_capabilities`, whose keys it negotiates rather than assumes.
+**A change to the filter or capability surface affects it**, so treat it like an
+implementation package when working out downstream impact. A change to this library reaches
+the dashboard only if it changes the wire contract, which is a separate, deliberate decision.
+
+Run `git submodule update --init` if `tools/` is empty.
 
 ## Pull requests and commits
 

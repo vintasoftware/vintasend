@@ -1,5 +1,78 @@
 # Release Notes
 
+## Unreleased
+
+### Features
+
+#### Logical composition and range negation reported through the capability report
+- `DEFAULT_BACKEND_FILTER_CAPABILITIES` gained two namespaces, all defaulting to `True`:
+  `logical.and` / `logical.or` / `logical.not` / `logical.notNested`, and
+  `negation.sendAfterRange` / `negation.createdAtRange` / `negation.sentAtRange` /
+  `negation.readAtRange`.
+- The filter vocabulary has supported `and` / `or` / `not` groups since 2.0, but a backend had
+  no way to say it could not assemble them — so a dashboard could only find out by issuing a
+  filter the backend then failed or silently mis-evaluated.
+- `logical.not` and `logical.notNested` are deliberately separate: a query builder able to negate
+  a single predicate cannot always negate a whole subtree, so a backend may support
+  `{"not": {"tenant": "acme"}}` and decline `{"not": {"or": [...]}}`.
+- `negation.*` is scoped to date ranges because that is where backends struggle. A negated
+  membership or string lookup is a plain `NOT IN` / `NOT LIKE`; a negated range must include
+  `None` rows to satisfy this library's negation semantics, which not every query builder
+  expresses. `fields.sentAtRange: True` alongside `negation.sentAtRange: False` is expected.
+- These keys and their spellings come from the `vintasend-ts` sibling library, which already had
+  `logical.*` and the three `negation.*` range keys. `negation.readAtRange` is new to both, and
+  exists here because this library also has `fields.readAtRange`.
+
+#### Case-insensitive string matching reported through the capability report
+- `DEFAULT_BACKEND_FILTER_CAPABILITIES` gained `stringLookups.caseInsensitive`, defaulting to
+  `True`. It reports whether a backend can match a string filter ignoring case, i.e. whether it
+  honours `case_sensitive: False` on a `StringFilterLookup`.
+- This sits alongside the existing `stringLookups.caseSensitive`, and the two are **independent
+  capabilities rather than one flag and its negation**. A backend on a case-insensitive collation
+  (MySQL's `*_ci`) cannot match case-sensitively and reports `caseSensitive: False`; a backend
+  with no way to fold case cannot match case-insensitively and reports `caseInsensitive: False`.
+  Most backends do both, hence both default to `True`.
+- Previously only `caseSensitive` existed, so a caller wanting to know whether it could ask for a
+  case-insensitive match had to infer it — and inferring one from the other inverts the answer for
+  exactly the backends that have a constraint worth reporting.
+- `stringLookups.caseInsensitive` is also the key the `vintasend-ts` sibling library uses, so a
+  client consuming both ecosystems reads one key with one spelling. `vintasend-ts` has since added
+  `stringLookups.caseSensitive` too, so both ecosystems now report the pair.
+
+#### Pagination convention reported through the capability report
+- `DEFAULT_BACKEND_FILTER_CAPABILITIES` gained `pagination.oneIndexed`, defaulting to `True`.
+  It reports whether a backend's `page` argument is 1-indexed -- whether `page=1` is the first
+  page -- and it covers every paginated backend method, not just `filter_notifications`.
+- The key exists because the convention is silent when a caller gets it wrong: nothing raises,
+  the caller simply serves the wrong page, skips the first record, or gets an empty first page.
+  Anything translating between its own page numbering and a backend's should read this key
+  rather than hardcode an assumption. It matters most across ecosystems: `vintasend-ts` defines
+  the same key but defaults it to `false`, because its backends page from 0 while every backend
+  here pages from 1. The key is the same; the correct value is not, so it has to be read.
+- A 0-indexed backend declares `{"pagination.oneIndexed": False}` from `get_filter_capabilities`,
+  the same way it would decline any other capability.
+
+### Backwards compatibility
+
+- **No action required for existing backends.** This adds a key to a data contract, not an
+  abstract method. The new key defaults to `True`, which is what every backend in this library
+  and every known downstream implementation already does, so a backend that says nothing keeps
+  reporting the correct value. `get_filter_capabilities` is unchanged in signature and still has
+  a working default.
+- A downstream backend that is genuinely 0-indexed was already mismatched with the documented
+  convention before this release; it should now declare `{"pagination.oneIndexed": False}` so
+  callers can compensate.
+- Callers asserting on the exact contents of `get_backend_supported_filter_capabilities()` will
+  see ten additional keys. The in-repo test that does this (`test_capabilities_all_true_for_full_backend`)
+  compares against `DEFAULT_BACKEND_FILTER_CAPABILITIES` rather than a literal, so it needed no
+  change; a downstream test hardcoding the full dict will.
+- A backend that cannot assemble `and` / `or` / `not` groups, or cannot negate a date range, was
+  already unable to do so before this release and had no way to report it. It should now declare
+  the relevant `logical.*` / `negation.*` key as `False`.
+- A caller that had been treating `stringLookups.caseSensitive` as a proxy for "can this backend
+  match case-insensitively" should switch to reading `stringLookups.caseInsensitive` directly. The
+  two are not inverses, and the old inference is wrong for any backend that reports either.
+
 ## Version 2.0.0 (2026-07-23)
 
 2.0 is a major release that bundles several feature sets: background notification sending through a

@@ -340,12 +340,19 @@ class AsyncIOBaseNotificationBackend(ABC):
 
     async def get_filter_capabilities(self) -> dict[str, bool]:
         """
-        Report which filter fields, string lookups and sort fields this backend supports.
+        Report which filter fields, string lookups, logical composition and sort fields
+        this backend supports, and which pagination convention it follows.
 
         Keys are camelCase dotted (``'fields.notificationType'``, ``'orderBy.sentAt'``) and a
         backend declares ONLY what it *cannot* do -- the service merges this report OVER an
         all-``True`` default, so a missing key means supported. The concrete default returns
         ``{}`` (everything supported); backends override to decline specific capabilities.
+
+        One key is a convention rather than a feature: ``'pagination.oneIndexed'`` defaults to
+        ``True``, meaning ``page=1`` is the first page. A backend whose pages start at ``0``
+        MUST report ``{'pagination.oneIndexed': False}``, because a caller that assumes the
+        wrong base gets no error -- just the wrong rows. See
+        ``DEFAULT_BACKEND_FILTER_CAPABILITIES``.
         """
         return {}
 
