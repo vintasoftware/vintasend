@@ -16,7 +16,10 @@ what pyproject says, so a tag that disagrees with it publishes the wrong number
 and PyPI rejects it as a duplicate. Bump with `scripts/bump_version.py` first.
 
 Tag the submodules with `scripts/tag_subpackages.py` after this one succeeds --
-downstream packages cannot depend on a vintasend that is not published yet.
+downstream packages cannot depend on a vintasend that is not published yet. Since
+the root goes first, the submodules are expected to be dirty while this runs
+(already bumped, not yet tagged), so the clean-tree check here looks only at the
+root's own files and reports the submodule state instead of blocking on it.
 """
 
 from __future__ import annotations
@@ -87,8 +90,7 @@ def preflight(version: str, tag: str) -> list[str]:
     if not clean:
         problems.append(
             "working tree has uncommitted changes outside the submodules, so the tag would not "
-            "name what you tested:\n"
-            + "\n".join(f"      {line}" for line in dirty.splitlines())
+            "name what you tested:\n" + "\n".join(f"      {line}" for line in dirty.splitlines())
         )
 
     pushed, why = head_is_pushed(REPO_ROOT)
