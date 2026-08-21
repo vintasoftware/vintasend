@@ -1,5 +1,80 @@
 # Release Notes
 
+## Version 3.1.0 (2026-08-21)
+
+A supported-versions and packaging release. The `vintasend` package itself has no code change
+since 3.0.0 -- the number moves because the whole family releases in lockstep. Everything below
+concerns which Python and Django versions the packages support, and a Django test matrix that
+was not testing what its environment names claimed.
+
+### Features
+
+#### Python 3.10 and 3.11 restored on the Django packages
+
+* `vintasend-django` and `vintasend-django-templates-manager` lower their floor from `>=3.12`
+  back to `>=3.10`, matching every other package in the family. The 3.12 floor was collateral
+  from an earlier Django bump: Django 6.0 requires Python 3.12, and the constraint was raised
+  package-wide instead of being scoped to that one factor. Neither package's source needs 3.12,
+  so projects on 3.10 or 3.11 can use them again.
+
+#### Django 6.1 support
+
+* Both Django packages widen their Django constraint to `<6.2` and test against 6.1.
+* `vintasend-django`'s test settings move to the `MAILERS` setting introduced in Django 6.1.
+  The deprecated `EMAIL_*` names warn there and are removed in Django 7.0. This is test
+  configuration only: the email adapter builds a `django.core.mail.EmailMessage`, which is
+  unaffected by the deprecation.
+
+#### Supported Python x Django combinations
+
+* Python 3.10, 3.11 -- Django 4.2, 5.2
+* Python 3.12 -- Django 4.2, 5.2, 6.0, 6.1
+* Python 3.13, 3.14 -- Django 5.2, 6.0, 6.1
+
+### Bug Fixes
+
+* **The Django version matrix never varied Django.** Both Django packages pinned a Django
+  version per tox factor in `deps`, then ran `poetry install` in `commands_pre`, which
+  reinstalled Django from `poetry.lock`. Every environment tested the locked version (6.0.8)
+  no matter what its name said, so compatibility with Django 4.2 and 5.2 was untested rather
+  than under-tested. The factor pin is now installed after `poetry install`, and CI logs show
+  four distinct Django versions across the matrix.
+* CI ran matrix jobs on Python 3.10 and 3.11 against packages declaring `>=3.12`. Poetry
+  refused those interpreters and fell back to the runner's 3.12, so two jobs were duplicates
+  running under a misleading name. Matrices now match the declared floor.
+* `skip_missing_interpreters` is now set explicitly in every `tox.ini`. Its default changed
+  between tox 4.55 (skip) and 4.58 (fail), which is what turned "this matrix job did not
+  install that interpreter" into a hard CI failure once a lockfile picked up the newer tox.
+* `vintasend-django-templates-manager` uploaded its coverage to Codecov under the
+  `vintasend-django` slug.
+
+### Build Improvements
+
+* `tox-gh` is now a dev dependency of all 12 packages that carry a `tox.ini`. Each already had
+  a `[gh]` section mapping interpreters to environments, but without the plugin it was inert:
+  every CI job ran every environment it could find an interpreter for. The Django packages were
+  executing 30 environment runs for 14 declared environments; they now run exactly the 14.
+
+### Dependencies
+
+* `vintasend-django-templates-manager`: `django-stubs` relaxed from `^6.1.0` to `^6.0.5`.
+  django-stubs 6.1.0 requires Python `>=3.11` and cannot install on the restored 3.10 floor.
+* Both Django packages, dev only: `model-bakery` capped below 1.24, which requires
+  `django>=5.2` and therefore cannot run the Django 4.2 environments.
+
+### Backwards compatibility
+
+* **No ABC seam changed.** No method was added, removed or renamed on `BaseNotificationBackend`,
+  `AsyncIOBaseNotificationBackend`, the notification adapter ABCs or the template renderer ABCs,
+  and no existing signature or semantic changed. Custom backends, adapters and renderers need
+  no changes for this release.
+* The `vintasend` package contains no code change at all; only its dev dependencies moved.
+* **`vintasend-django` and `vintasend-django-templates-manager` drop Django 5.0 and 5.1**, both
+  end-of-life upstream (August 2025 and December 2025). This is the only narrowing in the
+  release: projects on either must move to Django 5.2, or stay on 3.0.0. The Django 4.2 LTS is
+  still supported.
+* The Python floor moves down rather than up, so no project loses support for its interpreter.
+
 ## Version 3.0.0 (2026-08-21)
 
 ### Features
