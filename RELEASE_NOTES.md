@@ -20,10 +20,10 @@ was not testing what its environment names claimed.
 #### Django 6.1 support
 
 * Both Django packages widen their Django constraint to `<6.2` and test against 6.1.
-* `vintasend-django`'s test settings move to the `MAILERS` setting introduced in Django 6.1.
-  The deprecated `EMAIL_*` names warn there and are removed in Django 7.0. This is test
-  configuration only: the email adapter builds a `django.core.mail.EmailMessage`, which is
-  unaffected by the deprecation.
+* Both packages' test settings move to the `MAILERS` setting introduced in Django 6.1. The
+  deprecated `EMAIL_*` names warn there and are removed in Django 7.0. This is test
+  configuration only: `vintasend-django`'s email adapter builds a
+  `django.core.mail.EmailMessage`, which is unaffected by the deprecation.
 
 #### Supported Python x Django combinations
 
