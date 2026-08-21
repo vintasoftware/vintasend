@@ -63,8 +63,22 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
 2. **Decide the version** using the table above. Confirm it with the user rather than inferring it
    from the diff alone.
 
-3. **Bump `version` in [`pyproject.toml`](../../../pyproject.toml)** under `[tool.poetry]`. This is the
-   single source of truth for the published version; nothing derives it from the tag.
+3. **Bump the version with [`scripts/bump_version.py`](../../../scripts/bump_version.py).** Every
+   `vintasend-*` package releases in lockstep on one shared number, so the version moves in this
+   repo *and* in each submodule together:
+
+   ```bash
+   scripts/bump_version.py minor --dry-run   # inspect first
+   scripts/bump_version.py minor
+   ```
+
+   It rewrites `version` in all 11 `pyproject.toml` files and moves each submodule's
+   `vintasend` pin to match, keeping the operator it already used. `pyproject.toml` is the single
+   source of truth for the published version; nothing derives it from the tag.
+
+   The bump leaves every `poetry.lock` stale. Relock the root before tagging; the submodules can
+   only be relocked after the root release is live on PyPI, since their pins now name a version
+   that does not exist yet. The script prints this ordering when it finishes.
 
 4. **Add the `RELEASE_NOTES.md` entry** at the top, directly under `# Release Notes`. Match the
    existing shape:
@@ -96,16 +110,25 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
 
 6. **Commit, open a PR, merge to `main`.** Normal flow — do not tag from a branch.
 
-7. **Tag and push the tag.**
+7. **Tag and push the tag** with [`scripts/tag_release.py`](../../../scripts/tag_release.py):
 
    ```bash
    git checkout main && git pull --ff-only
-   git tag vX.Y.Z
-   git push origin vX.Y.Z
+   scripts/tag_release.py --dry-run   # run every check, change nothing
+   scripts/tag_release.py             # check, show the plan, ask, then push
    ```
 
-   The tag must be `v`-prefixed to match the workflow's `tags: - 'v*'` trigger, and its version must
-   equal the `pyproject.toml` version. Nothing enforces that equality — check it by eye.
+   It takes the version from `pyproject.toml` rather than an argument, so the tag can never
+   disagree with what Poetry will build, and it refuses to run unless you are on `main` with a
+   clean tree whose HEAD is already pushed, the tag is absent both locally and on origin, every
+   package shares the version, and `RELEASE_NOTES.md` has the matching entry. It then pushes an
+   annotated `vX.Y.Z` tag and opens the GitHub release using that entry as the body.
+
+   Then tag the submodules with
+   [`scripts/tag_subpackages.py`](../../../scripts/tag_subpackages.py) — **after** this release is
+   live on PyPI, since every subpackage now pins `vintasend` at this exact version and cannot
+   resolve it before then. That script checks all ten packages before pushing any tag, so a
+   blocked package stops the run rather than leaving the family half-published.
 
 8. **Watch the workflow.** `gh run watch` or the Actions tab. It runs the matrix, then
    `test-before-publish` → `check-tests` → `publish-release`. A red matrix means nothing is

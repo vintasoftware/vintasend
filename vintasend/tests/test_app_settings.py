@@ -116,6 +116,13 @@ class DjangoAttachmentManagerSettingTestCase(TestCase):
     def test_django_setting_value_is_used_when_env_var_is_absent(self):
         from django.conf import settings as django_settings
 
+        # Django is only installed here incidentally, so there is no DJANGO_SETTINGS_MODULE
+        # and `settings` is still unconfigured -- reading any attribute off it would raise
+        # ImproperlyConfigured. An empty settings object is enough to exercise the real
+        # `django.conf.settings` lookup path.
+        if not django_settings.configured:
+            django_settings.configure()
+
         with patch("vintasend.app_settings.detect_framework", return_value="Django"):
             with patch.object(
                 django_settings,

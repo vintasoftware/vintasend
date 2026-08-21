@@ -39,6 +39,7 @@ from vintasend.exceptions import (
     NotificationUpdateError,
     ReplicationError,
     TenantReassignmentError,
+    UsedTemplateVersionReassignmentError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
@@ -102,6 +103,7 @@ from vintasend.services.notification_queue_services.base import BaseNotification
 from vintasend.services.notification_queue_services.replication_base import (
     BaseNotificationReplicationQueueService,
 )
+from vintasend.services.notification_template_renderers.base import NotificationSendInput
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     BaseTemplatedEmailRenderer,
     EmailTemplateContent,
@@ -342,6 +344,7 @@ class NotificationService(Generic[A, B]):
         attachment_manager: BaseAttachmentManager | str | None = None,
         git_commit_sha_provider: BaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
+        pin_template_versions: bool = False,
         additional_backends: Iterable[B | str] | None = None,
         replication_queue_service: BaseNotificationReplicationQueueService | str | None = None,
         replication_mode: Literal["inline", "queued"] | None = None,
@@ -364,6 +367,16 @@ class NotificationService(Generic[A, B]):
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
+        :param pin_template_versions: the default answer to "should a notification created
+            or repointed without an explicit ``requested_template_version`` be pinned to
+            whatever version is current at that moment", so a later edit to the template
+            cannot change what it renders. Off by default, because turning it on changes what
+            an existing deployment sends: today an unpinned notification always renders the
+            latest version. Every create and update takes a ``pin_template_versions`` of its
+            own that overrides this, so the setting is a default rather than a policy. Only
+            renderers that version their templates can answer at all -- see
+            ``BaseNotificationTemplateRenderer.get_latest_template_version`` -- so with a
+            file-based renderer neither the setting nor the argument has anything to pin.
         :param additional_backends: extra backends replicated reads (and, from a later
             phase, writes) can be routed to. Each entry is a backend instance or its import
             string, resolved the same way as `notification_backend`. A backend is
@@ -409,6 +422,7 @@ class NotificationService(Generic[A, B]):
                 "'queued'"
             )
         self.replication_mode = resolved_replication_mode
+        self.pin_template_versions = pin_template_versions
 
         if isinstance(notification_queue_service, BaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -1185,6 +1199,130 @@ class NotificationService(Generic[A, B]):
 
         return {"migrated": migrated, "failures": failures}
 
+    def _resolve_template_version_to_pin(
+        self,
+        notification_type: str,
+        body_template: str,
+        requested_template_version: int | None,
+        pin_template_versions: bool | None,
+    ) -> int | None:
+        """Which template version to record on a notification being created or repointed.
+
+        An explicit request always wins -- pinning is a default, not an override, so a caller
+        who names a version gets that version whatever the service was configured with. With
+        no request and no pinning asked for, the answer is None: the notification goes on
+        resolving its template at send time, exactly as notifications did before any of this
+        existed.
+
+        ``pin_template_versions`` is this call's answer to "should an unpinned notification be
+        pinned", and ``None`` means "whatever the service was built with". A caller who has one
+        notification that must not move, in a deployment that pins nothing -- or the reverse --
+        says so on the call rather than building a second service.
+
+        Otherwise the renderer for this notification type is asked what the current version
+        is. Best-effort by design: a renderer that does not version templates says None, and
+        one that raises is logged and treated the same way. Neither is worth failing a
+        creation over -- an unpinned notification still sends, against whatever is current.
+        """
+        if requested_template_version is not None:
+            return requested_template_version
+        if not self._should_pin(pin_template_versions):
+            return None
+
+        for adapter in self.notification_adapters:
+            if adapter.notification_type.value != notification_type:
+                continue
+            try:
+                version = adapter.template_renderer.get_latest_template_version(body_template)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Template renderer %s raised while resolving the current version of "
+                    "template %r; leaving the notification unpinned",
+                    adapter.template_renderer.template_renderer_import_str,
+                    body_template,
+                )
+                continue
+            if version is not None:
+                return version
+        return None
+
+    def _should_pin(self, pin_template_versions: bool | None) -> bool:
+        """Whether this call pins, given what it asked for and what the service defaults to.
+
+        ``None`` from a call site means it did not ask, so the service's own setting decides.
+        Anything else is the call's decision and overrides it in both directions.
+        """
+        if pin_template_versions is None:
+            return self.pin_template_versions
+        return pin_template_versions
+
+    def _pin_template_version_on_update(
+        self,
+        notification_id: int | str | uuid.UUID,
+        kwargs: "UpdateNotificationKwargs",
+        pin_template_versions: bool | None,
+    ) -> None:
+        """Pin an update that repoints a notification at a different template.
+
+        Only when ``body_template`` is being changed: that is the update where the version
+        that was pinned no longer describes what the notification renders. An update to the
+        title -- or to anything else -- leaves an existing pin exactly as it is, because
+        silently re-pinning a notification to a newer version is the very thing pinning
+        exists to prevent.
+
+        Does nothing when the caller named a version themselves; theirs wins, as it does on
+        create. Mutates ``kwargs`` in place, so the resolved version travels to the backend
+        with the rest of the update.
+        """
+        if not self._should_pin(pin_template_versions):
+            return
+        if "body_template" not in kwargs or kwargs.get("requested_template_version") is not None:
+            return
+
+        notification = self.get_notification(notification_id)
+        version = self._resolve_template_version_to_pin(
+            notification.notification_type, kwargs["body_template"], None, pin_template_versions
+        )
+        if version is not None:
+            kwargs["requested_template_version"] = version
+
+    def _record_used_template_version(
+        self,
+        notification: Notification | OneOffNotification,
+        send_input: "NotificationSendInput | None",
+    ) -> None:
+        """Store the template version an adapter's renderer reported it used.
+
+        A no-op unless the adapter returned its send input and the renderer filled the
+        version in, which is every adapter that predates this and every renderer whose
+        templates are not versioned.
+
+        Failures are logged, never raised: the notification has already been delivered by the
+        time this runs, and losing a line of audit metadata is not worth reporting a
+        successful send as failed.
+        """
+        version = getattr(send_input, "template_version", None)
+        if version is None or version == notification.used_template_version:
+            return
+
+        try:
+            self._execute_multi_backend_write(
+                lambda backend: backend.store_template_version(notification.id, version),
+                self._replicate_snapshot_fallback,
+                replication_notification_id=notification.id,
+            )
+        except Exception:  # noqa: BLE001
+            # Every failure, not just NotificationUpdateError: by the time this runs the
+            # notification has been delivered and marked sent, so anything raised here would
+            # report a successful send as a failure. A missing line of audit metadata is the
+            # smaller loss, and the log says which notification lost it.
+            logger.exception(
+                "Failed to store the template version used for notification %s",
+                notification.id,
+            )
+            return
+        notification.used_template_version = version
+
     def _resolve_and_persist_git_commit_sha(
         self, notification: Notification | OneOffNotification
     ) -> None:
@@ -1322,7 +1460,7 @@ class NotificationService(Generic[A, B]):
                     return
 
             try:
-                adapter.send(
+                send_input = adapter.send(
                     notification=notification,
                     context=context,
                 )
@@ -1360,6 +1498,12 @@ class NotificationService(Generic[A, B]):
                 if self.raise_on_failed_send:
                     raise NotificationMarkSentError("Failed to mark notification as sent") from e
 
+            # Outside the try above on purpose: that block's NotificationUpdateError handler
+            # is about failing to mark the notification sent, which is a real delivery
+            # outcome. Recording which template version rendered it is audit metadata, and it
+            # keeps its own failure handling inside the helper.
+            self._record_used_template_version(notification, send_input)
+
     def create_notification(
         self,
         user_id: int | str | uuid.UUID,
@@ -1374,6 +1518,8 @@ class NotificationService(Generic[A, B]):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
+        pin_template_versions: bool | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -1397,8 +1543,18 @@ class NotificationService(Generic[A, B]):
             attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
+            requested_template_version: int | None - which version of ``body_template`` to
+                render. An explicit value always wins. Left None, the version is pinned to
+                whatever is current now if this call (or the service) asks for pinning, and
+                otherwise stays None, meaning "whatever is current at send time".
+            pin_template_versions: bool | None - whether to pin this notification when no
+                version was named. None (the default) defers to the service's own setting;
+                True or False decides it for this call alone.
         """
         validated_attachments = self._validate_attachments(attachments or [])
+        resolved_template_version = self._resolve_template_version_to_pin(
+            notification_type, body_template, requested_template_version, pin_template_versions
+        )
 
         persist_kwargs: dict[str, Any] = {
             "user_id": user_id,
@@ -1419,6 +1575,12 @@ class NotificationService(Generic[A, B]):
 
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
+
+        # Only passed when there is a version to pin, the same courtesy the attachments
+        # keyword gets above: a backend that predates template versioning does not accept
+        # the keyword, and an unpinned notification must not be the thing that breaks it.
+        if resolved_template_version is not None:
+            persist_kwargs["requested_template_version"] = resolved_template_version
 
         notification = self._execute_multi_backend_write(
             lambda backend: backend.persist_notification(**persist_kwargs),
@@ -1446,6 +1608,8 @@ class NotificationService(Generic[A, B]):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
+        pin_template_versions: bool | None = None,
     ) -> "OneOffNotification":
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -1471,9 +1635,16 @@ class NotificationService(Generic[A, B]):
             attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
+            requested_template_version: int | None - which version of ``body_template`` to
+                render. Behaves exactly as it does on ``create_notification``.
+            pin_template_versions: bool | None - whether to pin this notification when no
+                version was named. Behaves exactly as it does on ``create_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
+        resolved_template_version = self._resolve_template_version_to_pin(
+            notification_type, body_template, requested_template_version, pin_template_versions
+        )
 
         persist_kwargs: dict[str, Any] = {
             "email_or_phone": email_or_phone,
@@ -1495,6 +1666,12 @@ class NotificationService(Generic[A, B]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
+        # Only passed when there is a version to pin, the same courtesy the attachments
+        # keyword gets above: a backend that predates template versioning does not accept
+        # the keyword, and an unpinned notification must not be the thing that breaks it.
+        if resolved_template_version is not None:
+            persist_kwargs["requested_template_version"] = resolved_template_version
+
         notification = self._execute_multi_backend_write(
             lambda backend: backend.persist_one_off_notification(**persist_kwargs),
             self._replicate_snapshot_fallback,
@@ -1508,6 +1685,7 @@ class NotificationService(Generic[A, B]):
     def update_notification(
         self,
         notification_id: int | str | uuid.UUID,
+        pin_template_versions: bool | None = None,
         **kwargs: Unpack[UpdateNotificationKwargs],
     ) -> Notification | OneOffNotification:
         """
@@ -1519,13 +1697,24 @@ class NotificationService(Generic[A, B]):
             * GitCommitShaReassignmentError if ``git_commit_sha`` is present in kwargs --
               it is system-managed and only ever written by NotificationService at send
               time.
+            * UsedTemplateVersionReassignmentError if ``used_template_version`` is present in
+              kwargs -- it is system-managed the same way. Pass
+              ``requested_template_version`` to change which version renders.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
+            * UnconfirmedNotificationUpdateError if the backend could not tell whether the
+              write applied -- it may or may not have landed, so re-read the notification
+              instead of assuming either outcome.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to update
+            pin_template_versions: bool | None - whether an update that repoints this
+                notification at another template should pin it to that template's current
+                version. None (the default) defers to the service's own setting. Named
+                explicitly rather than left to ``**kwargs`` because it is a decision about
+                the update, not a field to write.
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
         if "tenant" in kwargs:
@@ -1534,6 +1723,12 @@ class NotificationService(Generic[A, B]):
             raise GitCommitShaReassignmentError(
                 "A notification's git_commit_sha is system-managed and cannot be set directly"
             )
+        if "used_template_version" in kwargs:
+            raise UsedTemplateVersionReassignmentError(
+                "A notification's used_template_version is system-managed and cannot be set "
+                "directly; set requested_template_version instead"
+            )
+        self._pin_template_version_on_update(notification_id, kwargs, pin_template_versions)
         notification = self._execute_multi_backend_write(
             lambda backend: backend.persist_notification_update(
                 notification_id=notification_id,
@@ -1734,6 +1929,9 @@ class NotificationService(Generic[A, B]):
 
         This method may raise the following exceptions:
             * NotificationUpdateError if the notification fails to be marked as read.
+            * UnconfirmedNotificationUpdateError if the backend could not tell whether the
+              write applied -- it may or may not have landed, so re-read the notification
+              instead of assuming either outcome.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the notification to mark as read
@@ -2072,6 +2270,13 @@ class NotificationService(Generic[A, B]):
         """
         Cancel a notification.
 
+        This method may raise the following exceptions:
+            * NotificationCancelError if the notification could not be cancelled -- it is
+              already sent, already cancelled, or no longer there.
+            * UnconfirmedNotificationUpdateError if the backend could not tell whether the
+              write applied -- it may or may not have landed, so re-read the notification
+              instead of assuming either outcome.
+
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
@@ -2181,7 +2386,7 @@ class NotificationService(Generic[A, B]):
                     return
 
             try:
-                adapter.send(notification=notification, context=context)
+                send_input = adapter.send(notification=notification, context=context)
             except Exception as adapter_error:  # noqa: BLE001
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification_id)
@@ -2215,6 +2420,12 @@ class NotificationService(Generic[A, B]):
                 logger.exception("Failed to mark notification %s as sent", notification_id)
                 if self.raise_on_failed_send:
                     raise NotificationMarkSentError("Failed to mark notification as sent") from e
+
+            # Outside the try above on purpose: that block's NotificationUpdateError handler
+            # is about failing to mark the notification sent, which is a real delivery
+            # outcome. Recording which template version rendered it is audit metadata, and it
+            # keeps its own failure handling inside the helper.
+            self._record_used_template_version(notification, send_input)
 
         if not background_adapter_found:
             logger.error(
@@ -2254,6 +2465,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         attachment_manager: AsyncIOBaseAttachmentManager | str | None = None,
         git_commit_sha_provider: AsyncIOBaseGitCommitShaProvider | str | None = None,
         raise_on_failed_send: bool = False,
+        pin_template_versions: bool = False,
         additional_backends: Iterable[BAIO | str] | None = None,
         replication_queue_service: AsyncIOBaseNotificationReplicationQueueService
         | str
@@ -2278,6 +2490,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         :param raise_on_failed_send: when False (the default), a failure to send, enqueue, or
             record a notification's outcome is logged and the remaining adapters still run.
             When True, those failures are raised, which is the 1.x behaviour.
+        :param pin_template_versions: the default answer to "should a notification created
+            or repointed without an explicit ``requested_template_version`` be pinned to
+            whatever version is current at that moment", so a later edit to the template
+            cannot change what it renders. Off by default, because turning it on changes what
+            an existing deployment sends: today an unpinned notification always renders the
+            latest version. Every create and update takes a ``pin_template_versions`` of its
+            own that overrides this, so the setting is a default rather than a policy. Only
+            renderers that version their templates can answer at all -- see
+            ``BaseNotificationTemplateRenderer.get_latest_template_version`` -- so with a
+            file-based renderer neither the setting nor the argument has anything to pin.
         :param additional_backends: extra backends replicated reads (and, from a later
             phase, writes) can be routed to. Each entry is a backend instance or its import
             string, resolved the same way as `notification_backend`. A backend is
@@ -2323,6 +2545,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 "'queued'"
             )
         self.replication_mode = resolved_replication_mode
+        self.pin_template_versions = pin_template_versions
 
         if isinstance(notification_queue_service, AsyncIOBaseNotificationQueueService):
             self.notification_queue_service = notification_queue_service
@@ -3127,6 +3350,131 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         return {"migrated": migrated, "failures": failures}
 
+    def _resolve_template_version_to_pin(
+        self,
+        notification_type: str,
+        body_template: str,
+        requested_template_version: int | None,
+        pin_template_versions: bool | None,
+    ) -> int | None:
+        """Which template version to record on a notification being created or repointed.
+
+        An explicit request always wins -- pinning is a default, not an override, so a caller
+        who names a version gets that version whatever the service was configured with. With
+        no request and no pinning asked for, the answer is None: the notification goes on
+        resolving its template at send time, exactly as notifications did before any of this
+        existed.
+
+        ``pin_template_versions`` is this call's answer to "should an unpinned notification be
+        pinned", and ``None`` means "whatever the service was built with". A caller who has one
+        notification that must not move, in a deployment that pins nothing -- or the reverse --
+        says so on the call rather than building a second service.
+
+        Otherwise the renderer for this notification type is asked what the current version
+        is. Best-effort by design: a renderer that does not version templates says None, and
+        one that raises is logged and treated the same way. Neither is worth failing a
+        creation over -- an unpinned notification still sends, against whatever is current.
+        """
+        if requested_template_version is not None:
+            return requested_template_version
+        if not self._should_pin(pin_template_versions):
+            return None
+
+        for adapter in self.notification_adapters:
+            if adapter.notification_type.value != notification_type:
+                continue
+            try:
+                version = adapter.template_renderer.get_latest_template_version(body_template)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Template renderer %s raised while resolving the current version of "
+                    "template %r; leaving the notification unpinned",
+                    adapter.template_renderer.template_renderer_import_str,
+                    body_template,
+                )
+                continue
+            if version is not None:
+                return version
+        return None
+
+    def _should_pin(self, pin_template_versions: bool | None) -> bool:
+        """Whether this call pins, given what it asked for and what the service defaults to.
+
+        ``None`` from a call site means it did not ask, so the service's own setting decides.
+        Anything else is the call's decision and overrides it in both directions.
+        """
+        if pin_template_versions is None:
+            return self.pin_template_versions
+        return pin_template_versions
+
+    async def _pin_template_version_on_update(
+        self,
+        notification_id: int | str | uuid.UUID,
+        kwargs: "UpdateNotificationKwargs",
+        pin_template_versions: bool | None,
+    ) -> None:
+        """Pin an update that repoints a notification at a different template.
+
+        Only when ``body_template`` is being changed: that is the update where the version
+        that was pinned no longer describes what the notification renders. An update to the
+        title -- or to anything else -- leaves an existing pin exactly as it is, because
+        silently re-pinning a notification to a newer version is the very thing pinning
+        exists to prevent.
+
+        Does nothing when the caller named a version themselves; theirs wins, as it does on
+        create. Mutates ``kwargs`` in place, so the resolved version travels to the backend
+        with the rest of the update.
+        """
+        if not self._should_pin(pin_template_versions):
+            return
+        if "body_template" not in kwargs or kwargs.get("requested_template_version") is not None:
+            return
+
+        notification = await self.get_notification(notification_id)
+        version = self._resolve_template_version_to_pin(
+            notification.notification_type, kwargs["body_template"], None, pin_template_versions
+        )
+        if version is not None:
+            kwargs["requested_template_version"] = version
+
+    async def _record_used_template_version(
+        self,
+        notification: Notification | OneOffNotification,
+        send_input: "NotificationSendInput | None",
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        """Store the template version an adapter's renderer reported it used.
+
+        A no-op unless the adapter returned its send input and the renderer filled the
+        version in, which is every adapter that predates this and every renderer whose
+        templates are not versioned.
+
+        Failures are logged, never raised: the notification has already been delivered by the
+        time this runs, and losing a line of audit metadata is not worth reporting a
+        successful send as failed.
+        """
+        version = getattr(send_input, "template_version", None)
+        if version is None or version == notification.used_template_version:
+            return
+
+        try:
+            await self._execute_multi_backend_write(
+                lambda backend: backend.store_template_version(notification.id, version, lock),
+                self._replicate_snapshot_fallback,
+                replication_notification_id=notification.id,
+            )
+        except Exception:  # noqa: BLE001
+            # Every failure, not just NotificationUpdateError: by the time this runs the
+            # notification has been delivered and marked sent, so anything raised here would
+            # report a successful send as a failure. A missing line of audit metadata is the
+            # smaller loss, and the log says which notification lost it.
+            logger.exception(
+                "Failed to store the template version used for notification %s",
+                notification.id,
+            )
+            return
+        notification.used_template_version = version
+
     async def _resolve_and_persist_git_commit_sha(
         self,
         notification: Notification | OneOffNotification,
@@ -3272,7 +3620,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                     return
 
             try:
-                await adapter.send(
+                send_input = await adapter.send(
                     notification=notification,
                     context=context,
                 )
@@ -3310,6 +3658,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 if self.raise_on_failed_send:
                     raise NotificationMarkSentError("Failed to mark notification as sent") from e
 
+            # Outside the try above on purpose: that block's NotificationUpdateError handler
+            # is about failing to mark the notification sent, which is a real delivery
+            # outcome. Recording which template version rendered it is audit metadata, and it
+            # keeps its own failure handling inside the helper.
+            await self._record_used_template_version(notification, send_input, lock)
+
     async def create_notification(
         self,
         user_id: int | str | uuid.UUID,
@@ -3324,6 +3678,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
+        pin_template_versions: bool | None = None,
     ) -> Notification:
         """
         Create a notification and send it if it is due to be sent immediately.
@@ -3347,8 +3703,18 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
+            requested_template_version: int | None - which version of ``body_template`` to
+                render. An explicit value always wins. Left None, the version is pinned to
+                whatever is current now if this call (or the service) asks for pinning, and
+                otherwise stays None, meaning "whatever is current at send time".
+            pin_template_versions: bool | None - whether to pin this notification when no
+                version was named. None (the default) defers to the service's own setting;
+                True or False decides it for this call alone.
         """
         validated_attachments = self._validate_attachments(attachments or [])
+        resolved_template_version = self._resolve_template_version_to_pin(
+            notification_type, body_template, requested_template_version, pin_template_versions
+        )
 
         persist_kwargs: dict[str, Any] = {
             "user_id": user_id,
@@ -3369,6 +3735,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
+
+        # Only passed when there is a version to pin, the same courtesy the attachments
+        # keyword gets above: a backend that predates template versioning does not accept
+        # the keyword, and an unpinned notification must not be the thing that breaks it.
+        if resolved_template_version is not None:
+            persist_kwargs["requested_template_version"] = resolved_template_version
 
         notification = await self._execute_multi_backend_write(
             lambda backend: backend.persist_notification(**persist_kwargs),
@@ -3396,6 +3768,8 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
+        pin_template_versions: bool | None = None,
     ) -> OneOffNotification:
         """
         Create a one-off notification and send it if it is due to be sent immediately.
@@ -3421,9 +3795,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             attachments: list[AnyNotificationAttachment] | None - attachments to include
             tenant: str | None - the tenant this notification belongs to. Cannot be changed
                 after creation -- see ``update_notification``.
+            requested_template_version: int | None - which version of ``body_template`` to
+                render. Behaves exactly as it does on ``create_notification``.
+            pin_template_versions: bool | None - whether to pin this notification when no
+                version was named. Behaves exactly as it does on ``create_notification``.
         """
         validate_email_or_phone(email_or_phone)
         validated_attachments = self._validate_attachments(attachments or [])
+        resolved_template_version = self._resolve_template_version_to_pin(
+            notification_type, body_template, requested_template_version, pin_template_versions
+        )
 
         persist_kwargs: dict[str, Any] = {
             "email_or_phone": email_or_phone,
@@ -3445,6 +3826,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if tenant is not None:
             persist_kwargs["tenant"] = tenant
 
+        # Only passed when there is a version to pin, the same courtesy the attachments
+        # keyword gets above: a backend that predates template versioning does not accept
+        # the keyword, and an unpinned notification must not be the thing that breaks it.
+        if resolved_template_version is not None:
+            persist_kwargs["requested_template_version"] = resolved_template_version
+
         notification = await self._execute_multi_backend_write(
             lambda backend: backend.persist_one_off_notification(**persist_kwargs),
             self._replicate_snapshot_fallback,
@@ -3458,6 +3845,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
     async def update_notification(
         self,
         notification_id: int | str | uuid.UUID,
+        pin_template_versions: bool | None = None,
         **kwargs: Unpack[UpdateNotificationKwargs],
     ) -> Notification | OneOffNotification:
         """
@@ -3469,13 +3857,24 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             * GitCommitShaReassignmentError if ``git_commit_sha`` is present in kwargs --
               it is system-managed and only ever written by AsyncIONotificationService at
               send time.
+            * UsedTemplateVersionReassignmentError if ``used_template_version`` is present in
+              kwargs -- it is system-managed the same way. Pass
+              ``requested_template_version`` to change which version renders.
             * NotificationContextGenerationError if the context generation fails;
             * NotificationSendError if the adapter fails to send the notification.
             * NotificationMarkFailedError if the notification fails to be marked as failed.
             * NotificationMarkSentError if the notification fails to be marked as sent.
+            * UnconfirmedNotificationUpdateError if the backend could not tell whether the
+              write applied -- it may or may not have landed, so re-read the notification
+              instead of assuming either outcome.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to update
+            pin_template_versions: bool | None - whether an update that repoints this
+                notification at another template should pin it to that template's current
+                version. None (the default) defers to the service's own setting. Named
+                explicitly rather than left to ``**kwargs`` because it is a decision about
+                the update, not a field to write.
             **kwargs: UpdateNotificationKwargs - the fields to update
         """
         if "tenant" in kwargs:
@@ -3484,6 +3883,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             raise GitCommitShaReassignmentError(
                 "A notification's git_commit_sha is system-managed and cannot be set directly"
             )
+        if "used_template_version" in kwargs:
+            raise UsedTemplateVersionReassignmentError(
+                "A notification's used_template_version is system-managed and cannot be set "
+                "directly; set requested_template_version instead"
+            )
+        await self._pin_template_version_on_update(notification_id, kwargs, pin_template_versions)
         notification = await self._execute_multi_backend_write(
             lambda backend: backend.persist_notification_update(
                 notification_id=notification_id,
@@ -3704,6 +4109,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         This method may raise the following exceptions:
             * NotificationUpdateError if the notification fails to be marked as read.
+            * UnconfirmedNotificationUpdateError if the backend could not tell whether the
+              write applied -- it may or may not have landed, so re-read the notification
+              instead of assuming either outcome.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the notification to mark as read
@@ -4044,6 +4452,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         """
         Cancel a notification.
 
+        This method may raise the following exceptions:
+            * NotificationCancelError if the notification could not be cancelled -- it is
+              already sent, already cancelled, or no longer there.
+            * UnconfirmedNotificationUpdateError if the backend could not tell whether the
+              write applied -- it may or may not have landed, so re-read the notification
+              instead of assuming either outcome.
+
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to cancel
         """
@@ -4153,7 +4568,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                     return
 
             try:
-                await adapter.send(notification=notification, context=context)
+                send_input = await adapter.send(notification=notification, context=context)
             except Exception as adapter_error:  # noqa: BLE001
                 send_error = NotificationSendError("Failed to send notification")
                 logger.exception("Failed to send notification %s", notification_id)
@@ -4187,6 +4602,12 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 logger.exception("Failed to mark notification %s as sent", notification_id)
                 if self.raise_on_failed_send:
                     raise NotificationMarkSentError("Failed to mark notification as sent") from e
+
+            # Outside the try above on purpose: that block's NotificationUpdateError handler
+            # is about failing to mark the notification sent, which is a real delivery
+            # outcome. Recording which template version rendered it is audit metadata, and it
+            # keeps its own failure handling inside the helper.
+            await self._record_used_template_version(notification, send_input)
 
         if not background_adapter_found:
             logger.error(

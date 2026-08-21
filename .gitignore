@@ -11,6 +11,11 @@ __pycache__/
 
 # coverage result
 .coverage
+.coverage.*
+coverage.xml
+coverage-*.xml
+coverage.json
+htmlcov/
 /coverage/
 
 # pycharm
@@ -52,3 +57,7 @@ notifications.json
 
 # vinta-ai-workflows / implement-plan working notes
 .vinta-ai-workflows/
+
+# Scratch state from scripts/prepare_release.py; never commit it.
+.release-prep-backup/
+.release-prep-logs/

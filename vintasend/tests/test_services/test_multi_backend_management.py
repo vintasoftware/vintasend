@@ -589,6 +589,13 @@ class SyncComparableFieldsPinTestCase(TestCase):
             "read_at",
             "tenant",
             "git_commit_sha",
+            # Both hold comparable content, so they belong here rather than in
+            # _VOLATILE_NOTIFICATION_SYNC_FIELDS: requested_template_version is written by
+            # the same create/update write that fans out to every backend, and
+            # used_template_version is written to all of them together at send time. A
+            # backend disagreeing on either really is replication drift.
+            "requested_template_version",
+            "used_template_version",
         )
 
     def test_one_off_notification_comparable_fields_are_pinned(self):
@@ -613,4 +620,11 @@ class SyncComparableFieldsPinTestCase(TestCase):
             "read_at",
             "tenant",
             "git_commit_sha",
+            # Both hold comparable content, so they belong here rather than in
+            # _VOLATILE_NOTIFICATION_SYNC_FIELDS: requested_template_version is written by
+            # the same create/update write that fans out to every backend, and
+            # used_template_version is written to all of them together at send time. A
+            # backend disagreeing on either really is replication drift.
+            "requested_template_version",
+            "used_template_version",
         )

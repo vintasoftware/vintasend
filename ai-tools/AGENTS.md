@@ -146,7 +146,7 @@ where `B` is the backend type and `T` the renderer type — and accept either li
 import strings, which is what the `@overload`-ed `__init__` is for.
 
 **Optional does not mean unversioned.** The rules below apply to all seven: each optional seam has
-downstream implementers too (`vintasend-s3-attachments` implements the attachment manager), so
+downstream implementers too (`vintasend-aws-s3-attachments` implements the attachment manager), so
 adding an `@abstractmethod` to one breaks them exactly the same way.
 
 **Changing a seam is a breaking change.** Every `vintasend-*` package implements these classes, and
@@ -341,7 +341,26 @@ linked here as a git submodule so one checkout holds every package that has to s
 | `vintasend-fastapi-mail` | `implementations/vintasend-fastapi-mail` | AsyncIO email adapter |
 | `vintasend-flask-mail` | `implementations/vintasend-flask-mail` | sync email adapter |
 | `vintasend-jinja` | `implementations/vintasend-jinja` | Jinja2 template renderer |
-| `vintasend-s3-attachments` | `implementations/vintasend-s3-attachments` | attachment manager (AWS S3 via boto3, sync and AsyncIO) |
+| `vintasend-aws-s3-attachments` | `implementations/vintasend-aws-s3-attachments` | attachment manager (AWS S3 via boto3, sync and AsyncIO) |
+| `vintasend-managed-templates` | `implementations/vintasend-managed-templates` | database-backed template management: its own `BaseTemplateManagerBackend` seam plus renderers that wrap a real renderer |
+| `vintasend-django-templates-manager` | `implementations/vintasend-django-templates-manager` | Django ORM implementation of `vintasend-managed-templates`' manager backend |
+
+Two of these sit at a different layer from the rest and are worth calling out:
+
+- **`vintasend-managed-templates` defines a seam of its own**, `BaseTemplateManagerBackend`, which is
+  *not* one of this repo's seven. It moves template bodies out of files and into a data store, with
+  versioning and a `draft` / `active` / `inactive` / `archived` lifecycle. Its
+  `ManagedTemplateRenderer` is a renderer that **composes** another
+  `BaseNotificationTemplateRenderer` — it fetches the stored template and delegates to
+  `render_from_template_content`, so `body_template` on a notification holds a managed template key
+  rather than a path. That method is part of this repo's renderer contract, so a change to
+  `notification_template_renderers/base.py` (or the templated email / SMS subclasses) hits this
+  package first.
+- **`vintasend-django-templates-manager` implements that seam, not one of ours**, using Django
+  models. It also depends on `vintasend-managed-templates` by relative path
+  (`{path = "../vintasend-managed-templates", develop = true}` in its `pyproject.toml`), which is
+  the one place in this checkout where one submodule depends on another — so a breaking change in
+  `vintasend-managed-templates` needs both repos released together.
 
 Run `git submodule update --init` if `implementations/` is empty.
 
@@ -370,7 +389,7 @@ When a change to this repo affects them:
 
 1. Work out which packages are affected. Backend seam changes hit `vintasend-django` and
    `vintasend-sqlalchemy`; adapter changes hit the four adapter packages; renderer changes hit
-   `vintasend-django` and `vintasend-jinja`.
+   `vintasend-django`, `vintasend-jinja` and `vintasend-managed-templates`.
 2. State the impact in the PR body — which packages, and whether the change is source-compatible.
 3. If implementers must change code (a new `@abstractmethod`, or any rename / removal), each
    affected package needs a matching release that widens its `vintasend` constraint. Land this

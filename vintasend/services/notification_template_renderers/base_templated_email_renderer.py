@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from vintasend.services.notification_template_renderers.base import (
     BaseNotificationTemplateRenderer,
     NotificationSendInput,
+    TemplateContent,
 )
 
 
@@ -23,10 +24,14 @@ class TemplatedEmail(NotificationSendInput):
     # Optional: populated by renderers that render a preheader too. Defaults to None so
     # existing ``render`` implementations that never set it keep working unchanged.
     preheader: str | None = None
+    # Which template version produced this, for a renderer whose templates are versioned.
+    # See ``NotificationSendInput.template_version``; declared here as well so a renderer
+    # that knows the version up front can pass it to the constructor.
+    template_version: int | None = None
 
 
 @dataclass
-class EmailTemplateContent:
+class EmailTemplateContent(TemplateContent):
     """A historical subject/body (and optional preheader) template pair, supplied by the
     caller rather than looked up from a notification's stored template reference.
 
@@ -40,7 +45,7 @@ class EmailTemplateContent:
     preheader_template: str | None = None
 
 
-class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer):
+class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer[EmailTemplateContent]):
     @abstractmethod
     def render(
         self,
@@ -56,22 +61,4 @@ class BaseTemplatedEmailRenderer(BaseNotificationTemplateRenderer):
         template_content: EmailTemplateContent,
         context: "NotificationContextDict",
         **kwargs,
-    ) -> TemplatedEmail:
-        """
-        Render an email from supplied template content instead of the notification's stored
-        template reference.
-
-        Unlike ``render``, which looks up the notification's ``subject_template`` /
-        ``body_template`` (and ``preheader_template``) to locate a template, this renders the
-        given ``template_content`` directly -- typically an older template pair paired with a
-        notification's stored ``context_used``, to reproduce how it rendered in the past.
-
-        :param notification: The notification the render is performed on behalf of. Only its
-            non-template fields (e.g. attachments) are consulted; its stored templates are
-            ignored in favor of ``template_content``.
-        :param template_content: The historical subject/body (and optional preheader) template
-            content to render.
-        :param context: The context to render with, verbatim -- typically a notification's
-            stored ``context_used``. No context generation happens here.
-        :return: The rendered email.
-        """
+    ) -> TemplatedEmail: ...

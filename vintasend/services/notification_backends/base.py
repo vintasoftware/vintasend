@@ -9,6 +9,7 @@ from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
     AndFilter,
     DateRange,
+    MembershipValue,
     NotFilter,
     NotificationFilter,
     NotificationFilterFields,
@@ -18,8 +19,14 @@ from vintasend.services.notification_backends.filters import (
     OrFilter,
     StringFieldFilter,
     StringFilterLookup,
+    is_choice_member,
+    is_choice_wire_value,
+    is_date_range,
     is_field_filter,
+    is_membership_value,
+    is_sequence_filter,
     is_string_filter_lookup,
+    to_choice_member,
 )
 from vintasend.services.utils import get_class_path
 
@@ -44,6 +51,7 @@ __all__ = [
     "AndFilter",
     "BaseNotificationBackend",
     "DateRange",
+    "MembershipValue",
     "NotFilter",
     "NotificationFilter",
     "NotificationFilterFields",
@@ -53,8 +61,14 @@ __all__ = [
     "OrFilter",
     "StringFieldFilter",
     "StringFilterLookup",
+    "is_choice_member",
+    "is_choice_wire_value",
+    "is_date_range",
     "is_field_filter",
+    "is_membership_value",
+    "is_sequence_filter",
     "is_string_filter_lookup",
+    "to_choice_member",
 ]
 
 
@@ -116,6 +130,11 @@ class BaseNotificationBackend(ABC):
         adapter_extra_parameters: dict | None = None,
         attachments: list["AnyNotificationAttachment"] | None = None,
         tenant: str | None = None,
+        # Optional to accept only in the sense that a backend predating template versioning
+        # never receives it: NotificationService passes it solely when a version was pinned.
+        # A backend that stores it can answer "which version was this notification recorded
+        # against" without re-deriving it from a template store that has moved on since.
+        requested_template_version: int | None = None,
     ) -> "Notification": ...
 
     @abstractmethod
@@ -135,6 +154,11 @@ class BaseNotificationBackend(ABC):
         adapter_extra_parameters: dict | None = None,
         attachments: list["AnyNotificationAttachment"] | None = None,
         tenant: str | None = None,
+        # Optional to accept only in the sense that a backend predating template versioning
+        # never receives it: NotificationService passes it solely when a version was pinned.
+        # A backend that stores it can answer "which version was this notification recorded
+        # against" without re-deriving it from a template store that has moved on since.
+        requested_template_version: int | None = None,
     ) -> "OneOffNotification": ...
 
     @abstractmethod
@@ -422,6 +446,24 @@ class BaseNotificationBackend(ABC):
         ``git_commit_sha`` always arrives already normalized (40 lowercase hex characters).
         """
         ...
+
+    def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+    ) -> None:
+        """Persist which version of the template actually rendered this notification.
+
+        Called by NotificationService at send time, only when the renderer reported a version
+        and it differs from what is already stored -- so an implementation need not
+        deduplicate writes itself.
+
+        Concrete (not abstract) and a no-op on purpose, unlike ``store_git_commit_sha``: a
+        backend with no column for it inherits this and keeps working, which is what lets the
+        field be added without a major version. The cost of not overriding it is only that
+        ``used_template_version`` stays None on the records that backend holds.
+        """
+        return None
 
     def inject_attachment_manager(self, manager: "BaseAttachmentManager") -> None:
         """Store the attachment manager the service resolved for this backend.

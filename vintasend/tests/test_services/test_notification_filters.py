@@ -19,9 +19,16 @@ from vintasend.services.notification_adapters.stubs.fake_adapter import (
 )
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
+    is_choice_member,
+    is_choice_wire_value,
+    is_date_range,
     is_field_filter,
+    is_membership_value,
+    is_sequence_filter,
     is_string_filter_lookup,
+    is_template_version_value,
     matches_filter,
+    to_choice_member,
 )
 from vintasend.services.notification_backends.stubs.fake_backend import (
     FakeAsyncIOFileBackend,
@@ -60,6 +67,8 @@ def _build_notification(
     modified: datetime.datetime | None = None,
     sent_at: datetime.datetime | None = None,
     read_at: datetime.datetime | None = None,
+    requested_template_version: int | None = None,
+    used_template_version: int | None = None,
 ) -> Notification:
     return Notification(
         id=notification_id,
@@ -79,6 +88,8 @@ def _build_notification(
         modified=modified,
         sent_at=sent_at,
         read_at=read_at,
+        requested_template_version=requested_template_version,
+        used_template_version=used_template_version,
     )
 
 
@@ -164,6 +175,48 @@ class MatchesFilterUnitTestCase(TestCase):
         assert matches_filter(self.email, {"tenant": "acme"}) is True
         assert matches_filter(self.email, {"tenant": ["acme", "other"]}) is True
         assert matches_filter(self.sms, {"tenant": "acme"}) is False
+
+    def test_template_version_fields(self):
+        pinned = _build_notification(
+            "n-pinned", requested_template_version=3, used_template_version=3
+        )
+
+        assert matches_filter(pinned, {"requested_template_version": 3}) is True
+        assert matches_filter(pinned, {"requested_template_version": 4}) is False
+        assert matches_filter(pinned, {"used_template_version": [2, 3]}) is True
+        assert matches_filter(pinned, {"used_template_version": [1, 2]}) is False
+
+    def test_the_two_version_fields_are_independent(self):
+        """An unpinned notification asked for nothing and still rendered something."""
+        unpinned = _build_notification("n-unpinned", used_template_version=7)
+
+        assert matches_filter(unpinned, {"used_template_version": 7}) is True
+        assert matches_filter(unpinned, {"requested_template_version": 7}) is False
+
+    def test_a_null_version_never_matches_positively(self):
+        """Same NULL semantics as every other field: no version is not version zero."""
+        versionless = _build_notification("n-versionless")
+
+        assert matches_filter(versionless, {"requested_template_version": 1}) is False
+        assert matches_filter(versionless, {"used_template_version": 1}) is False
+
+    def test_a_null_version_is_included_under_negation(self):
+        versionless = _build_notification("n-versionless")
+
+        assert matches_filter(versionless, {"not": {"used_template_version": 1}}) is True
+
+    def test_a_version_candidate_that_is_not_an_int_rejects_the_whole_leaf(self):
+        """``["3"]`` is a malformed filter, not a request for version 3."""
+        pinned = _build_notification("n-pinned", requested_template_version=3)
+
+        assert matches_filter(pinned, {"requested_template_version": "3"}) is False
+        assert matches_filter(pinned, {"requested_template_version": [3, "4"]}) is False
+        assert matches_filter(pinned, {"requested_template_version": True}) is False
+
+    def test_an_empty_version_list_matches_nothing(self):
+        pinned = _build_notification("n-pinned", requested_template_version=3)
+
+        assert matches_filter(pinned, {"requested_template_version": []}) is False
 
     def test_implicit_and_across_keys(self):
         assert matches_filter(
@@ -277,6 +330,33 @@ class MatchesFilterUnitTestCase(TestCase):
         assert matches_filter(self.sms, {"sent_at_range": {"from": _dt(1)}}) is False
         assert matches_filter(self.sms, {"read_at_range": {"to": _dt(30)}}) is False
 
+    # --- malformed values ---------------------------------------------------
+
+    def test_unknown_choice_value_never_matches(self):
+        assert matches_filter(self.email, {"status": "BOGUS"}) is False
+        # One bad candidate rejects the whole leaf, it does not degrade to the good ones.
+        mixed = {"status": [NotificationStatus.SENT.value, "BOGUS"]}
+        assert matches_filter(self.email, mixed) is False
+        # A member of an unrelated enum is not a status either.
+        assert matches_filter(self.email, {"status": NotificationTypes.EMAIL}) is False
+
+    def test_malformed_string_lookup_never_matches(self):
+        # A lookup with no needle would match every row, so it is rejected instead.
+        assert matches_filter(self.email, {"body_template": {"lookup": "includes"}}) is False
+        assert (
+            matches_filter(self.email, {"body_template": {"lookup": "regex", "value": "Welcome"}})
+            is False
+        )
+
+    def test_malformed_date_range_never_matches(self):
+        assert matches_filter(self.email, {"send_after_range": {"to": "2026-01-11"}}) is False
+        # A typo'd bound would otherwise leave the range unbounded and match everything.
+        assert matches_filter(self.email, {"send_after_range": {"form": _dt(1)}}) is False
+
+    def test_unbounded_range_matches_any_non_null_value(self):
+        assert matches_filter(self.email, {"sent_at_range": {}}) is True
+        assert matches_filter(self.sms, {"sent_at_range": {}}) is False
+
     # --- logical operators --------------------------------------------------
 
     def test_and_operator(self):
@@ -331,6 +411,57 @@ class MatchesFilterUnitTestCase(TestCase):
     def test_is_string_filter_lookup(self):
         assert is_string_filter_lookup({"lookup": "exact", "value": "x"}) is True
         assert is_string_filter_lookup("bare string") is False
+        # ``lookup`` and ``case_sensitive`` are optional and default to a case-sensitive exact.
+        assert is_string_filter_lookup({"value": "x"}) is True
+
+    def test_is_string_filter_lookup_rejects_unusable_lookups(self):
+        assert is_string_filter_lookup({"lookup": "includes"}) is False  # no needle
+        assert is_string_filter_lookup({"lookup": "regex", "value": "x"}) is False
+        assert is_string_filter_lookup({"value": 1}) is False
+        assert is_string_filter_lookup({"value": "x", "case_sensitive": "yes"}) is False
+        # A misspelled key would silently keep the default it meant to override.
+        assert is_string_filter_lookup({"value": "x", "case_sensitve": False}) is False
+
+    def test_is_date_range(self):
+        assert is_date_range({"from": _dt(1), "to": _dt(2)}) is True
+        assert is_date_range({}) is True
+        assert is_date_range({"to": "2026-01-01"}) is False
+        assert is_date_range({"form": _dt(1)}) is False
+        assert is_date_range("2026-01-01") is False
+
+    def test_is_membership_value(self):
+        assert is_membership_value("acme") is True
+        assert is_membership_value(1) is True
+        assert is_membership_value(uuid.uuid4()) is True
+        assert is_membership_value(True) is False
+        assert is_membership_value(["acme"]) is False
+
+    def test_is_template_version_value(self):
+        assert is_template_version_value(3) is True
+        assert is_template_version_value(0) is True
+        # Stricter than ``is_membership_value``: these columns are integers.
+        assert is_template_version_value("3") is False
+        assert is_template_version_value(3.0) is False
+        assert is_template_version_value(True) is False
+        assert is_template_version_value(None) is False
+        assert is_template_version_value([3]) is False
+
+    def test_is_sequence_filter(self):
+        assert is_sequence_filter(["a"]) is True
+        assert is_sequence_filter(("a",)) is True
+        assert is_sequence_filter({"a"}) is True
+        assert is_sequence_filter("a") is False
+
+    def test_choice_guards_and_coercion(self):
+        assert is_choice_member(NotificationStatus.SENT, NotificationStatus) is True
+        assert is_choice_member(NotificationTypes.EMAIL, NotificationStatus) is False
+        assert is_choice_wire_value("SENT", NotificationStatus) is True
+        assert is_choice_wire_value("BOGUS", NotificationStatus) is False
+        assert to_choice_member("SENT", NotificationStatus) is NotificationStatus.SENT
+        assert (
+            to_choice_member(NotificationStatus.SENT, NotificationStatus) is NotificationStatus.SENT
+        )
+        assert to_choice_member(NotificationTypes.EMAIL, NotificationStatus) is None
 
 
 class FilterNotificationsBackendTestCase(TestCase):

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from vintasend.services.notification_template_renderers.base import (
     BaseNotificationTemplateRenderer,
     NotificationSendInput,
+    TemplateContent,
 )
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     BaseTemplatedEmailRenderer,
@@ -40,6 +41,19 @@ class ImplementationTemplateTemplateRenderer(BaseNotificationTemplateRenderer):
         """TODO: implement render — see vintasend/services/notification_template_renderers/base.py for the contract."""
         raise NotImplementedError(
             "TODO: implement render — see "
+            "vintasend/services/notification_template_renderers/base.py for the contract"
+        )
+
+    def render_from_template_content(
+        self,
+        notification: "Notification | OneOffNotification",
+        template_content: TemplateContent,
+        context: "NotificationContextDict",
+        **kwargs,
+    ) -> NotificationSendInput:
+        """TODO: implement render_from_template_content — see vintasend/services/notification_template_renderers/base.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement render_from_template_content — see "
             "vintasend/services/notification_template_renderers/base.py for the contract"
         )
 
@@ -84,6 +98,20 @@ class ImplementationTemplateSMSRenderer(BaseTemplatedSMSRenderer):
         """TODO: implement render — see vintasend/services/notification_template_renderers/base_templated_sms_renderer.py for the contract."""
         raise NotImplementedError(
             "TODO: implement render — see "
+            "vintasend/services/notification_template_renderers/base_templated_sms_renderer.py "
+            "for the contract"
+        )
+
+    def render_from_template_content(
+        self,
+        notification: "Notification | OneOffNotification",
+        template_content: str,
+        context: "NotificationContextDict",
+        **kwargs,
+    ) -> TemplatedSMS:
+        """TODO: implement render_from_template_content — see vintasend/services/notification_template_renderers/base_templated_sms_renderer.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement render_from_template_content — see "
             "vintasend/services/notification_template_renderers/base_templated_sms_renderer.py "
             "for the contract"
         )

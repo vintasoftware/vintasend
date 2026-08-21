@@ -10,6 +10,7 @@ from vintasend.services.notification_adapters.asyncio_base import AsyncIOBaseNot
 from vintasend.services.notification_adapters.base import BaseNotificationAdapter
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_template_renderers.base import NotificationSendInput
 from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
     BaseTemplatedEmailRenderer,
 )
@@ -40,8 +41,11 @@ class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
 
     def send(
         self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
-    ) -> None:
-        self.template_renderer.render(notification, context)
+    ) -> "NotificationSendInput":
+        # Returned rather than discarded, which is what lets the service record the template
+        # version the renderer reported. An adapter that drops it still delivers fine -- see
+        # BaseNotificationAdapter.send -- but then nothing downstream knows what rendered.
+        send_input = self.template_renderer.render(notification, context)
 
         # Capture attachment information for testing
         attachment_info = [
@@ -58,6 +62,7 @@ class FakeEmailAdapter(Generic[B, T], BaseNotificationAdapter[B, T]):
         ]
 
         self.sent_emails.append((notification, context, attachment_info))
+        return send_input
 
 
 BAIO = TypeVar("BAIO", bound=AsyncIOBaseNotificationBackend)
@@ -76,8 +81,9 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
 
     async def send(
         self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
-    ) -> None:
-        self.template_renderer.render(notification, context)
+    ) -> "NotificationSendInput":
+        # See the sync twin.
+        send_input = self.template_renderer.render(notification, context)
 
         # Capture attachment information for testing
         attachment_info = [
@@ -94,6 +100,7 @@ class FakeAsyncIOEmailAdapter(Generic[BAIO, T], AsyncIOBaseNotificationAdapter[B
         ]
 
         self.sent_emails.append((notification, context, attachment_info))
+        return send_input
 
 
 class FakeAsyncEmailAdapter(BackgroundNotificationAdapter, Generic[B, T], FakeEmailAdapter[B, T]):

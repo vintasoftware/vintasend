@@ -240,6 +240,20 @@ class Notification:
     # injected BaseGitCommitShaProvider. Never set on creation, and update_notification
     # rejects it in raw kwargs -- see GitCommitShaReassignmentError.
     git_commit_sha: str | None = None
+    # Which version of ``body_template`` this notification renders, when its renderer
+    # versions templates at all. ``None`` means "whatever is current at send time", which is
+    # how every notification behaved before pinning existed and how they still behave unless
+    # a version is passed on create/update or ``NotificationService`` was built with
+    # ``pin_template_versions=True``. Pinned, an edit to the template cannot change what this
+    # notification renders -- which is the point.
+    requested_template_version: int | None = None
+    # System-managed: what the renderer reported it actually used, written by
+    # NotificationService at send time from the adapter's returned send input. Reads the same
+    # as ``requested_template_version`` on a pinned notification, and tells you which version
+    # went out on an unpinned one -- the only record of that, since the template has moved on
+    # by the time anyone asks. update_notification rejects it in raw kwargs, the same as
+    # git_commit_sha -- see UsedTemplateVersionReassignmentError.
+    used_template_version: int | None = None
 
 
 @dataclass
@@ -270,6 +284,20 @@ class OneOffNotification:
     # injected BaseGitCommitShaProvider. Never set on creation, and update_notification
     # rejects it in raw kwargs -- see GitCommitShaReassignmentError.
     git_commit_sha: str | None = None
+    # Which version of ``body_template`` this notification renders, when its renderer
+    # versions templates at all. ``None`` means "whatever is current at send time", which is
+    # how every notification behaved before pinning existed and how they still behave unless
+    # a version is passed on create/update or ``NotificationService`` was built with
+    # ``pin_template_versions=True``. Pinned, an edit to the template cannot change what this
+    # notification renders -- which is the point.
+    requested_template_version: int | None = None
+    # System-managed: what the renderer reported it actually used, written by
+    # NotificationService at send time from the adapter's returned send input. Reads the same
+    # as ``requested_template_version`` on a pinned notification, and tells you which version
+    # went out on an unpinned one -- the only record of that, since the template has moved on
+    # by the time anyone asks. update_notification rejects it in raw kwargs, the same as
+    # git_commit_sha -- see UsedTemplateVersionReassignmentError.
+    used_template_version: int | None = None
 
 
 # Fields deliberately excluded from cross-backend sync comparison (see
@@ -405,6 +433,16 @@ class UpdateNotificationKwargs(TypedDict, total=False):
     # if it were already stored, which is wrong. Revisit this if an update-side upload flow is
     # ever added.
     attachments: list[StoredAttachment]
+    # Repointing a notification at a different version of its template, or pinning one that
+    # was floating. Settable here, unlike the two system-managed fields below, because which
+    # version a notification should render is the caller's call to make -- and an explicit
+    # value always wins over ``pin_template_versions``.
+    requested_template_version: int | None
+    # used_template_version is deliberately absent, for the same reason as git_commit_sha
+    # below: NotificationService writes it at send time from what the renderer reported,
+    # through the dedicated store_template_version backend method. update_notification
+    # raises UsedTemplateVersionReassignmentError if a caller passes it.
+    #
     # git_commit_sha is deliberately absent. It is system-managed: NotificationService
     # resolves and writes it at send time through an injected BaseGitCommitShaProvider via
     # the dedicated store_git_commit_sha backend method, never through

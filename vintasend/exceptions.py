@@ -18,6 +18,17 @@ class NotificationMarkSentError(NotificationUpdateError):
     pass
 
 
+class UnconfirmedNotificationUpdateError(NotificationUpdateError):
+    """Raised when a backend issued a write but cannot tell whether it applied, because the
+    affected-row count came back in a form it could not read.
+
+    Distinct from a plain ``NotificationUpdateError``, which means the write definitively did
+    not apply -- no row matched. Here the write may or may not have landed, so a caller that
+    needs to know should re-read the notification rather than assume either outcome. It
+    subclasses ``NotificationUpdateError`` so existing update handling still catches it; catch
+    this type specifically only when indeterminate and failed need to be told apart."""
+
+
 class NotificationCancelError(NotificationError):
     pass
 
@@ -107,6 +118,13 @@ class GitCommitShaReassignmentError(NotificationError):
     """Raised when an update attempts to set a notification's git_commit_sha. The field is
     system-managed -- only NotificationService writes it, at send time, through
     store_git_commit_sha."""
+
+
+class UsedTemplateVersionReassignmentError(NotificationError):
+    """Raised when an update attempts to set a notification's used_template_version. The
+    field is system-managed -- only NotificationService writes it, at send time, from the
+    version the renderer reported, through store_template_version. Set
+    ``requested_template_version`` instead to change which version a notification renders."""
 
 
 class BackendNotFoundError(NotificationError):

@@ -1,6 +1,6 @@
 [project]
 name = "vintasend"
-version = "2.0.0"
+version = "3.0.0"
 description = "A flexible package for implementing transactional notifications"
 authors = [{ name = "Hugo bessa", email = "hugo@vinta.com.br" }]
 license = "MIT"
@@ -17,8 +17,7 @@ include = [
 ]
 
 [tool.poetry.dependencies]
-typing-extensions = "^4.15.0"
-packaging = "^26.2"
+typing-extensions = ">=4.10.0"
 requests = "^2.34.2"
 
 
@@ -34,6 +33,7 @@ gevent = "^26.5.0"
 ruff = "^0.15.22"
 mypy = "^2.3.0"
 pre-commit = "^4.6.1"
+packaging = "^26.2"
 
 [build-system]
 requires = ["poetry-core"]
@@ -148,6 +148,10 @@ lines-after-imports = 2
 # Stubs are test doubles shipped for downstream implementers to test against:
 # same allowances as tests.
 "**/stubs/*" = ["S", "N802"]
+# `scripts/` holds release tooling run as `scripts/foo.py`, not an importable
+# package - sys.path[0] is scripts/ itself, so the shared `_packages` module is
+# imported without one. INP001 would ask for an __init__.py that buys nothing.
+"scripts/*" = ["INP001"]
 
 [tool.coverage.run]
 branch = true

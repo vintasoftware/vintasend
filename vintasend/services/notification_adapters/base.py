@@ -3,7 +3,10 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast, overload
 
 from vintasend.services.notification_backends.base import BaseNotificationBackend
-from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
+from vintasend.services.notification_template_renderers.base import (
+    BaseNotificationTemplateRenderer,
+    NotificationSendInput,
+)
 
 
 if TYPE_CHECKING:
@@ -110,12 +113,19 @@ class BaseNotificationAdapter(Generic[B, T], ABC):
     @abstractmethod
     def send(
         self, notification: "Notification | OneOffNotification", context: "NotificationContextDict"
-    ) -> None:
+    ) -> "NotificationSendInput | None":
         """
         Send the notification to the user.
 
+        Return what the template renderer produced, so the service can record which template
+        version actually went out (``NotificationSendInput.template_version``). Returning
+        ``None`` is entirely fine and is what every adapter written before this did -- the
+        service then records nothing, and delivery is unaffected either way. There is nothing
+        to gain by returning it unless the renderer versions its templates.
+
         :param notification: The notification to send.
         :param context: The context to render the notification templates.
+        :return: the rendered send input, or None.
         """
 
     @property

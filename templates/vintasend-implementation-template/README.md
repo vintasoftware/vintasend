@@ -158,9 +158,11 @@ email renderer, or look at `vintasend-jinja`'s implementation.
 
 ```checklist
 BaseNotificationTemplateRenderer.render
+BaseNotificationTemplateRenderer.render_from_template_content
 BaseTemplatedEmailRenderer.render
 BaseTemplatedEmailRenderer.render_from_template_content
 BaseTemplatedSMSRenderer.render
+BaseTemplatedSMSRenderer.render_from_template_content
 ```
 
 Connected by passing it into your adapter — a renderer has no setting of its own;

@@ -32,67 +32,48 @@ jobs:
       - name: Run tests
         run: poetry run tox
 
-  # Make sure tests pass before publishing
-  check-tests:
-    name: Check that tests pass
-    runs-on: ubuntu-latest
-    needs: test-before-publish
-    steps:
-      - name: Tests passed
-        run: echo "All tests passed successfully"
-
-  # Publish only after tests pass
+  # Publishes only after every matrix job above is green: a failed `needs` job
+  # skips this one.
   publish-release:
     name: Publish release
-    needs: [test-before-publish, check-tests]
+    needs: test-before-publish
     runs-on: ubuntu-latest
-    if: ${{ needs.test-before-publish.result == 'success' }}
+
+    # The PyPI trusted publisher is configured against this environment, so the
+    # name has to stay in sync with the publisher registered on PyPI.
+    environment: pypi
 
     permissions:
-      contents: write  # Needed to create GitHub releases
-      id-token: write  # Needed for trusted publishing to PyPI
+      # Lets the job mint the short-lived OIDC token that PyPI exchanges for an
+      # upload token. Trusted publishing stores no API token anywhere.
+      id-token: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Fetch full history for proper version detection
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"  # Use a stable Python version for publishing
+          python-version: "3.13"  # Stable version used just to build the dists
 
       - name: Install Poetry
         uses: snok/install-poetry@v1
         with:
           version: latest
-          virtualenvs-create: true
-          virtualenvs-in-project: true
 
-      - name: Cache Poetry dependencies
-        uses: actions/cache@v4
-        with:
-          path: .venv
-          key: poetry-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
-
-      - name: Install dependencies
-        run: poetry install --only=main
-
+      # `poetry build` reads pyproject.toml directly, so the project's own
+      # dependencies never need installing here.
       - name: Build package
         run: poetry build
 
       - name: Verify package contents
         run: |
-          # List the built packages
           ls -la dist/
-          # Check package contents
-          poetry run pip install twine
-          poetry run twine check dist/*
+          pipx run twine check dist/*
 
+      # Poetry has no OIDC support of its own (python-poetry/poetry#7940), so the
+      # token exchange for the trusted publisher runs through this action. It
+      # uploads everything in dist/.
       - name: Publish to PyPI
-        env:
-          POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          poetry config pypi-token.pypi $POETRY_PYPI_TOKEN_PYPI
-          poetry publish
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -336,6 +336,7 @@ class FakeFileBackend(BaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> Notification:
         notification_id = str(uuid.uuid4())
         stored_attachments = self._store_attachments(attachments or [], notification_id)
@@ -358,6 +359,7 @@ class FakeFileBackend(BaseNotificationBackend):
             tenant=tenant,
             created=now,
             modified=now,
+            requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -551,6 +553,7 @@ class FakeFileBackend(BaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> OneOffNotification:
         notification_id = uuid.uuid4()
         stored_attachments = self._store_attachments(attachments or [], notification_id)
@@ -575,6 +578,7 @@ class FakeFileBackend(BaseNotificationBackend):
             tenant=tenant,
             created=now,
             modified=now,
+            requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
         self._store_notifications()
@@ -776,6 +780,18 @@ class FakeFileBackend(BaseNotificationBackend):
     ) -> None:
         notification = self.get_notification(notification_id)
         notification.git_commit_sha = git_commit_sha
+        self._store_notifications()
+
+    def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+    ) -> None:
+        # Overridden rather than inherited: the base's default is a no-op so that a backend
+        # with nowhere to put this keeps working, and a reference implementation that took
+        # that default would quietly prove nothing.
+        notification = self.get_notification(notification_id)
+        notification.used_template_version = template_version
         self._store_notifications()
 
     def apply_replication_snapshot_if_newer(
@@ -1269,6 +1285,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
     ) -> Notification:
         notification_id = str(uuid.uuid4())
@@ -1292,6 +1309,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             tenant=tenant,
             created=now,
             modified=now,
+            requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -1313,6 +1331,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
     ) -> OneOffNotification:
         notification_id = uuid.uuid4()
@@ -1338,6 +1357,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             tenant=tenant,
             created=now,
             modified=now,
+            requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
         await self._store_notifications(lock)
@@ -1543,6 +1563,17 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     ) -> None:
         notification = await self.get_notification(notification_id)
         notification.git_commit_sha = git_commit_sha
+        await self._store_notifications(lock)
+
+    async def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        # See the sync twin: overridden on purpose, so the send path is exercised end to end.
+        notification = await self.get_notification(notification_id)
+        notification.used_template_version = template_version
         await self._store_notifications(lock)
 
     async def apply_replication_snapshot_if_newer(

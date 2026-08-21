@@ -16,12 +16,21 @@
 [submodule "implementations/vintasend-jinja"]
 	path = implementations/vintasend-jinja
 	url = git@github.com:vintasoftware/vintasend-jinja.git
-[submodule "implementations/vintasend-s3-attachments"]
-	path = implementations/vintasend-s3-attachments
-	url = git@github.com:vintasoftware/vintasend-s3-attachments.git
+[submodule "implementations/vintasend-aws-s3-attachments"]
+	path = implementations/vintasend-aws-s3-attachments
+	url = git@github.com:vintasoftware/vintasend-aws-s3-attachments.git
+[submodule "implementations/vintasend-managed-templates"]
+	path = implementations/vintasend-managed-templates
+	url = git@github.com:vintasoftware/vintasend-managed-templates.git
+[submodule "implementations/vintasend-django-templates-manager"]
+	path = implementations/vintasend-django-templates-manager
+	url = git@github.com:vintasoftware/vintasend-django-templates-manager.git
 [submodule "tools/vintasend-api"]
 	path = tools/vintasend-api
 	url = git@github.com:vintasoftware/vintasend-api.git
 [submodule "tools/vintasend-dashboard"]
 	path = tools/vintasend-dashboard
 	url = git@github.com:vintasoftware/vintasend-dashboard.git
+[submodule "tools/vintasend-templates-management-api"]
+	path = tools/vintasend-templates-management-api
+	url = git@github.com:vintasoftware/vintasend-templates-management-api.git

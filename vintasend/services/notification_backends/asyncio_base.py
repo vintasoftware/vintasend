@@ -79,6 +79,11 @@ class AsyncIOBaseNotificationBackend(ABC):
         adapter_extra_parameters: dict | None = None,
         attachments: list["AnyNotificationAttachment"] | None = None,
         tenant: str | None = None,
+        # Optional to accept only in the sense that a backend predating template versioning
+        # never receives it: NotificationService passes it solely when a version was pinned.
+        # A backend that stores it can answer "which version was this notification recorded
+        # against" without re-deriving it from a template store that has moved on since.
+        requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
     ) -> "Notification": ...
 
@@ -99,6 +104,11 @@ class AsyncIOBaseNotificationBackend(ABC):
         adapter_extra_parameters: dict | None = None,
         attachments: list["AnyNotificationAttachment"] | None = None,
         tenant: str | None = None,
+        # Optional to accept only in the sense that a backend predating template versioning
+        # never receives it: NotificationService passes it solely when a version was pinned.
+        # A backend that stores it can answer "which version was this notification recorded
+        # against" without re-deriving it from a template store that has moved on since.
+        requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
     ) -> "OneOffNotification": ...
 
@@ -403,6 +413,25 @@ class AsyncIOBaseNotificationBackend(ABC):
         hex characters).
         """
         ...
+
+    async def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        """Persist which version of the template actually rendered this notification.
+
+        Called by AsyncIONotificationService at send time, only when the renderer reported a
+        version and it differs from what is already stored -- so an implementation need not
+        deduplicate writes itself.
+
+        Concrete (not abstract) and a no-op on purpose, unlike ``store_git_commit_sha``: a
+        backend with no column for it inherits this and keeps working, which is what lets the
+        field be added without a major version. The cost of not overriding it is only that
+        ``used_template_version`` stays None on the records that backend holds.
+        """
+        return None
 
     def inject_attachment_manager(self, manager: "AsyncIOBaseAttachmentManager") -> None:
         """Store the attachment manager the service resolved for this backend.

@@ -32,13 +32,22 @@ Date-range bounds are **inclusive on both ends** (``from`` maps to ``>=``, ``to`
 ``<=``). Case sensitivity for string lookups defaults to **case-sensitive** when
 ``case_sensitive`` is absent; a bare ``str`` for a string field means a case-sensitive
 ``exact`` match.
+
+A value that does not fit the shape its field declares -- a lookup with no ``value``, a range
+bound that is not a ``datetime``, a status the enum does not define -- matches no notification,
+and so matches every notification under ``not``. The ``is_*`` type guards exported here are what
+decides that, and they are the reason the guards are public: a backend translating the same
+filter into SQL validates with them and therefore accepts and rejects exactly what this
+evaluator does. They are also where a ``TypedDict`` declared ``total=False`` for the sake of
+JSON payloads is actually checked.
 """
 
 import datetime
 import functools
 import uuid
+from collections.abc import Collection
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, TypeAlias, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Literal, TypeAlias, TypedDict, TypeGuard, TypeVar
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 
@@ -51,6 +60,7 @@ __all__ = [
     "DEFAULT_BACKEND_FILTER_CAPABILITIES",
     "AndFilter",
     "DateRange",
+    "MembershipValue",
     "NotFilter",
     "NotificationFilter",
     "NotificationFilterFields",
@@ -60,10 +70,17 @@ __all__ = [
     "OrFilter",
     "StringFieldFilter",
     "StringFilterLookup",
+    "is_choice_member",
+    "is_choice_wire_value",
+    "is_date_range",
     "is_field_filter",
+    "is_membership_value",
+    "is_sequence_filter",
     "is_string_filter_lookup",
+    "is_template_version_value",
     "matches_filter",
     "sort_notifications",
+    "to_choice_member",
 ]
 
 
@@ -74,12 +91,13 @@ DateRange = TypedDict(
 )
 
 
-class StringFilterLookup(TypedDict, total=False):
-    # ``lookup`` and ``value`` are required in practice; ``total=False`` only because a JSON
-    # payload might omit them and we validate at evaluation time rather than at typing time.
+class _StringFilterLookupOptional(TypedDict, total=False):
+    case_sensitive: bool
+
+
+class StringFilterLookup(_StringFilterLookupOptional):
     lookup: Literal["exact", "starts_with", "ends_with", "includes"]
     value: str
-    case_sensitive: bool
 
 
 StringFieldFilter: TypeAlias = str | StringFilterLookup
@@ -107,6 +125,14 @@ class NotificationFilterFields(TypedDict, total=False):
     created_at_range: DateRange
     sent_at_range: DateRange
     read_at_range: DateRange
+    # Which template version a notification asked for, and which one it actually rendered.
+    # Scalar or list, like the other membership fields, but the candidates must be real
+    # ``int``s -- see ``is_template_version_value``. Both are ``None`` on a notification whose
+    # renderer does not version templates, and ``used_template_version`` is ``None`` until it
+    # has been sent; under this module's NULL semantics such a row never matches a positive
+    # filter on either field and is included under negation.
+    requested_template_version: int | list[int]
+    used_template_version: int | list[int]
 
 
 # ``and`` / ``or`` / ``not`` are Python keywords, so these single-key groups can only be
@@ -142,6 +168,8 @@ DEFAULT_BACKEND_FILTER_CAPABILITIES: dict[str, bool] = {
     "fields.subjectTemplate": True,
     "fields.contextName": True,
     "fields.tenant": True,
+    "fields.requestedTemplateVersion": True,
+    "fields.usedTemplateVersion": True,
     "fields.sendAfterRange": True,
     "fields.createdAtRange": True,
     "fields.sentAtRange": True,
@@ -201,15 +229,39 @@ DEFAULT_BACKEND_FILTER_CAPABILITIES: dict[str, bool] = {
 }
 
 
+ChoiceType = TypeVar("ChoiceType", bound=Enum)
+
+# Scalars a membership field can be compared against. ``user_id`` may be an ``int``, a ``str``
+# or a ``uuid.UUID``; ``adapter_used`` and ``tenant`` are plain strings.
+MembershipValue: TypeAlias = str | int | uuid.UUID
+
 _LOGICAL_KEYS = ("and", "or", "not")
+_STRING_LOOKUP_KEYS = frozenset({"lookup", "value", "case_sensitive"})
+_STRING_LOOKUPS = frozenset({"exact", "starts_with", "ends_with", "includes"})
+_DATE_RANGE_KEYS = frozenset({"from", "to"})
 
 # String-lookup fields evaluate against the same-named attribute on the notification.
 _STRING_LOOKUP_FIELDS = frozenset({"body_template", "subject_template", "context_name"})
 
+# Enum-backed fields, mapped to the notification attribute they read and the ``Enum`` that
+# defines their vocabulary. Kept apart from plain membership because a candidate is only a
+# candidate if it names a real member -- see ``to_choice_member``.
+_CHOICE_FIELDS: dict[str, tuple[str, type[Enum]]] = {
+    "status": ("status", NotificationStatus),
+    "notification_type": ("notification_type", NotificationTypes),
+}
+
+# Integer membership fields, mapped to the notification attribute they read. Kept apart from
+# plain membership because these compare as ``int``s rather than through ``_scalar``'s string
+# normalization: ``user_id`` legitimately arrives as an ``int``, a ``str`` or a ``uuid`` for the
+# same row, whereas a template version is only ever an ``int``.
+_VERSION_FIELDS: dict[str, str] = {
+    "requested_template_version": "requested_template_version",
+    "used_template_version": "used_template_version",
+}
+
 # Scalar-or-list membership fields, mapped to the notification attribute they read.
 _MEMBERSHIP_FIELDS: dict[str, str] = {
-    "status": "status",
-    "notification_type": "notification_type",
     "adapter_used": "adapter_used",
     "user_id": "user_id",
     "tenant": "tenant",
@@ -240,9 +292,97 @@ def is_field_filter(filter: "NotificationFilter") -> TypeGuard["NotificationFilt
     return not any(key in filter for key in _LOGICAL_KEYS)
 
 
-def is_string_filter_lookup(value: "StringFieldFilter") -> TypeGuard["StringFilterLookup"]:
-    """Return ``True`` if a string-field filter is a ``StringFilterLookup`` and not a bare ``str``."""
-    return isinstance(value, dict)
+def is_sequence_filter(value: object) -> TypeGuard[Collection[object]]:
+    """Return ``True`` for the list/tuple/set forms a membership or choice field accepts.
+
+    A ``str`` is iterable but always means one value here, so it is not a sequence filter.
+    """
+    return isinstance(value, (list, tuple, set))
+
+
+def is_string_filter_lookup(value: object) -> TypeGuard["StringFilterLookup"]:
+    """Return ``True`` if a string-field filter is a usable ``StringFilterLookup``.
+
+    ``StringFilterLookup`` is ``total=False`` so a JSON payload can omit keys; this is where that
+    payload is checked. ``value`` is required -- a lookup with no needle would otherwise match on
+    the empty string, which is every row. ``lookup`` and ``case_sensitive`` may be omitted and
+    default to a case-sensitive ``exact``. An unrecognized key is rejected, so a misspelled
+    ``case_sensitve`` does not silently keep matching case-sensitively.
+    """
+    if not isinstance(value, dict):
+        return False
+    if not _STRING_LOOKUP_KEYS.issuperset(value):
+        return False
+    if not isinstance(value.get("value"), str):
+        return False
+    if value.get("lookup", "exact") not in _STRING_LOOKUPS:
+        return False
+    return isinstance(value.get("case_sensitive", True), bool)
+
+
+def is_date_range(value: object) -> TypeGuard["DateRange"]:
+    """Return ``True`` if ``value`` is a ``DateRange``: ``from`` / ``to`` bounds, both optional.
+
+    Every bound present must be a ``datetime``, and no other key is allowed, so a typo'd bound
+    cannot quietly widen the range to unbounded.
+    """
+    if not isinstance(value, dict):
+        return False
+    if not _DATE_RANGE_KEYS.issuperset(value):
+        return False
+    return all(isinstance(bound, datetime.datetime) for bound in value.values())
+
+
+def is_membership_value(value: object) -> TypeGuard["MembershipValue"]:
+    """Return ``True`` for a single value a membership field can be compared against.
+
+    ``bool`` is excluded even though it is an ``int``: ``True`` is never a meaningful id, tenant
+    or adapter path, and letting it through would compare against the string ``"True"``.
+    """
+    return isinstance(value, (str, int, uuid.UUID)) and not isinstance(value, bool)
+
+
+def is_template_version_value(value: object) -> TypeGuard[int]:
+    """Return ``True`` for a single value a template-version field can be compared against.
+
+    Stricter than ``is_membership_value`` on purpose. A version is an ``int`` column, so a
+    candidate that is not an ``int`` -- ``"3"``, ``3.0``, a ``uuid`` -- is a malformed filter
+    rather than one that happens to match nothing, and a SQL backend that forwarded it would
+    raise on the cast instead of returning no rows. ``bool`` is excluded for the same reason
+    it is excluded from membership: ``True`` is not version 1.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def is_choice_member(value: object, enum_cls: type[ChoiceType]) -> TypeGuard[ChoiceType]:
+    """Return ``True`` if ``value`` is a member of ``enum_cls`` itself, not of some other enum."""
+    return isinstance(value, enum_cls)
+
+
+def is_choice_wire_value(value: object, enum_cls: type[Enum]) -> TypeGuard[str | int]:
+    """Return ``True`` if ``value`` is the ``.value`` of a real member of ``enum_cls``.
+
+    This is the form a filter that round-tripped through JSON carries: ``"SENT"`` rather than
+    ``NotificationStatus.SENT``. Membership is tested against the enum's own values, so a status
+    the enum does not define is rejected here rather than compared as a string that can never
+    match -- and, more importantly, rather than reaching a SQL backend as a live predicate.
+    """
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return False
+    return value in {member.value for member in enum_cls}
+
+
+def to_choice_member(value: object, enum_cls: type[ChoiceType]) -> "ChoiceType | None":
+    """Resolve one choice filter value to a member of ``enum_cls``.
+
+    Returns ``None`` if ``value`` is neither a member nor the wire value of one, which is what
+    both this module's evaluator and the SQL backends read as "this leaf matches nothing".
+    """
+    if is_choice_member(value, enum_cls):
+        return value
+    if is_choice_wire_value(value, enum_cls):
+        return enum_cls(value)
+    return None
 
 
 def _scalar(value: object) -> str:
@@ -260,22 +400,58 @@ def _scalar(value: object) -> str:
 def _matches_membership(actual: object, expected: object) -> bool:
     if actual is None:
         return False
-    candidates = expected if isinstance(expected, (list, tuple, set)) else [expected]
+    candidates = list(expected) if is_sequence_filter(expected) else [expected]
+    if not all(is_membership_value(candidate) for candidate in candidates):
+        return False
     normalized_actual = _scalar(actual)
     return any(normalized_actual == _scalar(candidate) for candidate in candidates)
 
 
-def _matches_string(actual: object, spec: "StringFieldFilter") -> bool:
+def _matches_version(actual: object, expected: object) -> bool:
+    """Membership over an integer version field.
+
+    One non-``int`` candidate rejects the whole leaf, the same way one unresolvable status
+    does in ``_matches_choice``: ``[1, "2"]`` is a malformed filter, not a request for the
+    rows that happen to be version 1.
+    """
+    if not is_template_version_value(actual):
+        return False
+    candidates = list(expected) if is_sequence_filter(expected) else [expected]
+    if not candidates or not all(is_template_version_value(candidate) for candidate in candidates):
+        return False
+    return any(actual == candidate for candidate in candidates)
+
+
+def _matches_choice(actual: object, expected: object, enum_cls: type[Enum]) -> bool:
+    """Membership over an enum-backed field, comparing only against real members.
+
+    One unresolvable candidate rejects the whole leaf: ``["SENT", "TYPO"]`` is a malformed
+    filter, not a request for the rows that happen to be ``SENT``.
+    """
+    if actual is None:
+        return False
+    candidates = list(expected) if is_sequence_filter(expected) else [expected]
+    members = [to_choice_member(candidate, enum_cls) for candidate in candidates]
+    if any(member is None for member in members):
+        return False
+    normalized_actual = _scalar(actual)
+    return any(normalized_actual == _scalar(member) for member in members)
+
+
+def _matches_string(actual: object, spec: object) -> bool:
     if not isinstance(actual, str):
         return False
-    if isinstance(spec, dict):
-        lookup: str = spec.get("lookup", "exact")
-        target: str = spec.get("value", "")
-        case_sensitive = spec.get("case_sensitive", True)
-    else:
+    if isinstance(spec, str):
+        # A bare string means a case-sensitive exact match.
         lookup = "exact"
         target = spec
         case_sensitive = True
+    elif is_string_filter_lookup(spec):
+        lookup = spec.get("lookup", "exact")
+        target = spec["value"]
+        case_sensitive = spec.get("case_sensitive", True)
+    else:
+        return False
 
     haystack = actual if case_sensitive else actual.lower()
     needle = target if case_sensitive else target.lower()
@@ -291,7 +467,9 @@ def _matches_string(actual: object, spec: "StringFieldFilter") -> bool:
     return False
 
 
-def _matches_range(actual: object, date_range: "DateRange") -> bool:
+def _matches_range(actual: object, date_range: object) -> bool:
+    if not is_date_range(date_range):
+        return False
     if not isinstance(actual, datetime.datetime):
         return False
     lower = date_range.get("from")
@@ -307,9 +485,14 @@ def _matches_field(
     notification: "Notification | OneOffNotification", field: str, value: object
 ) -> bool:
     if field in _RANGE_FIELDS:
-        return _matches_range(getattr(notification, _RANGE_FIELDS[field], None), value)  # type: ignore[arg-type]
+        return _matches_range(getattr(notification, _RANGE_FIELDS[field], None), value)
     if field in _STRING_LOOKUP_FIELDS:
-        return _matches_string(getattr(notification, field, None), value)  # type: ignore[arg-type]
+        return _matches_string(getattr(notification, field, None), value)
+    if field in _CHOICE_FIELDS:
+        attribute, enum_cls = _CHOICE_FIELDS[field]
+        return _matches_choice(getattr(notification, attribute, None), value, enum_cls)
+    if field in _VERSION_FIELDS:
+        return _matches_version(getattr(notification, _VERSION_FIELDS[field], None), value)
     if field in _MEMBERSHIP_FIELDS:
         return _matches_membership(getattr(notification, _MEMBERSHIP_FIELDS[field], None), value)
     # Unknown field: treat as non-matching rather than raising, so an over-eager client cannot

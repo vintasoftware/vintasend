@@ -12,6 +12,7 @@ A flexible package for implementing transactional notifications in Python projec
 * **Flexible backend**: Your projects database is getting slow after you created the first milion notifications? You can migrate to a faster no-sql database with a blink of an eye without affecting how you send the notifications.
 * **Flexible adapters**: Your project probably will need to change how it sends notifications overtime. This package allows to change the adapter without having to change how notifications templates are rendered or how the notification themselves are stored.
 * **Flexible template renderers**: Wanna start managing your templates with a third party tool (so non-technical people can help maintaining them)? Or even choose a more powerful rendering engine? You can do it independetly of how you send the notifications or store them in the database.
+* **Store-backed templates**: Templates don't have to be files. A [template manager](#template-managers) keeps them in a data store with versioning, a publishing lifecycle, and composition of one template from another — so copy changes ship without a deploy, and a notification can be pinned to the exact version it should render.
 
 
 ## Installation
@@ -309,6 +310,29 @@ notification_service.filter_notifications(
 )
 ```
 
+**Template versions.** `requested_template_version` and `used_template_version` filter on the
+two integer fields a notification records when its template renderer versions templates --
+what it was pinned to, and what it actually rendered. Scalar or list, like the other
+membership fields, but the candidates must be real `int`s: `"3"` is a malformed filter rather
+than a request for version 3, and one bad candidate rejects the whole leaf.
+
+```python
+# still pinned to v3
+notification_service.filter_notifications(
+    {"requested_template_version": 3}, page=1, page_size=10
+)
+
+# went out on v1 or v2 -- the query after finding a bug in an old version
+notification_service.filter_notifications(
+    {"used_template_version": [1, 2]}, page=1, page_size=10
+)
+```
+
+Both are `None` on a notification whose renderer has no versions, and `used_template_version`
+is `None` until it has been sent. The NULL rule above applies unchanged, so those rows never
+match a positive version filter and are included under negation -- which also means there is
+no positive way to ask for "the unpinned ones".
+
 **`and` / `or` / `not`** compose and nest arbitrarily -- each takes the same `NotificationFilter`
 shape, so a group can hold field filters or further groups:
 
@@ -398,6 +422,7 @@ grey out controls the configured backend can't handle:
 ```python
 capabilities = notification_service.get_backend_supported_filter_capabilities()
 capabilities["fields.tenant"]          # True unless the backend declines it
+capabilities["fields.usedTemplateVersion"]
 capabilities["stringLookups.startsWith"]
 capabilities["orderBy.sentAt"]
 capabilities["logical.or"]             # can it assemble `or` groups?
@@ -875,6 +900,110 @@ Key semantics:
 * **Provider failures never block a send.** If the provider raises, the exception is caught and logged, and treated exactly like a `None` return -- audit metadata is never worth failing a delivery over.
 * **System-managed.** `git_commit_sha` is never settable through `create_notification` or `update_notification` -- passing it to `update_notification` raises `GitCommitShaReassignmentError`. It is only ever written by the service itself, at send time.
 
+## Template Version Pinning
+
+Some template renderers version their templates. A file on disk has no version -- editing it changes what every notification renders, past and future. A store-backed renderer such as [vintasend-managed-templates](https://github.com/vintasoftware/vintasend-managed-templates) keeps every edit as a new version, and that makes two questions answerable that were not before: *which version should this notification render*, and *which version did it actually go out with*.
+
+Two fields on `Notification` (and `OneOffNotification`) hold the answers:
+
+| Field | Set by | Means |
+|---|---|---|
+| `requested_template_version` | the caller, or the service at create time | Render this exact version. `None` means "whatever is current at send time". |
+| `used_template_version` | the service, at send time | The version the renderer reported it actually used. Read-only to callers. |
+
+With a renderer whose templates are not versioned -- which is most of them -- both stay `None` and nothing about this changes.
+
+### Pinning a single notification
+
+Pass the version and it is used, whatever the service is configured with:
+
+```python
+service.create_notification(
+    user_id=user.id,
+    notification_type="EMAIL",
+    title="Welcome",
+    body_template="welcome",          # a template key, not a path
+    context_name="welcome_context",
+    context_kwargs={"user_id": user.id},
+    requested_template_version=3,     # render v3, now and forever
+)
+```
+
+Repointing an existing notification works the same way through `update_notification`:
+
+```python
+service.update_notification(notification.id, requested_template_version=4)
+```
+
+### Pinning without naming a version
+
+`pin_template_versions=True` resolves whatever version is current *now* and records it, so a later edit to the template cannot change what an already-recorded notification renders. Ask for it per call:
+
+```python
+service.create_notification(
+    ...,
+    body_template="welcome",
+    pin_template_versions=True,      # pin to whatever "welcome" is right now
+)
+
+service.update_notification(
+    notification.id,
+    pin_template_versions=True,
+    body_template="farewell",        # re-pinned to farewell's current version
+)
+```
+
+...or set the default for every call on the service, and override it where it does not apply:
+
+```python
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=...,
+    pin_template_versions=True,      # the default for every create and update
+)
+
+service.create_notification(..., pin_template_versions=False)   # not this one
+```
+
+The default is **off**, because turning it on changes what an existing deployment sends: unpinned, a notification scheduled for next week renders whatever the template says next week, which is sometimes exactly what a team wants. The flag is never stored -- it decides what `requested_template_version` is set to at that moment, and nothing afterwards consults it.
+
+Key semantics:
+
+* **The call wins over the service.** `pin_template_versions` on a create or update overrides the constructor's setting in both directions; leave it `None` (the default) to defer to the service.
+* **An explicit version always wins over both.** `pin_template_versions` only decides what happens when the caller does not name a version, on create and on update alike.
+* **Resolved through the renderer.** The service asks the renderer for the notification type it is creating, via `BaseNotificationTemplateRenderer.get_latest_template_version()`. The default implementation returns `None` -- so with a file-based renderer this flag has nothing to pin and quietly does nothing.
+* **Best-effort.** A renderer that raises while resolving is logged and the notification is created unpinned, rather than failing the write. An unpinned notification still sends.
+* **Updates re-pin only when the template changes.** An update carrying a new `body_template` is re-pinned to that template's current version; an update to the title leaves an existing pin exactly as it was. Silently moving a pin forward is the one thing pinning exists to prevent.
+
+### Recording what actually rendered
+
+At send time the renderer reports the version it used on the send input it returns, the adapter hands that back from `send()`, and the service stores it:
+
+```python
+notification = service.get_notification(notification_id)
+notification.requested_template_version   # 3  -- what it asked for (or None)
+notification.used_template_version        # 3  -- what rendered
+```
+
+On an unpinned notification `used_template_version` is the *only* record of which version went out, since the template has moved on by the time anyone asks.
+
+* **System-managed.** Passing `used_template_version` to `update_notification` raises `UsedTemplateVersionReassignmentError`. Set `requested_template_version` instead.
+* **Never blocks a send.** It is written after delivery, so a failure to record it is logged and the notification stays sent.
+* **A pin covers the template named, not what that template builds on.** With a renderer that
+  composes templates from other templates, pinning a notification to v3 of `welcome` renders v3 of
+  `welcome` -- but a base it extends without naming a version still resolves to whatever that base
+  is today. Pin the reference too (`{% managed_extends "base-email" version=2 %}`) when a template
+  must keep composing against an exact parent. See
+  [Template Managers](#template-managers).
+
+### What an implementation package has to do
+
+Everything below is optional. A renderer, adapter, or backend that ignores all of it keeps working exactly as it did.
+
+* **A renderer whose templates are versioned** overrides `get_latest_template_version(template_key)`, honours the notification's `requested_template_version` in `render()`, and sets `template_version` on the `NotificationSendInput` it returns.
+* **An adapter** returns the send input from `send()` instead of discarding it. Returning `None` is still valid -- the service then records nothing.
+* **A backend** stores `requested_template_version` (an optional keyword on `persist_notification` / `persist_one_off_notification`, passed only when a version was pinned) and overrides `store_template_version()`. That method is concrete and a no-op on the base, so a backend with nowhere to put it needs no changes at all.
+
 ## Glossary
 
 * **Notification Backend**: It is a class that implements the methods necessary for VintaSend services to create, update, and retrieve Notifications from da database.
@@ -886,6 +1015,9 @@ Key semantics:
 * **Context registry**: We store all registered context generators on a Singleton class, we call it context registry.
 * **Notification Attachment**: Files that can be attached to notifications, supporting various input types including file paths, URLs, bytes data, and file-like objects.
 * **Attachment Manager**: It is a class that implements the methods necessary to store, read, and delete the bytes behind a notification attachment, so the notification backend only ever handles rows, never files.
+* **Template Manager**: A class that implements the methods necessary to store, version, and publish notification templates in a data store rather than as files, so they can be edited without a deploy. Paired with a template renderer that reads from it.
+* **Managed Template**: One version of one template held by a template manager, identified by a key and a version number, with a draft/active/inactive/archived lifecycle. A notification's `body_template` names its key rather than a file path.
+* **Abstract Template**: A managed template meant to be built on rather than sent -- it declares a `{% managed_children %}` hole, or blocks without extending anything. Recorded on the template as `is_abstract`.
 * **One-off Notification**: A notification sent directly to an email address or phone number without requiring a user ID from your database. 
 * **Git Commit SHA Provider**: A class that implements a single method returning the current git commit SHA, so a notification records which source-code revision sent it.
 
@@ -913,13 +1045,57 @@ VintaSend has many backend, adapter, and template renderer implementations. If y
 * **[vintasend-jinja](https://github.com/vintasoftware/vintasend-jinja/)**: Renders emails using Jinja2.
 
 #### Attachment Managers
-* **[vintasend-s3-attachments](https://github.com/vintasoftware/vintasend-s3-attachments/)**: Stores attachment files as objects in an AWS S3 bucket using boto3. Supports both sync and AsyncIO.
+* **[vintasend-aws-s3-attachments](https://github.com/vintasoftware/vintasend-aws-s3-attachments/)**: Stores attachment files as objects in an AWS S3 bucket using boto3. Supports both sync and AsyncIO.
+
+#### Template Managers
+
+Regular template renderers read templates from wherever the rendering engine looks -- files on
+disk, usually. A **template manager** puts them in a data store instead, so non-technical people
+can edit a notification's copy without a deploy, with versioning and a draft/active/inactive/archived
+lifecycle on top.
+
+* **[vintasend-managed-templates](https://github.com/vintasoftware/vintasend-managed-templates/)**: The template management layer itself -- the `BaseTemplateManagerBackend` seam, `ManagedTemplateService` for creating/versioning/publishing templates, and `ManagedTemplateEmailRenderer` / `ManagedTemplateSMSRenderer`, which wrap any existing `BaseNotificationTemplateRenderer` and feed it the stored template body instead of a template path. Storage-agnostic on its own; pair it with a manager backend.
+* **[vintasend-django-templates-manager](https://github.com/vintasoftware/vintasend-django-templates-manager/)**: Stores managed templates in the database through the Django ORM, with `ManagedTemplate` / `ManagedTemplateStatusRecord` models, an admin, and filtering + pagination over template versions and their status history.
+* **[vintasend-templates-management-api](https://github.com/vintasoftware/vintasend-templates-management-api/)**: A django-ninja REST API over a template manager backend, for a UI where non-technical people create, version, publish and preview templates. Tracked here as a submodule under `tools/`.
+
+Because the renderer wraps another renderer rather than replacing it, a notification's
+`body_template` stops being a path and becomes a managed template's key -- everything else about
+how you create and send notifications stays the same.
+
+**Templates can be built from other templates.** Moving templates into a store costs you what
+the rendering engine gave you for free: Django's `{% extends %}` and `{% include %}` resolve
+against the template loader, which never sees a stored template. `vintasend-managed-templates`
+replaces that with its own layer -- `managed_extends`, `managed_children`, `managed_block` /
+`managed_endblock`, `managed_super` and `managed_include` -- resolved into one flat string
+*before* the engine runs, so Django or Jinja renders exactly what it always did:
+
+```
+base-email    <html><body>
+                {% managed_block header %}<h1>Acme</h1>{% managed_endblock %}
+                {% managed_children %}
+              </body></html>
+
+welcome       {% managed_extends "base-email" %}
+              <p>Hi {{ name }}, welcome aboard.</p>
+```
+
+A template that declares a `{% managed_children %}` hole, or blocks without extending anything,
+is a base to build on rather than one to send. That is what `is_abstract` records -- denormalized
+onto the template by the manager backend, so "list the templates I can actually send" is a column
+lookup rather than a parse of every row. A reference can name a version --
+`{% managed_extends "base-email" version=2 %}` -- which is the same pin
+[Template Version Pinning](#template-version-pinning) applies to a notification.
+
+See the [package's README](https://github.com/vintasoftware/vintasend-managed-templates#composition-bases-blocks-and-includes)
+for the full tag reference, the cycle and depth limits, and how a composition failure is reported.
 
 #### Working on them from this repo
 
 Each officially supported package lives in its own repository and is linked here as a git
-submodule under `implementations/`, so a single checkout gives you the core package plus
-every implementation that has to stay compatible with it.
+submodule -- the backends, adapters, renderers, attachment managers and template managers under
+`implementations/`, and the applications built on top of them (the notifications dashboard and
+its API, the templates management API) under `tools/`. A single checkout gives you the core
+package plus everything that has to stay compatible with it.
 
 ```bash
 # Fresh clone, with the implementations

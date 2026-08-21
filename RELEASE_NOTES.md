@@ -1,8 +1,42 @@
 # Release Notes
 
-## Unreleased
+## Version 3.0.0 (2026-08-21)
 
 ### Features
+
+#### Template version pinning and recording
+- `Notification` and `OneOffNotification` gained `requested_template_version` (which version to
+  render) and `used_template_version` (which version the renderer reported it used). Both default
+  to `None`, which is what every notification carries with a renderer whose templates are not
+  versioned.
+- `create_notification`, `create_one_off_notification` and `update_notification` gained a
+  `requested_template_version` (which version to render) and a `pin_template_versions` argument
+  (whether to pin to the current version when no version is named). `NotificationService` /
+  `AsyncIONotificationService` take `pin_template_versions` too, as the default for every call;
+  the per-call argument overrides it in both directions, and `None` means "defer to the service".
+- An explicitly passed version always wins over both. Updates re-pin only when they carry a new
+  `body_template` -- an update to the title leaves an existing pin where it is.
+- `pin_template_versions` is never stored: it decides what `requested_template_version` is set to
+  at that moment, and nothing afterwards consults it.
+- `update_notification` raises the new `UsedTemplateVersionReassignmentError` if a caller passes
+  `used_template_version`, matching the existing `git_commit_sha` guard.
+- Pinning exists so that editing a template cannot change what an already-recorded notification
+  renders -- which only becomes a question once templates are versioned, i.e. with a store-backed
+  renderer such as `vintasend-managed-templates`.
+
+#### Filtering by template version
+- `NotificationFilterFields` gained `requested_template_version` and `used_template_version`,
+  each a scalar or a list, and `DEFAULT_BACKEND_FILTER_CAPABILITIES` gained the matching
+  `fields.requestedTemplateVersion` / `fields.usedTemplateVersion` keys (both `True`).
+- Candidates must be real `int`s. The new public guard `is_template_version_value` is what
+  decides that, and it is stricter than `is_membership_value` on purpose: these are integer
+  columns, so `"3"` is a malformed filter rather than a request for version 3, and a SQL
+  backend forwarding it would raise on the cast instead of returning no rows. One bad
+  candidate rejects the whole leaf, matching how a bad status candidate already behaved.
+- The usual NULL semantics apply unchanged: a notification with no version never matches a
+  positive filter on either field, and is included under negation.
+- `vintasend-django` and `vintasend-sqlalchemy` translate both fields to SQL, sharing the
+  guard so they accept and reject exactly what the reference evaluator does.
 
 #### Logical composition and range negation reported through the capability report
 - `DEFAULT_BACKEND_FILTER_CAPABILITIES` gained two namespaces, all defaulting to `True`:
@@ -52,8 +86,56 @@
 - A 0-indexed backend declares `{"pagination.oneIndexed": False}` from `get_filter_capabilities`,
   the same way it would decline any other capability.
 
+#### `UnconfirmedNotificationUpdateError` for writes a backend cannot confirm
+- New exception in `vintasend/exceptions.py`, subclassing `NotificationUpdateError`, for the case
+  where a backend issued a write but could not read back how many rows it affected -- so it cannot
+  say whether the write applied.
+- Distinct from a plain `NotificationUpdateError`, which means no row matched and the write
+  definitively did not apply. A caller that needs certainty should re-read the notification.
+- Documented on the `update_notification`, `mark_read`, and `cancel_notification` docstrings of both
+  `NotificationService` and `AsyncIONotificationService`.
+- First raised by `vintasend-sqlalchemy`, whose async backend reads `rowcount` off the result of an
+  `UPDATE`: `AsyncSession.execute` is typed as returning a plain `Result`, which has no `rowcount`,
+  and the backend now checks for the `CursorResult` it expects instead of assuming it.
+
 ### Backwards compatibility
 
+Everything below is additive. A host that upgrades and changes nothing behaves exactly as it did:
+`pin_template_versions` defaults to `False`, and every new seam member has a default.
+
+- **`BaseNotificationTemplateRenderer.get_latest_template_version(template_key)`** is new,
+  concrete, and returns `None`. A renderer whose templates are not versioned needs no changes.
+  One that versions them overrides it, honours `notification.requested_template_version` in
+  `render()`, and sets `template_version` on the `NotificationSendInput` it returns.
+- **`BaseNotificationAdapter.send()` / `AsyncIOBaseNotificationAdapter.send()`** now return
+  `NotificationSendInput | None` instead of `None`. Existing adapters return `None` implicitly and
+  keep working -- the service records nothing for them. Return the send input to have the template
+  version recorded.
+- **`BaseNotificationBackend.store_template_version()` / its AsyncIO twin** are new, concrete, and
+  no-ops. Unlike `store_git_commit_sha` they are deliberately not abstract, so an existing backend
+  inherits them and keeps working; the only cost of not overriding one is that
+  `used_template_version` stays `None` on the records that backend holds.
+- **`persist_notification()` / `persist_one_off_notification()`** gained an optional
+  `requested_template_version` keyword on the backend ABCs. The service passes it only when a
+  version was actually pinned, so a backend that has not added the parameter is never handed it at
+  runtime. Adding it to an implementation is a signature-only change; storing it needs a column.
+- **Downstream packages updated in this release**:
+  - `vintasend-django` -- both columns, migration `0007`, and both filter fields translated to `Q`.
+  - `vintasend-sqlalchemy` -- both columns, migration `3c1a2b4d5e6f` (plus the
+    `upgrade_notification_table_to_2_1()` op helper for host applications), `store_template_version`,
+    and both filter fields translated to SQL on the sync and AsyncIO backends alike.
+  - `vintasend-managed-templates` -- honours the pin, reports the version used, and accepts
+    `version=2` inside composition tags.
+  - `vintasend-django-templates-manager` -- the Django-ORM manager backend for the above.
+  - `vintasend-templates-management-api` (`tools/`) -- exposes composition and `isAbstract` over HTTP.
+
+  Each of these releases on its own cycle, from its own repository. This file covers the core
+  package only; a package's own README is the reference for what it added.
+
+- **`UnconfirmedNotificationUpdateError` needs no handling changes.** It subclasses
+  `NotificationUpdateError`, so every existing `except NotificationUpdateError` -- including the
+  send path's own `raise_on_failed_send` handling -- already catches it. Catch the new type
+  directly only if you need to tell an indeterminate write apart from a failed one.
 - **No action required for existing backends.** This adds a key to a data contract, not an
   abstract method. The new key defaults to `True`, which is what every backend in this library
   and every known downstream implementation already does, so a backend that says nothing keeps
@@ -254,6 +336,47 @@ guidance.
   created through the service, so `created_at_range` filters matched nothing and the default
   `created`-descending ordering fell through to the `id` tiebreaker.
 
+_The following were first documented under 1.4.0 and 1.3.0. Those version numbers were bumped
+in `pyproject.toml` but never published to PyPI, and the work shipped in 2.0.0 instead, so
+their notes are folded in here._
+
+- `NotificationService` and `AsyncIONotificationService` now reject two or more adapters that
+  declare the same `notification_type`, raising the new
+  `vintasend.exceptions.DuplicateNotificationAdapterError` at construction. Previously both
+  adapters were kept, and because the send loop has no `break`, every notification of that type
+  was sent twice: the second `mark_pending_as_sent` then failed because the row was no longer
+  `PENDING_SEND`, and if the first adapter failed while the second succeeded the notification was
+  marked FAILED and then overwritten as SENT. The error message names the offending notification
+  type and the `adapter_import_str` of every adapter declaring it.
+- `create_one_off_notification` now validates `email_or_phone` before anything is persisted, on
+  both services, raising the new `vintasend.exceptions.InvalidOneOffNotificationRecipientError`.
+  An empty string, a whitespace-only string, or a value that is neither an email address nor a
+  10-to-15-digit phone number (optionally `+`-prefixed) previously persisted a notification that
+  could never be delivered. Validation is on format only; it does not check deliverability. Both
+  new exceptions derive from `NotificationError`, which derives from `ValueError`, so existing
+  `except ValueError` handlers keep working.
+- `AsyncIONotificationService` now accepts the same `(import_str, kwargs)` adapter tuple form
+  that `NotificationService` already accepted, for example
+  `notification_adapters=[(("pkg.Adapter", {"k": 1}), "pkg.Renderer")]`. The async construction
+  helper, `get_asyncio_notification_adapters`, already handled this shape; the service's own
+  validation guard did not, and rejected it with `NotificationError("Invalid notification
+  adapters")` before the helper ever ran.
+
+### Internal Improvements
+_The following were first documented under 1.4.0 and 1.3.0. Those version numbers were bumped
+in `pyproject.toml` but never published to PyPI, and the work shipped in 2.0.0 instead, so
+their notes are folded in here._
+- Extracted the file-attachment and context-function helpers duplicated between `NotificationService`
+  and `AsyncIONotificationService` into `vintasend.services.service_utils`; both classes now delegate
+  to one shared implementation of each. No public signature changed.
+- Closed sync/AsyncIO parity gaps between the two services: `AsyncIONotificationService.send_pending_notifications`
+  now tracks sent/failed counters and logs the same summary lines its sync twin,
+  `NotificationService.send_pending_notifications`, always has; `AsyncIONotificationService.__init__`
+  now initializes the `NotificationSettings` singleton up front, matching `NotificationService.__init__`.
+- Importing `vintasend.services.notification_service` no longer imports `requests` as a side effect --
+  `download_from_url` now imports it lazily, at call time, with a friendly `ImportError` if it's
+  missing.
+
 ### Breaking Changes
 
 1. **`raise_on_failed_send` defaults to `False`.** In 1.x, send failures raised
@@ -382,42 +505,10 @@ guidance.
   replication -- including creating rows on a fresh replica, and converging attachments -- should
   implement `apply_replication_snapshot_if_newer` rather than relying on this fallback.
 
-### Operational Requirements
-- **Drain or dual-register the Celery queue before deploying.** Tasks queued under 1.x carry a
-  different payload format and will fail against 2.0. Either drain the queue before deploying the
-  2.0 worker or register the new entrypoint under a new task name and run both workers until the old
-  queue empties. See `MIGRATION_TO_2.0.0.md`.
+_The following were first documented under 1.4.0 and 1.3.0. Those version numbers were bumped
+in `pyproject.toml` but never published to PyPI, and the work shipped in 2.0.0 instead, so
+their notes are folded in here._
 
-### Upgrade Path
-1. Read `MIGRATION_TO_2.0.0.md` for the breaking changes and the deploy procedure.
-2. If you use background sending, set up `NOTIFICATION_SERVICE_FACTORY`.
-3. If you maintain an adapter, move to `BackgroundNotificationAdapter` /
-   `AsyncIOBackgroundNotificationAdapter` and move `delayed_send` logic to `send()`.
-4. If you maintain a backend, implement the new filter and attachment abstract methods.
-5. If you maintain an email template renderer, implement `render_from_template_content`.
-6. Test end-to-end, including attachments in background sends (now supported), then drain the queue
-   and deploy the 2.0 worker.
-
-## Version 1.4.0 (2026-07-22)
-
-### Bug Fixes
-- `NotificationService` and `AsyncIONotificationService` now reject two or more adapters that
-  declare the same `notification_type`, raising the new
-  `vintasend.exceptions.DuplicateNotificationAdapterError` at construction. Previously both
-  adapters were kept, and because the send loop has no `break`, every notification of that type
-  was sent twice: the second `mark_pending_as_sent` then failed because the row was no longer
-  `PENDING_SEND`, and if the first adapter failed while the second succeeded the notification was
-  marked FAILED and then overwritten as SENT. The error message names the offending notification
-  type and the `adapter_import_str` of every adapter declaring it.
-- `create_one_off_notification` now validates `email_or_phone` before anything is persisted, on
-  both services, raising the new `vintasend.exceptions.InvalidOneOffNotificationRecipientError`.
-  An empty string, a whitespace-only string, or a value that is neither an email address nor a
-  10-to-15-digit phone number (optionally `+`-prefixed) previously persisted a notification that
-  could never be delivered. Validation is on format only; it does not check deliverability. Both
-  new exceptions derive from `NotificationError`, which derives from `ValueError`, so existing
-  `except ValueError` handlers keep working.
-
-### Backwards compatibility
 - No seam method was added, renamed, or removed, and no existing method signature or semantic
   changed. Custom backends, adapters and template renderers need no code changes, and the
   `vintasend-django`, `vintasend-sqlalchemy`, `vintasend-celery`, and renderer/adapter packages
@@ -438,29 +529,6 @@ guidance.
   never deliverable. Existing rows are untouched -- validation is on the create path only, and
   `update_notification` is unchanged.
 
-## Version 1.3.0 (2026-07-22)
-
-### Bug Fixes
-- `AsyncIONotificationService` now accepts the same `(import_str, kwargs)` adapter tuple form
-  that `NotificationService` already accepted, for example
-  `notification_adapters=[(("pkg.Adapter", {"k": 1}), "pkg.Renderer")]`. The async construction
-  helper, `get_asyncio_notification_adapters`, already handled this shape; the service's own
-  validation guard did not, and rejected it with `NotificationError("Invalid notification
-  adapters")` before the helper ever ran.
-
-### Internal Improvements
-- Extracted the file-attachment and context-function helpers duplicated between `NotificationService`
-  and `AsyncIONotificationService` into `vintasend.services.service_utils`; both classes now delegate
-  to one shared implementation of each. No public signature changed.
-- Closed sync/AsyncIO parity gaps between the two services: `AsyncIONotificationService.send_pending_notifications`
-  now tracks sent/failed counters and logs the same summary lines its sync twin,
-  `NotificationService.send_pending_notifications`, always has; `AsyncIONotificationService.__init__`
-  now initializes the `NotificationSettings` singleton up front, matching `NotificationService.__init__`.
-- Importing `vintasend.services.notification_service` no longer imports `requests` as a side effect --
-  `download_from_url` now imports it lazily, at call time, with a friendly `ImportError` if it's
-  missing.
-
-### Backwards compatibility
 - `AsyncIONotificationService.__init__` now constructs the `NotificationSettings` singleton
   immediately, matching `NotificationService.__init__`. `NotificationSettings` is a singleton:
   the first construction wins, and every later `config` argument is ignored. An application
@@ -474,6 +542,22 @@ guidance.
   above) instead of depending on `requests` itself will see that `ImportError` move from import
   time to call time. `requests` remains a declared runtime dependency in `pyproject.toml`, so
   this affects nobody who installs the package normally.
+
+### Operational Requirements
+- **Drain or dual-register the Celery queue before deploying.** Tasks queued under 1.x carry a
+  different payload format and will fail against 2.0. Either drain the queue before deploying the
+  2.0 worker or register the new entrypoint under a new task name and run both workers until the old
+  queue empties. See `MIGRATION_TO_2.0.0.md`.
+
+### Upgrade Path
+1. Read `MIGRATION_TO_2.0.0.md` for the breaking changes and the deploy procedure.
+2. If you use background sending, set up `NOTIFICATION_SERVICE_FACTORY`.
+3. If you maintain an adapter, move to `BackgroundNotificationAdapter` /
+   `AsyncIOBackgroundNotificationAdapter` and move `delayed_send` logic to `send()`.
+4. If you maintain a backend, implement the new filter and attachment abstract methods.
+5. If you maintain an email template renderer, implement `render_from_template_content`.
+6. Test end-to-end, including attachments in background sends (now supported), then drain the queue
+   and deploy the 2.0 worker.
 
 ## Version 1.2.0 (2026-06-14)
 
