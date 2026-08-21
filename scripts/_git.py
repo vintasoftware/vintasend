@@ -35,15 +35,54 @@ def head_sha(cwd: Path) -> str:
     return out
 
 
-def is_clean(cwd: Path) -> tuple[bool, str]:
+def is_clean(cwd: Path, ignore_submodules: bool = False) -> tuple[bool, str]:
     """Whether the working tree has no tracked modifications.
 
     Untracked files are ignored: they are not part of what the tag would point
     at. Staged or unstaged changes to tracked files are not, because the tag
     would name a commit that differs from the tree the gates were run against.
+
+    `ignore_submodules` drops submodule entries -- both a moved gitlink and dirt
+    inside the submodule's own checkout. The root package is released first, so
+    at that moment the submodules are always mid-flight: their pyprojects are
+    already bumped to the version being cut and their gitlinks will move again
+    once they are tagged. Those changes say nothing about whether the root tree
+    matches what the root gates ran against, which is what this check is for.
+    Each submodule is checked in its own right by `tag_subpackages.py`.
     """
-    _, out = git(["status", "--porcelain", "--untracked-files=no"], cwd)
+    args = ["status", "--porcelain", "--untracked-files=no"]
+    if ignore_submodules:
+        args.append("--ignore-submodules=all")
+    _, out = git(args, cwd)
     return (out == ""), out
+
+
+def submodule_paths(cwd: Path) -> set[str]:
+    """Every submodule path registered in this superproject."""
+    code, out = git(["submodule", "status"], cwd)
+    if code != 0:
+        return set()
+
+    paths = set()
+    for line in out.splitlines():
+        # Each line is `<flag><sha> <path> (<describe>)`, where <flag> is a
+        # single character -- a space when the submodule is in step.
+        fields = line[1:].split()
+        if len(fields) >= 2:
+            paths.add(fields[1])
+    return paths
+
+
+def submodule_changes(cwd: Path) -> list[str]:
+    """The submodule paths that currently have changes, for reporting only.
+
+    `is_clean(..., ignore_submodules=True)` hides these from the release gate;
+    printing them keeps the reason visible rather than silent.
+    """
+    subs = submodule_paths(cwd)
+    _, out = git(["status", "--porcelain", "--untracked-files=no"], cwd)
+    # A porcelain line is `XY <path>`, so the path starts at column 3.
+    return [line[3:] for line in out.splitlines() if line[3:] in subs]
 
 
 def local_tag_exists(cwd: Path, tag: str) -> bool:

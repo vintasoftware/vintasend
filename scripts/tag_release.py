@@ -36,6 +36,7 @@ from _git import (
     is_clean,
     local_tag_exists,
     remote_tag_exists,
+    submodule_changes,
 )
 from _packages import REPO_ROOT, PackageError, find_packages
 
@@ -79,10 +80,14 @@ def preflight(version: str, tag: str) -> list[str]:
     if branch != RELEASE_BRANCH:
         problems.append(f"on branch {branch!r}, not {RELEASE_BRANCH!r} -- do not tag from a branch")
 
-    clean, dirty = is_clean(REPO_ROOT)
+    # Submodule entries are excluded on purpose. The root is released first, so
+    # the subpackages are always dirty at this point -- bumped to this version,
+    # not yet tagged. What matters here is the root's own tracked files.
+    clean, dirty = is_clean(REPO_ROOT, ignore_submodules=True)
     if not clean:
         problems.append(
-            "working tree has uncommitted changes, so the tag would not name what you tested:\n"
+            "working tree has uncommitted changes outside the submodules, so the tag would not "
+            "name what you tested:\n"
             + "\n".join(f"      {line}" for line in dirty.splitlines())
         )
 
@@ -180,6 +185,12 @@ def main() -> int:
     print(f"  tag            {tag}   (annotated)")
     print(f"  commit         {head_sha(REPO_ROOT)[:12]} on {RELEASE_BRANCH}")
     print(f"  release notes  {len(notes.splitlines())} lines from {RELEASE_NOTES.name}")
+    pending = submodule_changes(REPO_ROOT)
+    if pending:
+        print(f"  submodules     {len(pending)} with uncommitted changes, ignored here:")
+        for path in pending:
+            print(f"                 {path}")
+        print("                 tag them with scripts/tag_subpackages.py after this release")
     print(f"  github release {'skipped (--no-release)' if args.no_release else 'yes'}")
     print("\n  pushing this tag triggers publish.yml, which uploads to PyPI.")
     print("  that upload is permanent: the version can never be replaced.")
