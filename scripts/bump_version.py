@@ -29,9 +29,11 @@ import sys
 from dataclasses import dataclass
 
 from _packages import (
+    PIN_RE,
     TABLE_RE,
     VERSION_LINE_RE,
     VERSION_TABLES,
+    WHEEL_RE,
     Package,
     PackageError,
     find_packages,
@@ -41,18 +43,6 @@ from _packages import (
 
 # PEP 440 subset: three numeric segments plus an optional pre/post/dev suffix.
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)((?:a|b|rc|\.post|\.dev)\d+)?$")
-
-# A dependency line pinning a sibling package, e.g. `vintasend = "^2.0.0"`.
-PIN_RE = re.compile(
-    r"^(?P<prefix>\s*(?P<name>vintasend[\w-]*)\s*=\s*)"
-    r'(?P<quote>["\'])(?P<op>[~^><=!]*)(?P<version>\d[^"\']*)(?P=quote)'
-)
-
-# A sibling pinned as a built wheel carries the version inside the filename,
-# e.g. `vintasend = { path = "../../dist/vintasend-2.0.0-py3-none-any.whl" }`.
-WHEEL_RE = re.compile(
-    r"(?P<name>vintasend[\w_-]*)-(?P<version>\d[^-/\"']*)-(?P<tail>py3-none-any\.whl)"
-)
 
 
 @dataclass
@@ -276,16 +266,15 @@ def report_stale_locks(packages: list[Package], new_version: str, pins_moved: bo
         print(f"\n  2. release the root first. The submodules now pin vintasend {new_version},")
         print("     which does not exist on PyPI yet, so relocking them before the root")
         print("     publishes will fail to resolve. After it is live:")
-        for pkg in downstream:
-            print(f"       (cd {pkg.rel} && poetry lock)")
+        print("       scripts/lock_subpackages.py")
     elif downstream:
         print("\n  2. relock each submodule:")
-        for pkg in downstream:
-            print(f"       (cd {pkg.rel} && poetry lock)")
+        print("       scripts/lock_subpackages.py --no-pypi-check")
 
     print(
-        "\neach submodule is its own git repo: review and commit there, then tag "
-        f"v{new_version} per the release-package skill"
+        f"\nthat script relocks, commits and pushes each submodule -- each one is its own\n"
+        f"git repo, so review what it plans first (--dry-run). Then tag v{new_version} with\n"
+        "scripts/tag_subpackages.py, per the release-package skill."
     )
 
 

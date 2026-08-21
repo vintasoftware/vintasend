@@ -73,6 +73,19 @@ def submodule_paths(cwd: Path) -> set[str]:
     return paths
 
 
+def changed_paths(cwd: Path) -> list[str]:
+    """Every tracked path with a staged or unstaged modification."""
+    _, out = git(["status", "--porcelain", "--untracked-files=no"], cwd)
+    # A porcelain line is `XY <path>`. Split on whitespace rather than slicing a
+    # fixed column: `git()` strips its output, which eats the leading space of
+    # an unstaged first line and shifts every column by one.
+    return [
+        fields[1]
+        for fields in (line.split(None, 1) for line in out.splitlines())
+        if len(fields) == 2
+    ]
+
+
 def submodule_changes(cwd: Path) -> list[str]:
     """The submodule paths that currently have changes, for reporting only.
 
@@ -80,16 +93,7 @@ def submodule_changes(cwd: Path) -> list[str]:
     printing them keeps the reason visible rather than silent.
     """
     subs = submodule_paths(cwd)
-    _, out = git(["status", "--porcelain", "--untracked-files=no"], cwd)
-    # A porcelain line is `XY <path>`. Split on whitespace rather than slicing a
-    # fixed column: `git()` strips its output, which eats the leading space of
-    # an unstaged first line and shifts every column by one.
-    changed = [
-        fields[1]
-        for fields in (line.split(None, 1) for line in out.splitlines())
-        if len(fields) == 2
-    ]
-    return [path for path in changed if path in subs]
+    return [path for path in changed_paths(cwd) if path in subs]
 
 
 def local_tag_exists(cwd: Path, tag: str) -> bool:

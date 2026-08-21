@@ -7,7 +7,9 @@ to be released. This script closes that gap: it repoints each package at the
 local working copy, installs, and runs the gates, so a seam change that breaks a
 downstream implementation is caught before the tag rather than after.
 
-    1. rewrite each sibling dependency to a develop path dependency
+    1. rewrite every sibling dependency to a develop path dependency -- including
+       one subpackage's dependency on another, such as
+       vintasend-django-templates-manager on vintasend-managed-templates
     2. poetry lock && poetry install
     3. ruff check + ruff format
     4. mypy
@@ -152,17 +154,29 @@ def relative_path(from_dir: Path, to_dir: Path) -> str:
     return os.path.relpath(to_dir, from_dir).replace("\\", "/")
 
 
-def link_siblings(pkg: Package, by_name: dict[str, Package]) -> list[str]:
-    """Rewrite sibling deps to develop path deps. Returns a description per edit.
+def link_siblings(pkg: Package, by_name: dict[str, Package]) -> tuple[list[str], list[str]]:
+    """Rewrite sibling deps to develop path deps.
+
+    Every dependency on another package in this superproject is linked, not just
+    the one on the root: `vintasend-django-templates-manager` depends on
+    `vintasend-managed-templates` as well, and testing the first against a
+    released copy of the second defeats the point of this script.
 
     Only lines inside a `*dependencies` table are touched, and only when the key
-    names another package in this superproject -- so an unrelated key that merely
-    starts with "vintasend" in some tool's config is left alone.
+    names another package here -- so an unrelated key that merely starts with
+    "vintasend" in some tool's config is left alone.
+
+    Returns the edits made, and separately the deps that were *already* path
+    dependencies before this ran. That second list should always be empty: it
+    means the committed tree ships a dependency on a directory, which no
+    installed package can resolve. Reverting will faithfully restore it, so the
+    caller reports it rather than quietly fixing it.
     """
     lines = pkg.path.read_text(encoding="utf-8").splitlines(keepends=True)
     out: list[str] = []
     table = ""
     edits: list[str] = []
+    already: list[str] = []
 
     for line in lines:
         header = TABLE_RE.match(line.rstrip("\n"))
@@ -182,7 +196,7 @@ def link_siblings(pkg: Package, by_name: dict[str, Package]) -> list[str]:
             f'{match.group("indent")}{match.group("name")} = {{ path = "{rel}", develop = true }}\n'
         )
         if replacement.strip() == line.strip():
-            # Already linked -- vintasend-django-templates-manager ships this way.
+            already.append(match.group("name"))
             out.append(line)
             continue
 
@@ -191,7 +205,7 @@ def link_siblings(pkg: Package, by_name: dict[str, Package]) -> list[str]:
 
     if edits:
         pkg.path.write_text("".join(out), encoding="utf-8")
-    return edits
+    return edits, already
 
 
 # --------------------------------------------------------------------------
@@ -569,13 +583,29 @@ def main() -> int:
     print("=" * 78)
     print("STEP 1  link sibling dependencies at the local tree")
     print("=" * 78)
+    shipped_local: dict[str, list[str]] = {}
     for pkg in packages:
-        edits = link_siblings(pkg, by_name)
+        edits, already = link_siblings(pkg, by_name)
+        if already:
+            shipped_local[pkg.name] = already
         if edits:
             print(f"\n  {pkg.name}")
             for edit in edits:
                 print(f"    {edit}")
     print(f"\n  backup written to {BACKUP_DIR.relative_to(REPO_ROOT)}/")
+
+    if shipped_local:
+        print(
+            "\n  WARNING: these packages already had a path dependency before this run, so it is\n"
+            "  what they ship. A published package cannot resolve a directory, and the release\n"
+            "  scripts will refuse to lock or tag them until each one is a version pin again:"
+        )
+        for name, deps in shipped_local.items():
+            print(f"    {name}: {', '.join(deps)}")
+        print(
+            "  reverting restores exactly this state -- it is a committed edit to undo, not a\n"
+            "  leftover from an earlier --keep run."
+        )
 
     # Drop logs from an earlier run: a stale file next to this run's failures
     # reads as though it belongs to this one.

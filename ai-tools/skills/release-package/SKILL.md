@@ -76,9 +76,11 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
    `vintasend` pin to match, keeping the operator it already used. `pyproject.toml` is the single
    source of truth for the published version; nothing derives it from the tag.
 
-   The bump leaves every `poetry.lock` stale. Relock the root before tagging; the submodules can
-   only be relocked after the root release is live on PyPI, since their pins now name a version
-   that does not exist yet. The script prints this ordering when it finishes.
+   The bump leaves every `poetry.lock` stale. Relock the root before tagging (`poetry lock`); the
+   submodules can only be relocked after the root release is live on PyPI, since their pins now
+   name a version that does not exist yet. [`scripts/lock_subpackages.py`](../../../scripts/lock_subpackages.py)
+   does that walk — relock, commit, push, in each submodule's own repository — and the bump script
+   prints this ordering when it finishes.
 
 4. **Add the `RELEASE_NOTES.md` entry** at the top, directly under `# Release Notes`. Match the
    existing shape:
@@ -124,11 +126,25 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
    package shares the version, and `RELEASE_NOTES.md` has the matching entry. It then pushes an
    annotated `vX.Y.Z` tag and opens the GitHub release using that entry as the body.
 
-   Then tag the submodules with
-   [`scripts/tag_subpackages.py`](../../../scripts/tag_subpackages.py) — **after** this release is
-   live on PyPI, since every subpackage now pins `vintasend` at this exact version and cannot
-   resolve it before then. That script checks all ten packages before pushing any tag, so a
-   blocked package stops the run rather than leaving the family half-published.
+   Then release the submodules — **after** this release is live on PyPI, since every subpackage
+   pins `vintasend` at this exact version and cannot resolve it before then.
+
+   That happens in waves, not in one go. A package can only be locked and tagged once every
+   vintasend it depends on is installable, and two of them depend on a sibling rather than only on
+   the root: `vintasend-django-templates-manager` and `vintasend-templates-management-api` both
+   need `vintasend-managed-templates` published first. So per wave:
+
+   ```bash
+   scripts/lock_subpackages.py --dry-run   # shows the wave map and what is ready
+   scripts/lock_subpackages.py             # relock, commit and push the ready packages
+   scripts/tag_subpackages.py              # tag that wave; the rest report as waiting
+   # wait for those publishes to land on PyPI, then repeat for the next wave
+   ```
+
+   Both scripts print the same release order, tag only what is ready, and check every package in
+   the wave before pushing any tag — so a blocked package stops that wave rather than leaving it
+   half-published. A package already tagged on origin is reported as done, which is what makes the
+   second and third runs safe.
 
 8. **Watch the workflow.** `gh run watch` or the Actions tab. It runs the matrix, then
    `test-before-publish` → `check-tests` → `publish-release`. A red matrix means nothing is
