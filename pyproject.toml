@@ -25,6 +25,9 @@ requests = "^2.34.2"
 freezegun = "^1.5.5"
 coverage = "^7.14.1"
 tox = "^4.55.0"
+# Makes the [gh] section in tox.ini effective: each CI job then runs only the
+# envs mapped to its interpreter instead of every env it can find one for.
+tox-gh = "^1.8.0"
 pytest = "^9.0.3"
 pytest-asyncio = "^1.4.0"
 pytest-xdist = {version = "^3.8.0", extras=["psutil"]}

@@ -1410,6 +1410,22 @@ completion = ["argcomplete (>=3.6.3)"]
 testing = ["devpi-process (>=1.1.1)", "pytest (>=9.0.2)", "pytest-mock (>=3.15.1)"]
 
 [[package]]
+name = "tox-gh"
+version = "1.8.0"
+description = "Seamless integration of tox into GitHub Actions."
+optional = false
+python-versions = ">=3.10"
+groups = ["dev"]
+files = [
+    {file = "tox_gh-1.8.0-py3-none-any.whl", hash = "sha256:c29a109dc4c1a51bc472b4989bd7063ac9be07bf0c16a2b0fcbe57f16757e397"},
+    {file = "tox_gh-1.8.0.tar.gz", hash = "sha256:19c151525e6ed383b2fd23f8f3a35301ee12f3438c19ac7062f81c30958626ad"},
+]
+
+[package.dependencies]
+tox = ">=4.31"
+typing-extensions = {version = ">=4.12", markers = "python_version < \"3.12\""}
+
+[[package]]
 name = "typing-extensions"
 version = "4.16.0"
 description = "Backported and Experimental Type Hints for Python 3.9+"
@@ -1535,4 +1551,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.15"
-content-hash = "4a698eaec5c24aa67a72ff378b4aa4c575fc90dd27df0313f1e5268feb3967ff"
+content-hash = "821e743ed77a080860edc7ca51e724cc473887a386cfe6c744d23946861a3aef"
