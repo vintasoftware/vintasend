@@ -1,6 +1,6 @@
 [project]
 name = "vintasend"
-version = "3.1.0"
+version = "3.1.1"
 description = "A flexible package for implementing transactional notifications"
 authors = [{ name = "Hugo bessa", email = "hugo@vinta.com.br" }]
 license = "MIT"

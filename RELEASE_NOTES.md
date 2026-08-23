@@ -1,5 +1,148 @@
 # Release Notes
 
+## Version 3.1.1 (2026-08-23)
+
+The managed-templates packages gain a capability report and ordering. The `vintasend` package
+itself has no code change since 3.1.0 -- the number moves because the whole family releases in
+lockstep. Everything below concerns `vintasend-managed-templates`, its Django storage backend, and
+the templates management API.
+
+The TypeScript siblings moved first on this one. The vocabulary, the capability keys and the REST
+contract are all spelled to match `vintasend-ts-managed-templates`, so a client or dashboard
+consuming both ecosystems reads one set of names.
+
+### Features
+
+#### A capability vocabulary for managed templates
+
+* `vintasend_managed_templates.filters` gained `DEFAULT_TEMPLATE_BACKEND_FILTER_CAPABILITIES`, the
+  managed-template counterpart of `DEFAULT_BACKEND_FILTER_CAPABILITIES` on the notification side.
+  28 keys: `logical.*`, one `fields.*` per field of `ManagedTemplateFilterFields`,
+  `stringLookups.*`, and the six new `orderBy.*`.
+* Keys are camelCase dotted (`fields.templateManagedBackend`, `orderBy.createdAt`) even though the
+  Python field names are snake_case, because a report goes on the wire. `field_capability_key` and
+  `order_by_capability_key` translate; both raise `KeyError` for a name outside the vocabulary
+  rather than returning a key no backend has declared.
+* `BaseTemplateManagerBackend.get_filter_capabilities` is new and **concrete**, returning `{}`.
+  `ManagedTemplateService.get_backend_supported_filter_capabilities` merges a backend's report over
+  the default and caches it for the life of the service.
+* There is deliberately no `pagination.oneIndexed` key. Unlike the notification seam, every
+  template read passes through `ManagedTemplateService`'s own `page >= 1` validation, so 1-indexing
+  is this seam's convention throughout and there is nothing to negotiate.
+
+#### Ordering on the template-manager seam
+
+* `get_paginated_templates` and `get_paginated_filtered_templates` -- on the backend ABC and on the
+  service -- gained an optional `order_by: ManagedTemplateOrderBy | None`.
+* `ManagedTemplateFilterOrderByField` widens from `created_at` / `updated_at` to `key`, `name`,
+  `version`, `status`, `created_at` and `updated_at`. Each is a scalar a backend already stores per
+  row, so a store can answer it from an index. Tags are excluded (a many-to-many has no single
+  value to compare) and so is `most_recent_active_version` (a filter, not a field).
+* A backend accepting `order_by` MUST apply it to the whole result set **before** paging. Sorting a
+  page after it has been chosen orders rows *within* the page while the rows selected *for* it came
+  back in the store's own order -- right on page 1, wrong on every page after it.
+* `sort_templates(templates, order_by)` is the shared comparator, for a backend that reads a
+  complete set anyway. Total and stable: ties break on `(key, version)`, and neither the tiebreak
+  nor the placement of absent values flips with the direction -- either would let a page boundary
+  move between two requests and drop or repeat a row. Strings compare by code point rather than by
+  locale, so two machines serving two pages of one listing cannot disagree.
+
+#### The service acts on the capability report
+
+* `prune_unsupported_filters` is new, and `ManagedTemplateService` applies it before every filtered
+  read. Previously nothing in the package read a capability report at all -- including the default
+  listing, which asks for `most_recent_active_version` on every unqualified read.
+* **Dropping only ever widens.** A pruned filter matches everything the original matched and
+  possibly more, so a caller sees extra rows rather than missing ones. The corners follow from that
+  rule: an `or` is dropped whole (removing one branch of a disjunction narrows it), a `not` whose
+  inside pruned away is dropped (negating "everything" is "nothing"), and a bare string counts as
+  `exact` *and* case-sensitive, so a backend lacking either cannot answer it.
+
+#### Filters are dropped; orders are refused
+
+* The one asymmetry in the design. An unsupported filter is pruned and the call succeeds; an
+  unsupported order raises the new `ManagedTemplateUnsupportedOrderingError`.
+* An ignored filter returns more rows than were asked for, which the caller can see. An ignored
+  order returns exactly the rows requested in an arbitrary sequence, and nothing downstream can
+  tell -- a UI renders that page under a highlighted "sorted by name" header and shows a sort that
+  never happened.
+* `get_supported_order_by_fields()` is how a caller asks before it sends.
+
+#### `GET /templates` gains ordering, negotiated through `/capabilities`
+
+* Two query parameters on `vintasend-templates-management-api`: `orderByField` (`key`, `name`,
+  `version`, `status`, `createdAt`, `updatedAt`) and `orderByDirection` (`asc`, `desc`, defaulting
+  to `asc` when a field is given). `GET /api/v1/capabilities` now carries the matching `orderBy.*`
+  keys.
+* **Neither parameter has a default.** Every `orderBy.*` key defaults to false, so defaulting to a
+  field would make the ordinary listing a 400 against most backends. Omitted asks for the backend's
+  own order. This differs from `vintasend-api`, which does default its order -- there, every
+  notification backend can sort.
+* An order the backend cannot apply is a `400` naming the capability key in `details`, not a silent
+  drop. `orderByDirection` without `orderByField` is also a 400: ignoring it looks exactly like a
+  backend that cannot sort, which hides the client bug.
+* `openapi.yaml` is regenerated. `test_openapi.py` pins the enum against three places at once --
+  the spec, the literal the server validates with, and the library's field list -- so a field added
+  to one and forgotten in the others fails a test rather than a client.
+* `capabilities.py` no longer keeps its own copy of the default map. The library owns the
+  vocabulary and the service does the merging, so there is one fewer place for the two to drift.
+
+#### The Django backend declares every field it can order by
+
+* `vintasend-django-templates-manager` implements `get_filter_capabilities`, declaring all six
+  `orderBy.*` keys. All six are real indexed columns on `ManagedTemplate`, so each is answered by
+  the database and the order is composed into the SQL rather than applied to a page.
+* Its order-field map widens from two entries to six, and `get_paginated_templates` accepts an
+  order too rather than being hardcoded to newest-first. An unordered read still falls back to
+  `-created, -id`, because a key has a row per version and an unordered offset page is free to
+  return one row twice and skip another.
+* Every entry is pinned by a test that *runs* the sort rather than reading the column definition.
+  `version` is the one worth the effort: it is a `PositiveIntegerField`, so v10 sorts after v2 --
+  which a store keeping versions as strings gets wrong silently.
+
+### Backwards compatibility
+
+**No seam method was added, removed or renamed, and no existing signature or semantic changed in a
+way an implementation has to react to.** `BaseTemplateManagerBackend.__abstractmethods__` is
+unchanged, so no custom template-manager backend breaks at instantiation. The notification seams --
+`BaseNotificationBackend`, `AsyncIOBaseNotificationBackend`, the adapter ABCs and the template
+renderer ABCs -- are untouched entirely.
+
+* **`get_filter_capabilities` is concrete, not abstract.** It returns `{}`, so a backend that says
+  nothing keeps working and reads as fully capable of every *filter*. Backends SHOULD override it
+  to declare what they cannot do, and MUST override it to offer ordering at all -- see the next
+  point.
+* **The `orderBy.*` keys default to `False`.** This is the one exception to "a missing key means
+  supported", and it is deliberate: ordering is newer vocabulary than the filters, so a `True`
+  default would have every backend written before this release claim an order it silently ignores.
+  A backend that can sort has to say so, and should verify each claim by *running* the sort rather
+  than reading its store's documentation.
+* **The optional `order_by` argument is never passed unasked.** `get_paginated_templates` and
+  `get_paginated_filtered_templates` gained it on the ABC, but the service passes it as a keyword
+  only when the backend's own report says the field is orderable -- which a silent backend's never
+  does. A backend whose methods still take three arguments is therefore never handed a fourth.
+  Adding the parameter is a signature-only change; honouring it means ordering the whole result set
+  before paging.
+* **Filtered reads now reach a backend pruned.** A backend that declares a limitation stops being
+  handed the part of the filter it said it could not answer, which is the point of the report. Two
+  consequences worth checking against your own implementation: a backend that declared a limitation
+  and yet answered the filter anyway will see those listings widen, and `get_all_templates()`
+  against a backend declining `fields.mostRecentActiveVersion` now returns every version rather
+  than the filter being passed through and quietly ignored.
+* **`ManagedTemplateFilterOrderByField` widened from two values to six.** Nothing in the library
+  consumed it before this release -- it was declared and never wired to the seam -- so this is
+  additive in practice. Code matching on it exhaustively gains four cases.
+* **New exception**: `ManagedTemplateUnsupportedOrderingError`, subclassing `ManagedTemplateError`.
+  It is raised only for an order, never for a filter. Existing `except ManagedTemplateError`
+  handlers already catch it.
+* **REST clients**: both new query parameters are optional and have no default, so an existing
+  request is byte-for-byte unaffected. A client asserting on the exact contents of
+  `GET /capabilities` will see six additional keys.
+* **Release order.** `vintasend-managed-templates` must reach PyPI before
+  `vintasend-django-templates-manager` and `vintasend-templates-management-api`, which pin it
+  exactly and cannot resolve a version that does not exist yet. `scripts/lock_subpackages.py` and
+  `scripts/tag_subpackages.py` already encode that wave.
+
 ## Version 3.1.0 (2026-08-21)
 
 A supported-versions and packaging release. The `vintasend` package itself has no code change

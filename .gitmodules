@@ -34,3 +34,12 @@
 [submodule "tools/vintasend-templates-management-api"]
 	path = tools/vintasend-templates-management-api
 	url = git@github.com:vintasoftware/vintasend-templates-management-api.git
+[submodule "tools/vintasend-dashboard-core"]
+	path = tools/vintasend-dashboard-core
+	url = git@github.com:vintasoftware/vintasend-dashboard-core.git
+[submodule "tools/vintasend-templates-management-dashboard-core"]
+	path = tools/vintasend-templates-management-dashboard-core
+	url = git@github.com:vintasoftware/vintasend-templates-management-dashboard-core.git
+[submodule "tools/vintasend-templates-management-dashboard"]
+	path = tools/vintasend-templates-management-dashboard
+	url = git@github.com:vintasoftware/vintasend-templates-management-dashboard.git
