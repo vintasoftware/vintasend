@@ -146,6 +146,18 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
    half-published. A package already tagged on origin is reported as done, which is what makes the
    second and third runs safe.
 
+   [`scripts/release_all.py`](../../../scripts/release_all.py) drives that entire loop — root tag,
+   wait for PyPI, then lock/tag/wait per wave — in one unattended run:
+
+   ```bash
+   scripts/release_all.py --dry-run   # the plan, plus every script's own checks
+   scripts/release_all.py             # one confirmation, then the whole family
+   ```
+
+   It asks once (typing the version, not `y`), stops at the first failure without pushing anything
+   further, and skips whatever is already published — so re-running after a failure resumes rather
+   than double-publishing. Use the individual scripts when you want to inspect between steps.
+
 8. **Watch the workflow.** `gh run watch` or the Actions tab. It runs the matrix, then
    `test-before-publish` → `check-tests` → `publish-release`. A red matrix means nothing is
    published and the tag now points at a commit that cannot ship: fix forward, bump to the next
