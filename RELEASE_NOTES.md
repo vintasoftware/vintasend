@@ -1,6 +1,6 @@
 # Release Notes
 
-## Version 3.2.0 (2026-10-06)
+## Version 3.2.0 (2026-10-07)
 
 Managed templates get a send path that never renders a draft, defaults for keys nobody has written
 yet, and protection for published versions and their history. The `vintasend` package itself has
