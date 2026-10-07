@@ -1,5 +1,128 @@
 # Release Notes
 
+## Version 3.2.0 (2026-10-06)
+
+Managed templates get a send path that never renders a draft, defaults for keys nobody has written
+yet, and protection for published versions and their history. The `vintasend` package itself has
+no code change since 3.1.1 -- the number moves because the whole family releases in lockstep.
+Everything below concerns `vintasend-managed-templates`, its Django storage backend, and the
+templates management API.
+
+**This release changes behaviour, not just API.** Unpinned sends resolve differently, deletes are
+refused by default, and the Django backend ships migrations. Read
+[Backwards compatibility](#backwards-compatibility) before upgrading.
+
+### Features
+
+#### Sends render the newest *active* version
+
+* `BaseTemplateManagerBackend.get_active_template(key)` is new and **concrete**. It returns the
+  highest-numbered `ACTIVE` version of a key, skipping drafts and retired versions whatever their
+  number. The default answers through `get_filtered_templates`; backends can override it with
+  something cheaper, picking with `lifecycle.newest_active_version` and raising
+  `lifecycle.no_active_version(key)` so every backend applies the same rule.
+* `ManagedTemplateService.get_active_template` delegates to it. An unpinned `render`,
+  `service.render` with no version and no pin, and `get_latest_template_version` (what
+  `pin_template_versions=True` pins to) all go through it, so a draft is never sent or pinned.
+* `get_template(key)` keeps answering the newest version whatever its status. That is the editing
+  view, for editors and APIs; the send path is the only place "latest" now means "latest active".
+* A key that exists but has no active version raises the new `ManagedTemplateNoActiveVersionError`.
+* `vintasend-django-templates-manager` overrides `get_active_template` with one indexed query.
+
+#### Fallbacks for keys with nothing published
+
+* `ManagedTemplateRenderer` (email and SMS) accepts
+  `fallback=ManagedTemplateFallback(templates={...}, renderer=...)`: a per-key default rendered
+  while the key has nothing published, so an application can send before anyone has written the
+  template in the store.
+* It applies only on `render` (the send path), only to an unpinned notification, and only to a
+  registered key. A stored template that fails to compose still raises: a default must not hide a
+  broken template. `ManagedTemplateService.render` and previews never fall back.
+* A fallback send leaves `used_template_version` null, which is how a host tells it apart from a
+  stored-template send. The renderer logs the key and notification id at `INFO`, never the
+  context.
+
+#### Published versions cannot be deleted, and history outlives deletion
+
+* `delete_template` refuses any version that was ever published -- not `DRAFT` now, or anything but
+  `DRAFT` in its status history -- with the new `ManagedTemplateDeletionNotAllowedError`. Archive a
+  published version instead. `allow_deleting_published_versions=True` lifts the rule; through the
+  service, it must be set on both `ManagedTemplateService` and the backend.
+* The rules live in the new `vintasend_managed_templates.lifecycle` module
+  (`newest_active_version`, `no_active_version`, `is_template_version_deletable`,
+  `assert_template_version_deletable`), so every backend applies them identically.
+* The seam now documents that a backend must keep a deleted version's status history readable
+  through `get_template_status_history`, and must never reuse a deleted version's number.
+* `vintasend-django-templates-manager` enforces the rule with the row locked, inside the delete's
+  transaction. The admin applies it too: a published version has no delete button and its delete
+  page answers 403, and a "Delete selected" batch holding one is refused whole. Subclass
+  `ManagedTemplateAdmin` with `allow_deleting_published_versions = True` to lift it.
+* `ManagedTemplateStatusRecord` stores its own `template_key` and `version`, and its `template` link
+  is `SET_NULL` rather than `CASCADE`, so history survives any delete -- through the backend, the
+  admin, or a queryset `.delete()`. A new version is numbered one above the highest the key has
+  ever had, history included.
+* `vintasend-templates-management-api` answers a refused delete on either `DELETE` route with a
+  `409 CONFLICT` carrying the library's message, rather than a 500.
+
+### Bug Fixes
+
+* **`vintasend-django-templates-manager`: row locks outside a transaction.**
+  `create_template_status_update` and `delete_template` evaluated `select_for_update()` before
+  entering `transaction.atomic()`. On PostgreSQL and MySQL that raises `TransactionManagementError`
+  in autocommit mode, so both methods only worked for hosts running with `ATOMIC_REQUESTS`. SQLite
+  has no `SELECT ... FOR UPDATE`, which hid it from the test suite; a new test re-arms Django's
+  check on SQLite and covers every locking method.
+* **`vintasend-django-templates-manager`: `create_template` numbering.** The new version's number
+  is now chosen inside the creating transaction, after locking the key's surviving status history,
+  so two concurrent creates of a key whose versions were all deleted no longer claim the same
+  number. A key that still has *any* version is refused with `IntegrityError`, as a duplicate
+  always was; before, a key whose v1 had been deleted would hand v1 out again, inheriting the
+  deleted v1's history.
+
+### Backwards compatibility
+
+**No seam method was added as abstract, and none was removed or renamed.**
+`BaseTemplateManagerBackend.__abstractmethods__` is unchanged, so no custom template-manager
+backend breaks at instantiation. The notification seams -- `BaseNotificationBackend`,
+`AsyncIOBaseNotificationBackend`, the adapter ABCs and the template renderer ABCs -- are untouched.
+
+**Three behaviours change, though, and each needs checking against your deployment:**
+
+* **Unpinned sends render the newest `ACTIVE` version, not the newest version.** A key holding only
+  drafts used to send its latest draft; it now raises `ManagedTemplateNoActiveVersionError` -- or
+  renders the registered fallback, if there is one. **Activate every template you currently send
+  before upgrading**, or those sends start failing. `pin_template_versions=True` likewise pins the
+  newest active version, and leaves a notification unpinned when its key has nothing published.
+  Pinned notifications are unaffected: a pin renders its version whatever its status.
+* **`delete_template` refuses published versions by default** -- through the service, through the
+  Django backend, and through the Django admin. Code that deletes published versions must archive
+  them instead, or opt in with `allow_deleting_published_versions=True` on both the service and the
+  backend.
+* **`vintasend-django-templates-manager` adds migrations `0002`-`0004`** moving status history off
+  `CASCADE`. A stop-migrate-start deploy needs nothing more. For a rolling deploy, migrate to
+  `0002`, roll the new code out everywhere, then run the rest -- the package README has the full
+  order. Rolling back to `0001` stops, rather than deleting history, if any version has been deleted
+  since the upgrade.
+
+The rest is additive:
+
+* **`get_active_template` is concrete, not abstract.** A backend that doesn't override it is
+  answered through `get_filtered_templates`. Override it when your store can answer more cheaply.
+* **Custom backends SHOULD enforce the deletion rule** with
+  `lifecycle.assert_template_version_deletable`, keep status history readable after a delete, and
+  never reuse a deleted version's number. `ManagedTemplateService` checks the deletion rule before
+  calling the backend either way, so a backend that doesn't is still protected when used through
+  the service.
+* **New exceptions.** `ManagedTemplateNoActiveVersionError` subclasses
+  `ManagedTemplateNotFoundError`, so existing not-found handlers and 404 mappings catch it.
+  `ManagedTemplateDeletionNotAllowedError` subclasses `ManagedTemplateError`.
+* **REST clients.** Both `DELETE` template routes can now answer `409 CONFLICT`, documented in
+  `openapi.yaml`. No new error code: `CONFLICT` already existed. `vintasend-ts-templates-management-api`
+  ships the same contract and needs the matching change to stay byte-identical.
+* **Release order.** `vintasend-managed-templates` must reach PyPI before
+  `vintasend-django-templates-manager` and `vintasend-templates-management-api`, which pin it
+  exactly. `scripts/lock_subpackages.py` and `scripts/tag_subpackages.py` already encode that wave.
+
 ## Version 3.1.1 (2026-08-23)
 
 The managed-templates packages gain a capability report and ordering. The `vintasend` package
