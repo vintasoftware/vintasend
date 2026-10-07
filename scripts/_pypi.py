@@ -8,6 +8,8 @@ needs the same question answered: is `name==version` on PyPI yet?
 
 from __future__ import annotations
 
+import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +17,9 @@ from collections.abc import Callable
 
 
 TIMEOUT = 15
+
+# The JSON flavour of the simple index (PEP 691), which lists every version (PEP 700).
+SIMPLE_INDEX_ACCEPT = "application/vnd.pypi.simple.v1+json"
 
 _SEEN: dict[tuple[str, str], bool | None] = {}
 
@@ -35,17 +40,52 @@ def on_pypi(name: str, version: str, refresh: bool = False) -> bool | None:
     if key in _SEEN and not refresh:
         return _SEEN[key]
 
-    url = f"https://pypi.org/pypi/{name}/{version}/json"
-    try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:  # noqa: S310 -- literal https
-            found: bool | None = response.status == 200
-    except urllib.error.HTTPError as exc:
-        found = False if exc.code == 404 else None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        found = None
+    found = _on_json_api(name, version)
+    if found is True:
+        found = _on_simple_index(name, version)
 
     _SEEN[key] = found
     return found
+
+
+def _on_json_api(name: str, version: str) -> bool | None:
+    """Whether PyPI's JSON API knows `name==version`. None means the question failed."""
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:  # noqa: S310 -- literal https
+            return response.status == 200
+    except urllib.error.HTTPError as exc:
+        return False if exc.code == 404 else None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def _on_simple_index(name: str, version: str) -> bool | None:
+    """Whether the simple index -- what pip actually resolves against -- lists `version`.
+
+    The JSON API can report an upload before the simple index does. In the 3.2.0 release,
+    two packages' publish jobs failed with "No matching distribution found for
+    vintasend==3.2.0" a couple of minutes after the JSON API had answered yes, while their
+    other matrix jobs, moments later, installed it fine. So a version only counts as live
+    once the index pip reads lists it too.
+    """
+    normalized = re.sub(r"[-_.]+", "-", name).lower()  # PEP 503
+    request = urllib.request.Request(  # noqa: S310 -- literal https
+        f"https://pypi.org/simple/{normalized}/",
+        headers={"Accept": SIMPLE_INDEX_ACCEPT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        return False if exc.code == 404 else None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+    versions = payload.get("versions") if isinstance(payload, dict) else None
+    if not isinstance(versions, list):
+        return None
+    return version in versions
 
 
 def wait_for_pypi(

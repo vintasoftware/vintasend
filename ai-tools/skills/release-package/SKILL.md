@@ -146,6 +146,15 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
    half-published. A package already tagged on origin is reported as done, which is what makes the
    second and third runs safe.
 
+   `vintasend-api` and `vintasend-templates-management-api` are applications: they have no
+   `.github/workflows/publish.yml`, so their tag is the whole release and they never appear on
+   PyPI. The wave map marks them `(tag-only)`. Don't wait for them there.
+
+   A version counts as live only once PyPI's simple index lists it, not just the JSON API. pip
+   reads the simple index, and in 3.2.0 two Python 3.12 publish jobs failed with "No matching
+   distribution" a couple of minutes after the JSON API already listed the new `vintasend`. If a
+   job still fails that way, re-run its failed jobs on the same tag: nothing was uploaded.
+
    [`scripts/release_all.py`](../../../scripts/release_all.py) drives that entire loop — root tag,
    wait for PyPI, then lock/tag/wait per wave — in one unattended run:
 
