@@ -64,6 +64,22 @@ refused by default, and the Django backend ships migrations. Read
 * `vintasend-templates-management-api` answers a refused delete on either `DELETE` route with a
   `409 CONFLICT` carrying the library's message, rather than a 500.
 
+#### Hardening the templates management API
+
+* **`MANAGED_TEMPLATE_ACTOR_RESOLVER`** names a callable `(request) -> str | None` that says who
+  made a status change. When it is set, its answer is what every status route records as
+  `changedBy`, and any `changedBy` in the request body is ignored, so a caller holding the API key
+  cannot write someone else's identity into the audit trail. It may be `async`.
+* **Unexpected errors are logged as one redacted line**: the error class, a request id, the method
+  and the route pattern -- never the message, traceback, request body or preview context, which can
+  carry template content or health data. Django's duplicate `django.request` record for the 500 is
+  suppressed, and the response carries the request id in `X-Request-Id`.
+* **`MANAGED_TEMPLATE_UNHANDLED_ERROR_HANDLER`** names a callable `(exc, request, request_id)` that
+  takes over reporting, for an error tracker with its own scrubbing. It may be `async`. If it
+  raises, the redacted line is logged instead.
+* A system check fails `manage.py check` when either setting names something that cannot be
+  imported or is not callable.
+
 ### Bug Fixes
 
 * **`vintasend-django-templates-manager`: row locks outside a transaction.**
@@ -86,7 +102,7 @@ refused by default, and the Django backend ships migrations. Read
 backend breaks at instantiation. The notification seams -- `BaseNotificationBackend`,
 `AsyncIOBaseNotificationBackend`, the adapter ABCs and the template renderer ABCs -- are untouched.
 
-**Three behaviours change, though, and each needs checking against your deployment:**
+**Four behaviours change, though, and each needs checking against your deployment:**
 
 * **Unpinned sends render the newest `ACTIVE` version, not the newest version.** A key holding only
   drafts used to send its latest draft; it now raises `ManagedTemplateNoActiveVersionError` -- or
@@ -103,6 +119,11 @@ backend breaks at instantiation. The notification seams -- `BaseNotificationBack
   `0002`, roll the new code out everywhere, then run the rest -- the package README has the full
   order. Rolling back to `0001` stops, rather than deleting history, if any version has been deleted
   since the upgrade.
+* **`vintasend-templates-management-api` no longer logs unexpected errors in full.** A deployment
+  that relied on tracebacks in its logs now gets one line per error. Set
+  `MANAGED_TEMPLATE_UNHANDLED_ERROR_HANDLER` to send the exception to an error tracker that scrubs
+  it. Leaving `MANAGED_TEMPLATE_ACTOR_RESOLVER` unset keeps taking `changedBy` from the body, as
+  before.
 
 The rest is additive:
 
@@ -117,8 +138,9 @@ The rest is additive:
   `ManagedTemplateNotFoundError`, so existing not-found handlers and 404 mappings catch it.
   `ManagedTemplateDeletionNotAllowedError` subclasses `ManagedTemplateError`.
 * **REST clients.** Both `DELETE` template routes can now answer `409 CONFLICT`, documented in
-  `openapi.yaml`. No new error code: `CONFLICT` already existed. `vintasend-ts-templates-management-api`
-  ships the same contract and needs the matching change to stay byte-identical.
+  `openapi.yaml`. No new error code: `CONFLICT` already existed. A 500 now carries an
+  `X-Request-Id` header. `vintasend-ts-templates-management-api` ships the same contract, kept
+  byte-identical.
 * **Release order.** `vintasend-managed-templates` must reach PyPI before
   `vintasend-django-templates-manager` and `vintasend-templates-management-api`, which pin it
   exactly. `scripts/lock_subpackages.py` and `scripts/tag_subpackages.py` already encode that wave.
