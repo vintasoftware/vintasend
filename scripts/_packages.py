@@ -29,6 +29,10 @@ PACKAGE_GLOBS = ("pyproject.toml", "implementations/*/pyproject.toml", "tools/*/
 # skipped in silence.
 NON_PYTHON_SUBMODULES = frozenset({"tools/vintasend-dashboard"})
 
+# A package with this workflow uploads to PyPI when it is tagged. One without it is an
+# application released as a tag alone -- see `Package.publishes`.
+PUBLISH_WORKFLOW = Path(".github/workflows/publish.yml")
+
 # Tables whose `name`/`version` keys describe the package itself. The repo uses
 # both spellings: PEP 621 `[project]` and legacy `[tool.poetry]`.
 VERSION_TABLES = ("project", "tool.poetry")
@@ -80,6 +84,16 @@ class Package:
     @property
     def rel(self) -> str:
         return str(self.path.parent.relative_to(REPO_ROOT)) or "."
+
+    @property
+    def publishes(self) -> bool:
+        """Whether tagging this package uploads it to PyPI, or the tag is the whole release.
+
+        `vintasend-api` and `vintasend-templates-management-api` are applications: they have a
+        CI workflow but no publish workflow, so PyPI never hears of them. A script waiting for
+        one of them to appear there would wait until its timeout.
+        """
+        return (self.dir / PUBLISH_WORKFLOW).is_file()
 
 
 def read_metadata(pkg: Package) -> None:
@@ -204,6 +218,14 @@ def release_waves(packages: list[Package]) -> list[list[Package]]:
     root. Each wave is a set that can go together; the next one waits for it.
     """
     by_name = {p.name: p for p in packages}
+    for pkg in packages:
+        for dep in sibling_deps(pkg):
+            sibling = by_name.get(dep.name)
+            if sibling is not None and not sibling.publishes and not dep.local:
+                raise PackageError(
+                    f"{pkg.name} depends on {dep.name}, which is released as a tag only and "
+                    "never reaches PyPI, so that dependency can never resolve"
+                )
     needs = {
         p.name: {d.name for d in sibling_deps(p) if d.name in by_name and d.name != p.name}
         for p in packages
@@ -229,7 +251,7 @@ def wave_lines(waves: list[list[Package]]) -> list[str]:
     rendered = ["release order (each wave waits for the one before it to be live on PyPI):"]
     for number, wave in enumerate(waves, start=1):
         body = textwrap.fill(
-            ", ".join(p.name for p in wave),
+            ", ".join(p.name if p.publishes else f"{p.name} (tag-only)" for p in wave),
             width=84,
             subsequent_indent=" " * 12,
             break_on_hyphens=False,

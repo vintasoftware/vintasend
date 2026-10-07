@@ -10,6 +10,10 @@ The steps are the ones you would run by hand, in the only order that works:
     5. wait                    until every package in the wave is on PyPI
     6. back to 3 for the next wave, until nothing is left
 
+A package with no `.github/workflows/publish.yml` -- `vintasend-api` and
+`vintasend-templates-management-api`, which are applications -- is released by its
+tag alone. It is done once the tag is on origin, and nothing waits for it on PyPI.
+
 The waiting is what makes this a script rather than a list. A subpackage pins
 `vintasend` at the version being released, so `poetry lock` cannot resolve until
 the root is actually live, and `vintasend-django-templates-manager` cannot
@@ -70,13 +74,20 @@ def run_script(name: str, *args: str) -> int:
     return subprocess.run(argv, cwd=REPO_ROOT, check=False).returncode  # noqa: S603
 
 
-def published(pkg: Package, version: str) -> bool:
-    return on_pypi(pkg.name, version) is True
+def released(pkg: Package, version: str) -> bool:
+    """Whether `pkg` is already out at `version`.
+
+    For a package that publishes, that means installable from PyPI. A tag-only package (see
+    `Package.publishes`) never reaches PyPI, so for it the pushed tag is the release.
+    """
+    if pkg.publishes:
+        return on_pypi(pkg.name, version) is True
+    return remote_tag_exists(pkg.dir, f"v{version}")
 
 
 def release_root(root: Package, version: str, args: argparse.Namespace) -> tuple[bool, str]:
     """Tag and publish the root package. Returns (ok, what happened)."""
-    if published(root, version):
+    if released(root, version):
         return True, f"{root.name} {version} is already on PyPI"
 
     if remote_tag_exists(REPO_ROOT, f"v{version}"):
@@ -105,9 +116,9 @@ def release_wave(
     wave: list[Package], number: int, version: str, args: argparse.Namespace
 ) -> tuple[bool, str]:
     """Lock, commit, tag and publish one wave of subpackages."""
-    todo = [pkg for pkg in wave if not published(pkg, version)]
+    todo = [pkg for pkg in wave if not released(pkg, version)]
     if not todo:
-        return True, f"wave {number} is already on PyPI"
+        return True, f"wave {number} is already released"
 
     only: list[str] = []
     for pkg in todo:
@@ -122,8 +133,14 @@ def release_wave(
             "  publishing; re-run this script once the rest is fixed."
         )
 
+    # A tag-only package is done once tag_subpackages.py has pushed its tag; only the rest
+    # have an upload to wait for.
+    uploading = [pkg.name for pkg in todo if pkg.publishes]
+    if not uploading:
+        return True, f"wave {number} tagged: {', '.join(pkg.name for pkg in todo)}"
+
     print(f"\nwaiting for wave {number} to reach PyPI ...")
-    late = wait_for_pypi([pkg.name for pkg in todo], version, args.timeout * 60, args.poll)
+    late = wait_for_pypi(uploading, version, args.timeout * 60, args.poll)
     if late:
         return False, (
             f"these did not reach PyPI within {args.timeout:.0f} minutes: {', '.join(late)}\n"
@@ -203,15 +220,19 @@ def main() -> int:
     for line in wave_lines(waves):
         print(line)
 
-    print("\nalready on PyPI:")
-    done = [pkg.name for pkg in packages if published(pkg, version)]
+    print("\nalready released:")
+    done = [
+        pkg.name if pkg.publishes else f"{pkg.name} (tagged)"
+        for pkg in packages
+        if released(pkg, version)
+    ]
     print(f"  {', '.join(done) if done else '(nothing yet)'}")
 
     if args.dry_run:
         print("\n" + "=" * 78)
         print("DRY RUN -- running each script's own checks, publishing nothing")
         print("=" * 78)
-        if published(root, version):
+        if released(root, version):
             print(f"\nskipping tag_release.py: {root.name} {version} is already on PyPI")
         else:
             run_script("tag_release.py", "--dry-run")
