@@ -1056,7 +1056,7 @@ lifecycle on top.
 
 * **[vintasend-managed-templates](https://github.com/vintasoftware/vintasend-managed-templates/)**: The template management layer itself -- the `BaseTemplateManagerBackend` seam, `ManagedTemplateService` for creating/versioning/publishing templates, and `ManagedTemplateEmailRenderer` / `ManagedTemplateSMSRenderer`, which wrap any existing `BaseNotificationTemplateRenderer` and feed it the stored template body instead of a template path. Storage-agnostic on its own; pair it with a manager backend.
 * **[vintasend-django-templates-manager](https://github.com/vintasoftware/vintasend-django-templates-manager/)**: Stores managed templates in the database through the Django ORM, with `ManagedTemplate` / `ManagedTemplateStatusRecord` models, an admin, and filtering + pagination over template versions and their status history.
-* **[vintasend-templates-management-api](https://github.com/vintasoftware/vintasend-templates-management-api/)**: A django-ninja REST API over a template manager backend, for a UI where non-technical people create, version, publish and preview templates. Tracked here as a submodule under `tools/`.
+* **[vintasend-templates-management-api](https://github.com/vintasoftware/vintasend-templates-management-api/)**: A django-ninja REST API over a template manager backend, for a UI where non-technical people create, version, publish and preview templates. Install it from PyPI (`pip install vintasend-templates-management-api`) and mount it in your own Django project, or run it on its own. Tracked here as a submodule under `tools/`.
 
 Because the renderer wraps another renderer rather than replacing it, a notification's
 `body_template` stops being a path and becomes a managed template's key -- everything else about

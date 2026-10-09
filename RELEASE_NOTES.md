@@ -1,5 +1,49 @@
 # Release Notes
 
+## Unreleased
+
+### Features
+
+#### `vintasend-api` and `vintasend-templates-management-api` are on PyPI
+
+Both APIs are published to PyPI from now on, like every other package in the family, and each
+can be mounted in a host's own Django project as well as run on its own.
+
+* **Install and mount.** `pip install vintasend-api` (or `vintasend-templates-management-api`),
+  add the app to `INSTALLED_APPS` (`vintasend_api.dashboard` /
+  `vintasend_templates_management_api.templates_manager`), and `include()` its URLconf
+  (`vintasend_api.dashboard.urls` / `vintasend_templates_management_api.templates_manager.urls`)
+  under any prefix. Each serves `health` and `api/v1/` there. Each API has its own URL namespace,
+  so one project can mount both.
+* **`VINTASEND_API_AUTHENTICATOR`**: a callable `(request) -> None`, or its dotted path, that
+  replaces the shared-key check. It refuses a caller by raising `ApiError.unauthorized(...)` (401)
+  or `ApiError.forbidden(...)` (403), and it may be `async`. With it set, `VINTASEND_API_KEY` is
+  not required. The setting has the same name in both APIs, so one function can serve both, and it
+  may raise either package's `ApiError`: a refusal is recognised by its class name and code, as the
+  TypeScript packages do.
+* **`bearer_token(request_or_header)`** in each app's `auth` module reads an
+  `Authorization: Bearer` token, or returns `None`, for an authenticator built around a token the
+  host verifies itself.
+* Every setting either app reads now has a default, so a host sets only what it uses. The CORS
+  middleware and the JSON 404 handler stay optional, and the CORS middleware follows the API's
+  routes under whatever prefix they are mounted at.
+* The bundled project still runs on its own (`DJANGO_SETTINGS_MODULE=vintasend_api.settings` or
+  `vintasend_templates_management_api.settings`, with gunicorn installed separately). It now reads
+  `.env` from the working directory rather than from the package's.
+
+### Release tooling
+
+* `scripts/lock_subpackages.py` retries a `poetry lock` that cannot see a just-published version,
+  clearing Poetry's PyPI cache between attempts. In 3.4.0 the whole of wave 2 failed that way two
+  minutes after `vintasend` went live, because the CDN edge Poetry reached still served the old
+  index page.
+
+### Backwards compatibility
+
+**Nothing changes for a client, or for a deployment of the standalone project.** The HTTP
+contract and `openapi.yaml` are unchanged. A deployment that kept its `.env` beside the package
+rather than in its working directory needs to move it, or set the variables in the environment.
+
 ## Version 3.4.0 (2026-10-09)
 
 One new setting in `vintasend-templates-management-api`. Every other package is released at 3.4.0
