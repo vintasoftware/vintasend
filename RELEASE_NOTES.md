@@ -1,5 +1,25 @@
 # Release Notes
 
+## Version 3.4.0 (2026-10-09)
+
+One new setting in `vintasend-templates-management-api`. Every other package is released at 3.4.0
+unchanged, as the family releases in lockstep.
+
+### Features
+
+#### `vintasend-templates-management-api`
+
+* **`MANAGED_TEMPLATE_BACKEND_NAME`** is the backend name every new template is stored under. Set,
+  it replaces the `templateManagedBackend` a `POST /templates` body carries, so a host serving one
+  backend does not let a caller label a template with another. Unset, the body's value is stored,
+  as before. The TypeScript sibling gains the same as `createApp({ templateManagedBackend })`.
+
+### Backwards compatibility
+
+**Nothing changes for a client.** `templateManagedBackend` stays required in the create body, and
+`openapi.yaml` is unchanged. A deployment that sets the new setting stores its value instead of the
+body's.
+
 ## Version 3.3.0 (2026-10-09)
 
 The two HTTP APIs -- `vintasend-api` and `vintasend-templates-management-api` -- get stricter
