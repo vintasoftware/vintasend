@@ -1,6 +1,10 @@
 # Release Notes
 
-## Unreleased
+## Version 3.5.0 (2026-10-09)
+
+`vintasend-api` and `vintasend-templates-management-api` publish to PyPI for the first time, as
+packages a host can mount in its own Django project or run on its own. Every other package is
+released at 3.5.0 unchanged, as the family releases in lockstep.
 
 ### Features
 
