@@ -409,7 +409,7 @@ submodule directory, and one PR per repository.
 
 | Tool | Path | Purpose |
 |---|---|---|
-| `vintasend-api` | `tools/vintasend-api` | Django + django-ninja REST API serving the dashboard |
+| `vintasend-api` | `tools/vintasend-api` | Django + django-ninja REST API serving the dashboard; on PyPI, embeddable in a host Django project or run on its own |
 | `vintasend-dashboard` | `tools/vintasend-dashboard` | Next.js UI for browsing, previewing, resending and cancelling notifications |
 
 The two are separated by one HTTP contract, `openapi.yaml`, which is the normative document

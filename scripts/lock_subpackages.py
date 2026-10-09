@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 
 from _git import (
     changed_paths,
@@ -182,26 +183,61 @@ def poetry_available() -> bool:
     return result.returncode == 0
 
 
-def relock(pkg: Package) -> tuple[bool, str]:
-    """Run `poetry lock` in the package directory."""
-    try:
-        result = subprocess.run(  # noqa: S603
-            ["poetry", "lock"],  # noqa: S607 -- poetry off PATH is the normal invocation
-            cwd=pkg.dir,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=LOCK_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"poetry lock did not finish within {LOCK_TIMEOUT}s"
+# What Poetry says when the index it read does not list a version yet.
+NOT_YET_LISTED = "doesn't match any versions"
 
-    if result.returncode != 0:
+# How often, and how far apart, a lock that cannot see a just-published version is retried.
+LOCK_RETRIES = 6
+LOCK_RETRY_DELAY = 60
+
+
+def run_poetry_lock(pkg: Package) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        ["poetry", "lock"],  # noqa: S607 -- poetry off PATH is the normal invocation
+        cwd=pkg.dir,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=LOCK_TIMEOUT,
+    )
+
+
+def clear_poetry_pypi_cache() -> None:
+    """Drop Poetry's cached PyPI pages, so the next lock reads the index again."""
+    subprocess.run(  # noqa: S603
+        ["poetry", "cache", "clear", "PyPI", "--all", "-n"],  # noqa: S607
+        capture_output=True,
+        check=False,
+    )
+
+
+def relock(pkg: Package) -> tuple[bool, str]:
+    """Run `poetry lock` in the package directory.
+
+    A version can be live on PyPI and still missing from the index page Poetry reads: PyPI's
+    CDN serves a cached page for a few minutes after an upload, and a different edge than the
+    one the publish wait asked. In 3.4.0 every package in wave 2 failed with "doesn't match any
+    versions" two minutes after `vintasend` went live. So that one complaint clears Poetry's
+    cache and retries, a minute apart; any other failure is reported at once.
+    """
+    for attempt in range(1, LOCK_RETRIES + 1):
+        try:
+            result = run_poetry_lock(pkg)
+        except subprocess.TimeoutExpired:
+            return False, f"poetry lock did not finish within {LOCK_TIMEOUT}s"
+
+        if result.returncode == 0:
+            return True, ""
+
         output = ((result.stdout or "") + (result.stderr or "")).strip()
-        # The tail carries the resolver's actual complaint; the head is progress.
-        tail = "\n".join(output.splitlines()[-8:])
-        return False, f"poetry lock failed:\n            {tail}"
-    return True, ""
+        if NOT_YET_LISTED not in output or attempt == LOCK_RETRIES:
+            # The tail carries the resolver's actual complaint; the head is progress.
+            tail = "\n".join(output.splitlines()[-8:])
+            return False, f"poetry lock failed:\n            {tail}"
+
+        clear_poetry_pypi_cache()
+        time.sleep(LOCK_RETRY_DELAY)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def release_package(pkg: Package, version: str, args: argparse.Namespace) -> tuple[str, str]:

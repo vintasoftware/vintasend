@@ -10,9 +10,9 @@ The steps are the ones you would run by hand, in the only order that works:
     5. wait                    until every package in the wave is on PyPI
     6. back to 3 for the next wave, until nothing is left
 
-A package with no `.github/workflows/publish.yml` -- `vintasend-api` and
-`vintasend-templates-management-api`, which are applications -- is released by its
-tag alone. It is done once the tag is on origin, and nothing waits for it on PyPI.
+A package with no `.github/workflows/publish.yml` is released by its tag alone: it is done
+once the tag is on origin, and nothing waits for it on PyPI. Every package publishes today;
+`vintasend-api` and `vintasend-templates-management-api` were tag-only until 3.5.0.
 
 The waiting is what makes this a script rather than a list. A subpackage pins
 `vintasend` at the version being released, so `poetry lock` cannot resolve until

@@ -29,8 +29,8 @@ PACKAGE_GLOBS = ("pyproject.toml", "implementations/*/pyproject.toml", "tools/*/
 # skipped in silence.
 NON_PYTHON_SUBMODULES = frozenset({"tools/vintasend-dashboard"})
 
-# A package with this workflow uploads to PyPI when it is tagged. One without it is an
-# application released as a tag alone -- see `Package.publishes`.
+# A package with this workflow uploads to PyPI when it is tagged. One without it is released
+# as a tag alone -- see `Package.publishes`.
 PUBLISH_WORKFLOW = Path(".github/workflows/publish.yml")
 
 # Tables whose `name`/`version` keys describe the package itself. The repo uses
@@ -89,9 +89,9 @@ class Package:
     def publishes(self) -> bool:
         """Whether tagging this package uploads it to PyPI, or the tag is the whole release.
 
-        `vintasend-api` and `vintasend-templates-management-api` are applications: they have a
-        CI workflow but no publish workflow, so PyPI never hears of them. A script waiting for
-        one of them to appear there would wait until its timeout.
+        A package with a CI workflow but no publish workflow never reaches PyPI, so a script
+        waiting for it there would wait until its timeout. Every package in the family publishes
+        today; `vintasend-api` and `vintasend-templates-management-api` were tag-only until 3.5.0.
         """
         return (self.dir / PUBLISH_WORKFLOW).is_file()
 

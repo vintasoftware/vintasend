@@ -146,9 +146,14 @@ Follow that precedent rather than unilaterally switching to major bumps. But:
    half-published. A package already tagged on origin is reported as done, which is what makes the
    second and third runs safe.
 
-   `vintasend-api` and `vintasend-templates-management-api` are applications: they have no
-   `.github/workflows/publish.yml`, so their tag is the whole release and they never appear on
-   PyPI. The wave map marks them `(tag-only)`. Don't wait for them there.
+   Every package publishes to PyPI, `vintasend-api` and `vintasend-templates-management-api`
+   included since 3.5.0. A package without `.github/workflows/publish.yml` would be released by
+   its tag alone, and the wave map would mark it `(tag-only)`.
+
+   Poetry can lag PyPI too. In 3.4.0 `poetry lock` failed for all of wave 2 with "doesn't match
+   any versions" two minutes after `vintasend` was live: the CDN edge Poetry reached still served
+   the old index page. `lock_subpackages.py` now clears Poetry's PyPI cache and retries that
+   failure for a few minutes before reporting it.
 
    A version counts as live only once PyPI's simple index lists it, not just the JSON API. pip
    reads the simple index, and in 3.2.0 two Python 3.12 publish jobs failed with "No matching
