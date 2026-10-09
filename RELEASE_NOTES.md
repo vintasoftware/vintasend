@@ -1,6 +1,6 @@
 # Release Notes
 
-## Version 3.3.0 (unreleased)
+## Version 3.3.0 (2026-10-09)
 
 The two HTTP APIs -- `vintasend-api` and `vintasend-templates-management-api` -- get stricter
 contracts, shared byte-identical with their TypeScript siblings, and `vintasend-api` stops writing
