@@ -1,5 +1,94 @@
 # Release Notes
 
+## Version 3.3.0 (unreleased)
+
+The two HTTP APIs -- `vintasend-api` and `vintasend-templates-management-api` -- get stricter
+contracts, shared byte-identical with their TypeScript siblings, and `vintasend-api` stops writing
+whole errors to the log. A team running the TypeScript templates management API in a healthcare
+app reported the gaps; most existed in both languages, and both change in this release. The
+`vintasend` package and the libraries have no code change; the number moves because the family
+releases in lockstep.
+
+**This release changes what the APIs accept.** Read
+[Backwards compatibility in 3.3.0](#backwards-compatibility-in-330) before upgrading a client.
+
+### Features
+
+#### `vintasend-api` no longer logs unexpected errors whole
+
+* An unexpected error was logged with `logger.exception`: its message, its traceback and the
+  concrete path, any of which can quote notification content, recipients or context values. It is
+  now one line -- the error class, a request id, the method and the route pattern -- as the
+  templates management API already does. Django's duplicate `django.request` record for the 500 is
+  suppressed, and the response carries the request id in `X-Request-Id`.
+* **`VINTASEND_UNHANDLED_ERROR_HANDLER`** names a callable `(exc, request, request_id)` that takes
+  over reporting, for an error tracker with its own scrubbing. It may be `async`. If it raises, the
+  redacted line is logged instead. A system check fails `manage.py check` when it cannot be
+  imported or is not callable.
+
+#### One rule for request bodies, in both APIs
+
+* A request declaring `application/json` (or any `application/*+json`) must carry a valid JSON
+  object; an empty body there is a 400. A request declaring no media type, or another one, counts
+  as an omitted body when it is empty, and is a 400 otherwise. Ninja used to read any body as JSON
+  whatever it declared.
+* Malformed JSON is answered in the error envelope. It used to be Ninja's bare
+  `{"detail": "Cannot parse request body"}`.
+
+#### One envelope for every 400, in both APIs
+
+* Every 400 carries `details.issues: [{ path, message }]`: an invalid field, an invalid path
+  parameter (`path: version`), a body that is not JSON (`path` empty), an order the backend cannot
+  apply (`orderByField` / `orderByDirection`, with the old `details` keys kept beside `issues`), and
+  a refusal from the library (`path` empty, the message repeated).
+
+#### `vintasend-templates-management-api`
+
+* **Preview tells a broken chain from a broken template.** A template that cannot be composed is a
+  `409 TEMPLATE_COMPOSITION_ERROR`, the answer `GET /composition` gives; one that composes and fails
+  to render stays `409 PREVIEW_UNAVAILABLE`. A store failure while composing is a generic 500 that
+  goes through the unhandled-error handler; it used to reach the client in a 409, backend message
+  and all.
+* `GET` and `DELETE /templates/{key}/versions/{version}` answer 400 for a version that is not a
+  positive integer; `0` and `-1` were 404s.
+* `GET /composition` reads the version once, so its references, `isAbstract` and composed sources
+  always describe the same version.
+* `POST /templates/{key}/versions` declares its body optional, as it always was.
+* The `status` filter documents that it applies on top of `mostRecentActiveVersion`: send
+  `mostRecentActiveVersion=false` to find `inactive` or `archived` versions.
+
+#### Both contracts
+
+* **`FORBIDDEN` (403)** is a new error code, declared on every authenticated route, for a host that
+  authenticates callers itself and refuses one it knows. Neither Python API produces it yet: both
+  authenticate with the shared API key alone.
+* **`hasMore` means the next page has a row.** After a full page the API reads the one row that
+  would follow it.
+
+### Backwards compatibility in 3.3.0
+
+**No library seam changed.** `vintasend`, `vintasend-managed-templates` and the backends are
+untouched.
+
+**Three API behaviours change, and each needs checking against your clients:**
+
+* **A body in another media type is a 400.** A client posting JSON without
+  `Content-Type: application/json` used to be read as JSON; it is now refused. `curl -d` sends form
+  encoding unless told otherwise. Both dashboards already set the header.
+* **An empty body declared as JSON is a 400**, on the routes whose body is optional. Omit the
+  `Content-Type` along with the body.
+* **`hasMore` can be `false` on a full page**, when nothing follows it. A client that paged until a
+  short page came back still works; one that trusted `hasMore` stops offering an empty page.
+
+The rest is additive: a new error code, `details.issues` on 400s that had other `details` or none,
+a new optional setting, and a 403 declared where none is produced yet.
+
+* **`vintasend-api` logs one line per unexpected error.** A deployment that relied on tracebacks
+  in its logs sets `VINTASEND_UNHANDLED_ERROR_HANDLER` to send the exception to a tracker that
+  scrubs it.
+* **`openapi.yaml`** stays byte-identical with `vintasend-ts-api` and
+  `vintasend-ts-templates-management-api`, whose servers answer the same inputs the same way.
+
 ## Version 3.2.0 (2026-10-07)
 
 Managed templates get a send path that never renders a draft, defaults for keys nobody has written
