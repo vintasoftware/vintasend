@@ -17,7 +17,7 @@ repos:
       - id: detect-private-key
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Keep in sync with the ruff pin in pyproject.toml [tool.poetry.group.dev.dependencies].
-    rev: v0.15.22
+    rev: v0.17.3
     hooks:
       # Run the linter. (`ruff` is now a legacy alias for `ruff-check`.)
       - id: ruff-check
@@ -26,7 +26,7 @@ repos:
       - id: ruff-format
   - repo: https://github.com/pre-commit/mirrors-mypy
     # Keep in sync with the mypy pin in pyproject.toml [tool.poetry.group.dev.dependencies].
-    rev: v2.3.0
+    rev: v2.4.1
     hooks:
       - id: mypy
         # Type-check the package as a whole using [tool.mypy] in pyproject.toml rather

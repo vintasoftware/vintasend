@@ -19,12 +19,12 @@ include = [
 [tool.poetry.dependencies]
 # Pinned to the current vintasend line (2.0) so a freshly cloned package starts
 # with a correct, working pin against the seams this template's stubs subclass.
-vintasend = "^2.0.0"
+vintasend = "^3.5.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.3"
 pytest-asyncio = "^1.4.0"
-ruff = "^0.15.22"
+ruff = "^0.17.3"
 mypy = "^2.3.0"
 
 [build-system]
