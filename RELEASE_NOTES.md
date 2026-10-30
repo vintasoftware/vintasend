@@ -1,5 +1,56 @@
 # Release Notes
 
+## Version 3.6.0 (2026-10-29)
+
+A dependency refresh across the family. Every package now allows the latest release of each of its
+dependencies. The two HTTP APIs gain Django 6.0 and 6.1, and `vintasend-fastapi-mail` fixes the
+recipient headers it sends on current fastapi-mail. No seam changed. Every other package is
+released at 3.6.0 with no code change, as the family releases in lockstep.
+
+### Features
+
+#### `vintasend-api` and `vintasend-templates-management-api` support Django 6.0 and 6.1
+
+* The `django` range widens from `>=4.2,<6.0` to `>=4.2,<6.2`. The packages now carry the Django
+  6.0 and 6.1 classifiers.
+* tox pairs each Python with the Django releases that support it, as `vintasend-django` does.
+  CI now runs that matrix rather than only the locked Django. Django 6 needs Python 3.12, so it
+  is tested on 3.12 and 3.13.
+
+#### `vintasend-sqlalchemy` is tested on SQLAlchemy 2.1
+
+* The `^2.0.51` range already allowed 2.1, but the lock can only pick 2.0.x on the Python 3.10
+  floor, so 2.1 was never tested. tox now runs the suite on SQLAlchemy 2.1 on Python 3.11 and up,
+  and on 2.0 everywhere.
+
+### Bug Fixes
+
+#### `vintasend-fastapi-mail` sends bare recipient addresses again
+
+* From fastapi-mail 1.5.7, a recipient given as a bare string is turned into a pydantic
+  `NameEmail` whose display name is the address's local part. Mail went out as
+  `To: user <user@example.com>`. The old `^1.4.2` range already allowed those releases, so fresh
+  installs were affected. The adapter now passes recipients and BCC addresses as
+  `NameEmail(address, address)`, which fastapi-mail 1.6.6 and later write as a bare address.
+
+### Development
+
+* ruff 0.17 across the packages, and every `poetry.lock` regenerated with Poetry 2.0.0. Ruff 0.17
+  formats the Python code blocks in Markdown files by default; the packages exclude `*.md` from
+  the formatter so documentation stays as written.
+* `templates/vintasend-implementation-template` pins `vintasend ^3.5.0`, and its backend stubs
+  take the `requested_template_version` parameter that 3.x added to the `persist_*` methods.
+
+### Backwards compatibility
+
+**No seam changed.** No existing method signature or behaviour changed; this is an additive minor
+release, and downstream implementers have nothing to do.
+
+* **`vintasend-fastapi-mail` now requires fastapi-mail 1.6.6 or later** (it was 1.4.2). A host
+  pinned to an older fastapi-mail must upgrade it. Its API is unchanged.
+* `vintasend-api` and `vintasend-templates-management-api` keep their HTTP contract, and
+  `openapi.yaml` is unchanged.
+
 ## Version 3.5.0 (2026-10-09)
 
 `vintasend-api` and `vintasend-templates-management-api` publish to PyPI for the first time, as
