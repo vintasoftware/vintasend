@@ -53,15 +53,12 @@ class ImplementationTemplateAsyncIOReplicationQueueServiceTestCase(IsolatedAsync
 
     def test_no_abstract_methods_remain_unimplemented(self):
         assert (
-            ImplementationTemplateAsyncIOReplicationQueueService.__abstractmethods__
-            == frozenset()
+            ImplementationTemplateAsyncIOReplicationQueueService.__abstractmethods__ == frozenset()
         )
 
     async def test_stub_is_instantiable_and_fails_loudly_on_enqueue(self):
         replication_queue_service = ImplementationTemplateAsyncIOReplicationQueueService()
-        assert isinstance(
-            replication_queue_service, AsyncIOBaseNotificationReplicationQueueService
-        )
+        assert isinstance(replication_queue_service, AsyncIOBaseNotificationReplicationQueueService)
         with self.assertRaises(NotImplementedError):
             await replication_queue_service.enqueue_replication(
                 notification_id=1, backend_identifier="backend-1"

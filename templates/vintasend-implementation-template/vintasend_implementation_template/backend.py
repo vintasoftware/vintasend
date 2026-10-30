@@ -99,6 +99,7 @@ class ImplementationTemplateBackend(BaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: "list[AnyNotificationAttachment] | None" = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> "Notification":
         """TODO: implement persist_notification — see vintasend/services/notification_backends/base.py for the contract."""
         raise NotImplementedError(
@@ -122,6 +123,7 @@ class ImplementationTemplateBackend(BaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: "list[AnyNotificationAttachment] | None" = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> "OneOffNotification":
         """TODO: implement persist_one_off_notification — see vintasend/services/notification_backends/base.py for the contract."""
         raise NotImplementedError(
@@ -400,6 +402,7 @@ class ImplementationTemplateAsyncIOBackend(AsyncIOBaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: "list[AnyNotificationAttachment] | None" = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
         lock: "asyncio.Lock | None" = None,
     ) -> "Notification":
         """TODO: implement persist_notification — see vintasend/services/notification_backends/asyncio_base.py for the contract."""
@@ -424,6 +427,7 @@ class ImplementationTemplateAsyncIOBackend(AsyncIOBaseNotificationBackend):
         adapter_extra_parameters: dict | None = None,
         attachments: "list[AnyNotificationAttachment] | None" = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
         lock: "asyncio.Lock | None" = None,
     ) -> "OneOffNotification":
         """TODO: implement persist_one_off_notification — see vintasend/services/notification_backends/asyncio_base.py for the contract."""
