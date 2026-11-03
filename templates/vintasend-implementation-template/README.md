@@ -31,12 +31,13 @@ add a `logger.py` stub and matching test alongside that work.
 1. **Clone.** Run the clone script against a target directory:
 
    ```bash
-   python templates/vintasend-implementation-template/scripts/clone.py /path/to/vintasend-your-integration --package-name vintasend-your-integration
+   python templates/vintasend-implementation-template/scripts/clone.py /path/to/vintasend-your-integration --package-name vintasend-your-integration --description "Your integration for VintaSend"
    ```
 
    This copies the skeleton, renames the distribution (`vintasend-implementation-template` →
    your kebab-case name) and the import package (`vintasend_implementation_template` → your
-   snake_case name) everywhere they appear, and prints the next commands to run. See
+   snake_case name) everywhere they appear, sets the `description` PyPI shows (a `TODO:` line if
+   you leave out `--description`), and prints the next commands to run. See
    `scripts/clone.py`'s module docstring for exactly what it does and does not touch.
 
 2. **Rename the classes.** The clone keeps every class named `ImplementationTemplate*` (for
