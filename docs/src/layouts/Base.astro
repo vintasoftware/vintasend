@@ -1,0 +1,53 @@
+---
+import "../styles/site.css";
+import Nav from "../components/Nav.astro";
+import Footer from "../components/Footer.astro";
+import { withBase } from "../lib/urls";
+
+interface Props {
+  title: string;
+  description: string;
+  links?: { href: string; label: string }[];
+  current?: "home" | "docs" | "dashboard" | "templates";
+}
+const { title, description, links, current } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+<!doctype html>
+<html lang="en" data-theme="dark" data-lang="py">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <meta name="description" content={description} />
+  <meta property="og:title" content={title} />
+  <meta property="og:description" content={description} />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content={canonical} />
+  <link rel="canonical" href={canonical} />
+  <link rel="icon" href={withBase("/favicon.svg")} type="image/svg+xml" />
+  <script is:inline>
+    // Theme and language before first paint, so nothing flashes. The stored
+    // choices win; `?lang=py|ts` in the URL wins over the stored language once.
+    (function () {
+      var root = document.documentElement;
+      var t = null, l = null;
+      try { t = localStorage.getItem("vinta-theme"); l = localStorage.getItem("vintasend-lang"); } catch (e) {}
+      root.dataset.theme = t === "light" || t === "dark" ? t : (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      var q = new URLSearchParams(location.search).get("lang");
+      if (q === "py" || q === "ts") { l = q; try { localStorage.setItem("vintasend-lang", q); } catch (e) {} }
+      root.dataset.lang = l === "ts" ? "ts" : "py";
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <slot name="head" />
+</head>
+<body>
+  <Nav links={links} current={current} />
+  <main><slot /></main>
+  <Footer />
+  <script src="../scripts/site.ts"></script>
+</body>
+</html>

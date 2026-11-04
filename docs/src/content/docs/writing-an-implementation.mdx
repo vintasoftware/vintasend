@@ -1,0 +1,268 @@
+---
+title: Writing your own implementation
+description: The seam contracts, which methods are required, the shipped fakes to copy from, the starter templates, and the versioning rules downstream packages follow.
+section: Ecosystem
+order: 32
+---
+
+Every seam in the library is a small interface, and every official package is a separate implementation of one or more of them. If no [official implementation](/vintasend/docs/implementations/) fits — a different database, a provider nobody has wrapped, a queue your platform already runs — you write one against the same interface and the rest of the library does not notice.
+
+## When to write one
+
+Write an implementation when you need a seam the official packages do not cover: a backend over DynamoDB or MongoDB, an adapter for Postmark or a push provider, a renderer for a template engine of your own, an attachment manager for Azure Blob or GCS, or a queue service over SQS or BullMQ. Do not write one to change how an official package behaves in one place; subclass it and override the method instead.
+
+Start with the backend when you write several. Every other seam reads and writes through it, so a working backend is what lets you test the rest end to end.
+
+## The contract
+
+<Py>
+
+Each seam is an abstract base class under `vintasend/services/`, and all but the renderer have an AsyncIO twin in the sibling `asyncio_base.py`:
+
+| Seam | Sync | AsyncIO |
+|---|---|---|
+| Backend | `notification_backends/base.py` `BaseNotificationBackend` | `AsyncIOBaseNotificationBackend` |
+| Adapter | `notification_adapters/base.py` `BaseNotificationAdapter` | `AsyncIOBaseNotificationAdapter` |
+| Background adapter | `notification_adapters/async_base.py` `BackgroundNotificationAdapter` | `asyncio_background_base.py` `AsyncIOBackgroundNotificationAdapter` |
+| Renderer | `notification_template_renderers/base.py` `BaseNotificationTemplateRenderer` | none: rendering has nothing to await |
+| Attachment manager | `attachment_managers/base.py` `BaseAttachmentManager` | `AsyncIOBaseAttachmentManager` |
+| Queue service | `notification_queue_services/base.py` `BaseNotificationQueueService` | `AsyncIOBaseNotificationQueueService` |
+| Replication queue service | `notification_queue_services/replication_base.py` `BaseNotificationReplicationQueueService` | `AsyncIOBaseNotificationReplicationQueueService` |
+| Git commit SHA provider | `git_commit_sha_providers/base.py` `BaseGitCommitShaProvider` | `AsyncIOBaseGitCommitShaProvider` |
+
+`@abstractmethod` is enforced at instantiation: a subclass missing one raises `TypeError` the moment it is constructed, which is why every official package's test suite catches a seam change at import time. Adapters are generic over the backend and renderer types, `BaseNotificationAdapter(Generic[B, T], ABC)`, and accept either live instances or dotted import strings for both. Exceptions you raise should derive from `NotificationError` in `vintasend/exceptions.py`; a send failure that subclasses `NotificationSendError` is what makes the service mark the notification `FAILED`.
+
+</Py>
+
+<Ts>
+
+Each seam is a TypeScript type under `src/services/`, exported from the `vintasend` package. Some are interfaces you `implement`; some are abstract classes you `extend`:
+
+| Seam | Type | Kind |
+|---|---|---|
+| Backend | `BaseNotificationBackend<Config>` | interface |
+| Adapter | `BaseNotificationAdapter<TemplateRenderer, Config>` | abstract class |
+| Renderer | `BaseEmailTemplateRenderer<Config>` / `BaseTextNotificationTemplateRenderer<Config>` | abstract class |
+| Attachment manager | `BaseAttachmentManager` | abstract class |
+| Queue service | `BaseNotificationQueueService<Config>` | interface |
+| Replication queue service | `BaseNotificationReplicationQueueService<Config>` | interface |
+| Git commit SHA provider | `BaseGitCommitShaProvider` | interface |
+| Logger | `BaseLogger` | interface |
+
+There is one service, and it is async throughout, so every seam method that does I/O returns a `Promise`. The compiler enforces the interfaces: a class missing a required member fails to type-check, and an optional member (marked `?`) can be left out and the feature it gates stays off. Every implementation is generic over your `Config` (the `BaseNotificationTypeConfig` that names your notification id type and context generators), so the service can type notifications end to end.
+
+</Ts>
+
+## What each seam must implement
+
+The checklists below name the methods with no default. Read the base class for the signatures; names are what matter here, since implementations override by name.
+
+### Backend
+
+<Py>
+
+Required on both `BaseNotificationBackend` and `AsyncIOBaseNotificationBackend` (the async class has the same names as coroutines):
+
+```python
+get_all_pending_notifications        get_pending_notifications
+get_all_future_notifications         get_future_notifications
+get_all_future_notifications_from_user   get_future_notifications_from_user
+persist_notification                 persist_one_off_notification
+persist_notification_update
+mark_pending_as_sent                 mark_pending_as_failed
+mark_sent_as_read                    mark_sent_as_read_bulk
+cancel_notification                  get_notification
+filter_all_in_app_unread_notifications   filter_in_app_unread_notifications
+filter_all_in_app_notifications      filter_in_app_notifications
+filter_notifications
+get_user_email_from_notification
+store_context_used                   store_git_commit_sha
+store_attachment_file_record         get_attachment_file_record
+find_attachment_file_by_checksum     delete_attachment_file
+get_orphaned_attachment_files        get_attachments
+delete_notification_attachment
+```
+
+Nine methods have working defaults you override only when the database can do better: `count_in_app_notifications` and `count_in_app_unread_notifications` (they iterate the filter methods), `get_all_notifications`, `count_notifications`, `get_filter_capabilities` (reports everything supported and `pagination.oneIndexed: True`; a backend that pages from 0 must override it), `get_backend_identifier`, `apply_replication_snapshot_if_newer`, `store_template_version` and `inject_attachment_manager`. Pagination is 1-indexed: `page=1` is the first page.
+
+</Py>
+
+<Ts>
+
+Required members of `BaseNotificationBackend<Config>`:
+
+```typescript
+getAllPendingNotifications           getPendingNotifications
+getAllFutureNotifications            getFutureNotifications
+getAllFutureNotificationsFromUser    getFutureNotificationsFromUser
+persistNotification                  bulkPersistNotifications
+persistNotificationUpdate
+getAllNotifications                  getNotifications
+markAsSent                           markAsFailed
+markAsRead                           cancelNotification
+getNotification
+filterAllInAppUnreadNotifications    filterInAppUnreadNotifications
+filterNotifications
+getUserEmailFromNotification         storeAdapterAndContextUsed
+persistOneOffNotification            persistOneOffNotificationUpdate
+getOneOffNotification                getAllOneOffNotifications
+getOneOffNotifications
+```
+
+The optional members each gate a feature: `getFilterCapabilities` (omit it and every filter is assumed supported; pagination is assumed 0-indexed, so `page=0` is the first page), `getBackendIdentifier` and `applyReplicationSnapshotIfNewer` (multi-backend replication), `storeTemplateVersion` (template version pinning), `injectLogger`, and the attachment set `storeAttachmentFileRecord`, `getAttachmentFileRecord`, `findAttachmentFileByChecksum`, `deleteAttachmentFile`, `getOrphanedAttachmentFiles`, `getAttachments` and `deleteNotificationAttachment`. `supportsAttachments(backend)` and `supportsTemplateVersions(backend)` are the type guards the service uses to detect them.
+
+</Ts>
+
+### Adapter
+
+<Py>
+
+One abstract method on `BaseNotificationAdapter` and `AsyncIOBaseNotificationAdapter`: `send(notification, context, headers=None)`. Render through `self.template_renderer`, deliver, and raise a `NotificationSendError` subclass on failure. A `BackgroundNotificationAdapter` inherits that `send` and adds one more abstract method, `delayed_send(notification_id)`, which the worker calls after reloading the notification. `supports_attachments` and `prepare_attachments` have defaults; override the first to return `True` and the second to map `StoredAttachment` rows onto your provider's payload.
+
+</Py>
+
+<Ts>
+
+`BaseNotificationAdapter` has no abstract members, but its default `send` only rejects when no backend was injected, so an adapter is a class that sets `key`, passes its `notificationType` and `enqueueNotifications` to the constructor, and overrides `send(notification, context)`. Return what the renderer produced (an `EmailTemplate` or `TextNotificationTemplate`) so the service can record `templateVersion`; returning nothing is also valid. `injectBackend` and `injectLogger` are called by the service and need no override. Use `isOneOffNotification(notification)` to branch on recipients that have no user record.
+
+</Ts>
+
+### Template renderer
+
+<Py>
+
+Two abstract methods on `BaseNotificationTemplateRenderer`: `render(notification, context)` and `render_from_template_content(notification, template_content, context)`. Subclass `BaseTemplatedEmailRenderer` (returns `TemplatedEmail` with `subject`, `body` and `preheader`) or `BaseTemplatedSMSRenderer` (returns `TemplatedSMS` with `body`). `get_latest_template_version` has a default returning `None`; only a renderer over a versioned store overrides it.
+
+</Py>
+
+<Ts>
+
+Extend `BaseEmailTemplateRenderer<Config>` or `BaseTextNotificationTemplateRenderer<Config>` and override `render(notification, context)` and `renderFromTemplateContent(notification, templateContent, context)`; the base implementations throw. `getLatestTemplateVersion` is optional with a default of `null`, and `injectLogger` is inherited.
+
+</Ts>
+
+### Attachment manager
+
+Three methods with no default: <Sw py="upload_file" ts="uploadFile" />, <Sw py="reconstruct_attachment_file" ts="reconstructAttachmentFile" /> and <Sw py="delete_file_by_identifiers" ts="deleteFileByIdentifiers" />. `upload_file` stores the bytes and returns an `AttachmentFileRecord` whose `storage_identifiers` carries a non-empty `id` plus whatever the manager needs to find the object again; the backend persists that map opaquely. `reconstruct_attachment_file` builds an `AttachmentFile` handle (`read`, `stream`, `url`, `delete`) from those identifiers without doing I/O, which is why it stays a plain method even on the AsyncIO class. <Sw py="detect_content_type" ts="detectContentType" />, <Sw py="calculate_checksum" ts="calculateChecksum" /> and <Sw py="file_to_bytes" ts="fileToBuffer" /> are provided.
+
+### Queue services
+
+A queue service is one method: <Sw py="enqueue_notification(notification_id)" ts="enqueueNotification(notificationId)" />. The payload is the id alone; the worker reloads the notification from the backend and delivers it through the adapter. A replication queue service is also one method, <Sw py="enqueue_replication(notification_id, backend_identifier)" ts="enqueueReplication(notificationId, backendIdentifier)" />, and is only consulted when replication mode is `queued`; unset, the service falls back to inline replication.
+
+### Git commit SHA provider
+
+One method, <Sw py="get_current_git_commit_sha" ts="getCurrentGitCommitSha" />, returning a 40-character hex SHA or <Sw py="None" ts="null" /> when it cannot be determined.
+
+<Ts>
+
+It may return the value synchronously or as a `Promise`; the service awaits either.
+
+</Ts>
+
+<Ts>
+
+### Logger
+
+`BaseLogger` is `info`, `warn` and `error`, each receiving a `LogMessage` rather than a string. Print it with `renderLogMessage(message)`, or read `message.strings` and `message.values` to emit structured fields. The typed interpolations (`logId`, `logCount`, `logLabel`, `logTimestamp`, `logError`) are what keep recipients, rendered content and context out of log lines; a logger should not undo that.
+
+</Ts>
+
+## The shipped fakes
+
+<Py>
+
+Every seam has a working fake under its `stubs/` folder, and they are the reference implementations downstream authors read. They are complete rather than minimal: the test suite runs against them, and `fake_backend.py` is the second-largest file in the package.
+
+| Seam | Fake (sync / AsyncIO) | Module |
+|---|---|---|
+| Backend | `FakeFileBackend` / `FakeAsyncIOFileBackend` | `notification_backends/stubs/fake_backend.py` |
+| Adapter | `FakeEmailAdapter` / `FakeAsyncIOEmailAdapter`, plus `FakeAsyncEmailAdapter` and `FakeAsyncIOBackgroundEmailAdapter` for the background split | `notification_adapters/stubs/fake_adapter.py` |
+| In-app adapter | `FakeInAppAdapter` / `FakeAsyncIOInAppAdapter` | `notification_adapters/stubs/fake_in_app_adapter.py` |
+| Renderer | `FakeTemplateRenderer` | `notification_template_renderers/stubs/fake_templated_email_renderer.py` |
+| Attachment manager | `FakeAttachmentManager` / `FakeAsyncIOAttachmentManager` | `attachment_managers/stubs/fake_attachment_manager.py` |
+| Queue service | `FakeQueueService` / `FakeAsyncIOQueueService` | `notification_queue_services/stubs/fake_queue_service.py` |
+| Replication queue service | `FakeReplicationQueueService` / `FakeAsyncIOReplicationQueueService` | `notification_queue_services/stubs/fake_replication_queue_service.py` |
+| Git commit SHA provider | `FakeGitCommitShaProvider` / `FakeAsyncIOGitCommitShaProvider` | `git_commit_sha_providers/stubs/fake_git_commit_sha_provider.py` |
+
+`FakeFileBackend` serializes to a JSON file, so it is also a usable backend for a test suite of your own: wire your real adapter against it and no database is needed.
+
+</Py>
+
+<Ts>
+
+The TypeScript package ships one real, minimal implementation rather than a set of fakes: `LocalFileAttachmentManager`, under the `vintasend/local-file-attachment-manager` entry point, writes attachments to a directory and is the reference for the attachment seam. The library's own tests define their doubles inline (`TestBackendWithAttachments` in `src/services/notification-backends/__tests__/base-notification-backend.test.ts`, `MockTemplateRenderer` and `TestNotificationAdapter` in `src/services/__tests__/notification-adapters/base-notification-adapter.test.ts`), and the implementation template below carries a complete typed stub per seam. For a worked example of each seam, read the official package the template README names: `vintasend-prisma` for a backend, `vintasend-nodemailer` and `vintasend-sendgrid` for adapters, `vintasend-pug` for a renderer, `vintasend-aws-s3-attachments` for an attachment manager, `vintasend-winston` for a logger.
+
+</Ts>
+
+## The starter template
+
+<Py>
+
+`templates/vintasend-implementation-template/` in the core repository is a Poetry package with one `TODO` stub per seam (`backend.py`, `adapter.py`, `template_renderer.py`, `queue_service.py`, `attachment_manager.py`, `replication_queue_service.py`) and a scaffold test for each that asserts the stub subclasses the right ABC with no leftover abstract methods. Its README carries the per-seam checklist, and a test in the core repository parses that checklist against the live ABCs so it cannot go stale.
+
+Clone it with the script:
+
+```bash
+python templates/vintasend-implementation-template/scripts/clone.py /path/to/vintasend-your-integration \
+  --package-name vintasend-your-integration \
+  --description "Your integration for VintaSend"
+```
+
+The script copies the directory, renames the distribution and the import package everywhere they appear, and sets the PyPI description. It does not rename the `ImplementationTemplate*` classes, which you do as you implement each seam, and it does not touch the `vintasend` dependency range. Then:
+
+```bash
+cd /path/to/vintasend-your-integration
+poetry install
+poetry run pytest
+poetry run mypy
+```
+
+Implement in the order the README gives — backend, renderer, adapter, then the optional seams — and test the real implementation the way the core suite tests its fakes: against the seam, with no mocking of it.
+
+</Py>
+
+<Ts>
+
+`src/implementations/vintasend-implementation-template/` in the `vintasend-ts` repository is a package with one typed stub per component: `backend.ts` (`NotificationBackend` and `NotificationBackendFactory`), `adapter.ts`, `template-renderer.ts`, `logger.ts` and `attachment-manager.ts` (`TemplateAttachmentManager` and `TemplateAttachmentFile`), each with a matching test. Generate a package from it, keeping only the components you need:
+
+```bash
+npm run implementation:generate -- \
+  --dir=vintasend-aws-ses \
+  --package=@acme/vintasend-aws-ses \
+  --components=backend,adapter,template-renderer
+```
+
+`--dir` is the new directory under `src/implementations`, `--package` the `package.json` name, `--components` a comma-separated list of `backend`, `adapter`, `template-renderer`, `logger` and `attachment-manager`; `--repo` sets the GitHub repository and `--force` overwrites an existing directory. Copying the directory by hand and deleting the unused files works too. Then rename the classes, implement them, export them from `src/index.ts`, and:
+
+```bash
+npm install
+npm run build
+npm test
+```
+
+</Ts>
+
+## Versioning rules to know
+
+The seams are a public contract, and the core repositories version them deliberately.
+
+<Py>
+
+- **A new abstract method ships as a minor release**, with a mandatory `### Backwards compatibility` section in the core `RELEASE_NOTES.md` naming every added method and both classes it landed on (the project's own precedent: 1.2.0 added three abstract methods this way). Strict semver would call it major; the project has chosen the release note as the warning instead, so read that section on every minor upgrade before bumping your pin.
+- **A new method with a working default is additive.** Existing implementations keep working; override it when your store can do better.
+- **Renaming, reordering or removing a seam method is a major release.** Widening a signature with a new optional keyword argument is not.
+- The official packages pin an exact `vintasend` version. When you adopt a new abstract method, release your package with its constraint widened to the core version that introduced it; the core release always lands first, since a package cannot pin a version that does not exist.
+
+</Py>
+
+<Ts>
+
+- **A new required interface member is a breaking change for implementers**, because a class that lacks it stops compiling. The library adds features as optional members instead — `storeTemplateVersion`, `getFilterCapabilities`, the attachment set — so an existing backend keeps compiling and simply does not gain the feature until it implements the member.
+- **A new member on an abstract class with a working default is additive**, as `getLatestTemplateVersion` was for renderers.
+- Declare `vintasend` as a peer dependency and keep it on the same release line as the implementation packages you ship with. When you adopt a newly added member, widen the peer range to the version that introduced it.
+
+</Ts>
+
+<Callout kind="note" title="Test against the fakes, not around them">
+Whatever you build, exercise it through the service with the real seam on the other side: a real adapter against <Sw py="FakeFileBackend" ts="an in-memory backend" />, a real backend against <Sw py="FakeEmailAdapter" ts="a stub adapter" />. Mocking the seam itself tests the mock.
+</Callout>

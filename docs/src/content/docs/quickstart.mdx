@@ -1,0 +1,237 @@
+---
+title: Quick start
+description: Build a service, register a context generator, create a notification and drain the scheduled ones.
+section: Getting started
+order: 3
+---
+
+This page goes from an empty project to a sent email in four steps. It uses the most common stack for each language; swap any package for another implementation of the same seam and the rest does not change.
+
+## 1. Build the service
+
+<Py>
+
+With Django, `vintasend-django` provides all three required seams. Add the app, run its migrations, and point the three settings at its classes.
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    # ...
+    "vintasend_django",
+]
+
+NOTIFICATION_BACKEND = (
+    "vintasend_django.services.notification_backends.django_db_notification_backend.DjangoDbNotificationBackend"
+)
+NOTIFICATION_ADAPTERS = [
+    (
+        "vintasend_django.services.notification_adapters.django_email.DjangoEmailNotificationAdapter",
+        "vintasend_django.services.notification_template_renderers.django_templated_email_renderer.DjangoTemplatedEmailRenderer",
+    ),
+]
+NOTIFICATION_DEFAULT_FROM_EMAIL = "no-reply@example.com"
+```
+
+```bash
+python manage.py migrate
+```
+
+`NOTIFICATION_ADAPTERS` is a list of `(adapter, renderer)` pairs, one per delivery channel. With the settings in place the service needs no arguments:
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+service = NotificationService()
+```
+
+Outside Django, build the same objects explicitly. An adapter takes its renderer and the backend it will read from:
+
+```python
+from vintasend.services.notification_service import NotificationService
+from vintasend_django.services.notification_backends.django_db_notification_backend import (
+    DjangoDbNotificationBackend,
+)
+from vintasend_django.services.notification_adapters.django_email import DjangoEmailNotificationAdapter
+from vintasend_django.services.notification_template_renderers.django_templated_email_renderer import (
+    DjangoTemplatedEmailRenderer,
+)
+
+backend = DjangoDbNotificationBackend()
+service = NotificationService(
+    notification_adapters=[DjangoEmailNotificationAdapter(DjangoTemplatedEmailRenderer(), backend)],
+    notification_backend=backend,
+)
+```
+
+</Py>
+
+<Ts>
+
+With Prisma, Nodemailer and LiquidJS, each package exposes a factory. The `NotificationTypeConfig` type is declared once and passed to every factory so the backend, the adapter and the service agree on the context map and the id types.
+
+First add the `Notification` model from the [`vintasend-prisma` README](https://github.com/vintasoftware/vintasend-ts-prisma#readme) to `schema.prisma` and run `prisma migrate dev`. Then:
+
+```typescript
+// notifications.ts
+import { PrismaClient } from '@prisma/client';
+import type { Notification, User } from '@prisma/client';
+import { VintaSendFactory, renderLogMessage, type BaseLogger, type LogMessage } from 'vintasend';
+import { PrismaNotificationBackendFactory } from 'vintasend-prisma';
+import { NodemailerNotificationAdapterFactory } from 'vintasend-nodemailer';
+import { LiquidEmailTemplateRendererFactory } from 'vintasend-liquidjs';
+
+export type NotificationTypeConfig = {
+  ContextMap: typeof contextGeneratorsMap;
+  NotificationIdType: Notification['id'];
+  UserIdType: User['id'];
+};
+
+const prisma = new PrismaClient();
+const backend = new PrismaNotificationBackendFactory<NotificationTypeConfig>().create(prisma);
+
+const templateRenderer = new LiquidEmailTemplateRendererFactory<NotificationTypeConfig>().create({
+  root: './templates',
+});
+
+const adapter = new NodemailerNotificationAdapterFactory<NotificationTypeConfig>().create(
+  templateRenderer,
+  false, // deliver inline; true hands delivery to a queue service
+  { host: 'smtp.example.com', port: 587, auth: { user: 'apikey', pass: process.env.SMTP_PASSWORD } },
+);
+
+// Any object with info / warn / error works; vintasend-winston wraps Winston.
+const logger: BaseLogger = {
+  info: (m: LogMessage) => console.info(renderLogMessage(m)),
+  warn: (m: LogMessage) => console.warn(renderLogMessage(m)),
+  error: (m: LogMessage) => console.error(renderLogMessage(m)),
+};
+
+export const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [adapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+});
+```
+
+The service is the one place that holds references to everything else, so one module usually builds it and exports it.
+
+</Ts>
+
+## 2. Register a context generator
+
+A notification does not store the data its template needs. It stores a **context name** and the arguments to call the generator with, and the generator runs when the notification is sent. That is what lets a notification scheduled for next week render next week's data.
+
+<Py>
+
+```python
+from vintasend.services.notification_service import register_context
+
+@register_context("welcome")
+def welcome_context(user_id: int):
+    user = User.objects.get(pk=user_id)
+    return {"first_name": user.first_name, "plan": user.plan.name}
+```
+
+Registration happens at import time. Make sure the module that registers the generator is imported before anything sends, or the send fails with `NotificationContextGenerationError`. In Django, importing it from an app's `ready()` is the usual place. Async generators work the same way with `AsyncIONotificationService`.
+
+</Py>
+
+<Ts>
+
+Generators are classes with a `generate` method, collected in a map whose keys are the context names. Declare the map `as const` so the service can type `contextName` and `contextParameters` for each entry.
+
+```typescript
+import type { ContextGenerator } from 'vintasend';
+
+class WelcomeContext implements ContextGenerator<{ userId: number }> {
+  async generate({ userId }: { userId: number }) {
+    const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    return { firstName: user.firstName, plan: user.plan };
+  }
+}
+
+export const contextGeneratorsMap = {
+  welcome: new WelcomeContext(),
+} as const;
+```
+
+</Ts>
+
+## 3. Create a notification
+
+Creating a notification writes the record and, when its send time has already passed, sends it in the same call. Leave the send time out (or set it to now) for an immediate send.
+
+<Py>
+
+```python
+import datetime
+from vintasend.constants import NotificationTypes
+
+service.create_notification(
+    user_id=user.id,
+    notification_type=NotificationTypes.EMAIL,
+    title="Welcome email",                       # for the audit trail, not shown to the user
+    body_template="emails/welcome.html",
+    subject_template="emails/welcome_subject.txt",
+    context_name="welcome",
+    context_kwargs={"user_id": user.id},
+    send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(hours=1),
+)
+```
+
+`body_template` and `subject_template` are whatever the renderer resolves: template paths for the Django and Jinja renderers, template keys for a managed-template renderer. `preheader_template` is a third optional template for the preview line email clients show.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.createNotification({
+  userId: user.id,
+  notificationType: 'EMAIL',
+  title: 'Welcome email', // for the audit trail, not shown to the user
+  bodyTemplate: 'emails/welcome.liquid',
+  subjectTemplate: 'emails/welcome-subject.liquid',
+  contextName: 'welcome',
+  contextParameters: { userId: user.id },
+  sendAfter: new Date(Date.now() + 60 * 60 * 1000),
+  extraParams: null,
+});
+```
+
+`contextName` is checked against the keys of `contextGeneratorsMap`, and `contextParameters` against that generator's parameter type, so a typo fails at compile time.
+
+</Ts>
+
+## 4. Drain the scheduled notifications
+
+A notification with a future send time waits in the store with status `PENDING_SEND`. Nothing sends it until something calls <Sw py="send_pending_notifications" ts="sendPendingNotifications" />, which the library leaves to whatever already runs periodic jobs in your application.
+
+<Py>
+
+```python
+# Celery Beat, cron, a management command: anything periodic
+from vintasend.tasks.periodic_tasks import periodic_send_pending_notifications
+
+periodic_send_pending_notifications(service)
+```
+
+Without an argument the task builds its service from the `NOTIFICATION_SERVICE_FACTORY` setting, which is also how background workers get theirs. See [Background sending](/vintasend/docs/background-sending/).
+
+</Py>
+
+<Ts>
+
+```typescript
+// a cron job, a worker loop, a scheduled function
+await vintasend.sendPendingNotifications();
+```
+
+Every minute is a common cadence. The call is safe to repeat: a notification that is already `SENT` is never picked up again.
+
+</Ts>
+
+## What you have now
+
+Every notification is a row you can query. The [lifecycle page](/vintasend/docs/lifecycle/) covers the status transitions, cancelling and resending; [filtering](/vintasend/docs/filtering/) covers listing across users for a dashboard; and the [dashboard and APIs](/vintasend/docs/tools/) page shows how to put a UI on top without writing one.

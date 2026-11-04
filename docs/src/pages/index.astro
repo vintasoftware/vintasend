@@ -1,0 +1,415 @@
+---
+import { Code } from "astro:components";
+import Base from "../layouts/Base.astro";
+import LangToggle from "../components/LangToggle.astro";
+import { withBase, GITHUB_PY, GITHUB_TS, PYPI, NPM } from "../lib/urls";
+
+const links = [
+  { href: "#how", label: "How it works" },
+  { href: "#seams", label: "Architecture" },
+  { href: "#features", label: "Features" },
+  { href: "#ecosystem", label: "Ecosystem" },
+];
+
+const pyHero = `from vintasend.services.notification_service import NotificationService, register_context
+from vintasend.constants import NotificationTypes
+
+service = NotificationService()  # backend, adapters and renderer come from settings
+
+
+@register_context("invoice_ready")
+def invoice_ready(invoice_id: int):
+    invoice = Invoice.objects.get(pk=invoice_id)  # runs when the email is sent
+    return {"first_name": invoice.customer.first_name, "total": invoice.total}
+
+
+service.create_notification(
+    user_id=invoice.customer_id,
+    notification_type=NotificationTypes.EMAIL,
+    title="Invoice ready",
+    body_template="billing/invoice_ready.html",
+    subject_template="billing/invoice_ready_subject.txt",
+    context_name="invoice_ready",
+    context_kwargs={"invoice_id": invoice.id},
+    send_after=invoice.due_at - timedelta(days=3),  # a row now, an email later
+)`;
+
+const tsHero = `import { VintaSendFactory, type ContextGenerator } from 'vintasend';
+
+class InvoiceReady implements ContextGenerator<{ invoiceId: number }> {
+  async generate({ invoiceId }: { invoiceId: number }) {
+    const invoice = await getInvoice(invoiceId); // runs when the email is sent
+    return { firstName: invoice.customer.firstName, total: invoice.total };
+  }
+}
+
+const contextGeneratorsMap = { invoiceReady: new InvoiceReady() } as const;
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [emailAdapter], backend, logger, contextGeneratorsMap,
+});
+
+await vintasend.createNotification({
+  userId: invoice.customerId,
+  notificationType: 'EMAIL',
+  title: 'Invoice ready',
+  bodyTemplate: 'billing/invoice-ready.liquid',
+  subjectTemplate: 'billing/invoice-ready-subject.liquid',
+  contextName: 'invoiceReady',
+  contextParameters: { invoiceId: invoice.id },
+  sendAfter: addDays(invoice.dueAt, -3), // a row now, an email later
+  extraParams: null,
+});`;
+
+const theme = "github-dark-default";
+---
+<Base
+  title="VintaSend — Transactional notifications for Python and TypeScript"
+  description="VintaSend records every email, SMS, push and in-app notification before delivery, generates its data at send time, and delivers through the backend, template engine and provider you already use. One design, two languages."
+  links={links}
+>
+
+<!-- ============ HERO ============ -->
+<section class="hero">
+  <div class="hero-bg"><div class="glow"></div><div class="grid"></div></div>
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow reveal"><i class="dot"></i> Open source · MIT · <span data-only="py">Python 3.10 to 3.14</span><span data-only="ts">Node.js 20+, strictly typed</span></span>
+      <h1 class="reveal d1">Every notification is a record. <span class="grad">Rendered the moment it sends.</span></h1>
+      <p class="lede reveal d2">VintaSend stores each email, SMS, push and in-app notification before delivery, generates its data when it is actually sent, and delivers it through the database, template engine and provider you already run. One design, in <span data-only="py">Python and TypeScript. You are reading the Python version.</span><span data-only="ts">Python and TypeScript. You are reading the TypeScript version.</span></p>
+      <div class="cta-row reveal d3" style="margin-bottom:14px">
+        <LangToggle class="big" />
+      </div>
+      <div class="cta-row reveal d3">
+        <button class="btn btn-primary btn-copy" data-only="py" data-copy="pip install vintasend"><span class="ico">⌘</span> pip install vintasend</button>
+        <button class="btn btn-primary btn-copy" data-only="ts" data-copy="npm install vintasend"><span class="ico">⌘</span> npm install vintasend</button>
+        <a class="btn" href={withBase("/docs/quickstart/")}>Quick start</a>
+        <a class="btn" data-only="py" href={GITHUB_PY}>GitHub ↗</a>
+        <a class="btn" data-only="ts" href={GITHUB_TS}>GitHub ↗</a>
+      </div>
+      <div class="vendors reveal d4" data-only="py">
+        <span class="lbl">Ships with</span>
+        <span class="v">Django</span><span class="v">SQLAlchemy</span><span class="v">FastAPI-Mail</span><span class="v">Flask-Mail</span><span class="v">Celery</span><span class="v">Twilio</span><span class="v">Jinja2</span><span class="v">S3</span>
+      </div>
+      <div class="vendors reveal d4" data-only="ts">
+        <span class="lbl">Ships with</span>
+        <span class="v">Prisma</span><span class="v">Medplum</span><span class="v">Nodemailer</span><span class="v">SendGrid</span><span class="v">Mailgun</span><span class="v">Twilio</span><span class="v">LiquidJS</span><span class="v">React Email</span><span class="v">S3</span>
+      </div>
+    </div>
+    <div class="panel hero-code reveal d2">
+      <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="lang-pill" data-only="py">python</span><span class="lang-pill" data-only="ts">typescript</span><span class="title" data-only="py">billing/notifications.py</span><span class="title" data-only="ts">billing/notifications.ts</span></div>
+      <div data-only="py"><Code code={pyHero} lang="python" theme={theme} /></div>
+      <div data-only="ts"><Code code={tsHero} lang="typescript" theme={theme} /></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ HOW IT WORKS ============ -->
+<section class="section" id="how">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">How it works</p>
+      <h2>Create a row. Send it when it is due. Keep the trail.</h2>
+      <p>Nothing in VintaSend is fire-and-forget. A notification is persisted first, rendered at send time from data generated at send time, and left behind as a record you can query, resend and cancel.</p>
+    </div>
+    <div class="steps">
+      <div class="step reveal">
+        <div class="num">STEP 01</div>
+        <h3>Create a record</h3>
+        <p>The service writes a row with status <code class="mono">PENDING_SEND</code>, the template names, the <em>name</em> of the function that will produce the data, its arguments, and when to send. No body is rendered yet.</p>
+        <pre data-only="py"><span class="p">&gt;&gt;&gt;</span> service.create_notification(..., send_after=next_monday)</pre>
+        <pre data-only="ts"><span class="p">&gt;</span> await vintasend.createNotification({'{'} ..., sendAfter {'}'})</pre>
+      </div>
+      <div class="step reveal d1">
+        <div class="num">STEP 02</div>
+        <h3>Send when due</h3>
+        <p>Immediately, or when your cron drains the pending ones. The context generator runs <em>now</em>, so a reminder written last week renders this week's data. The renderer builds the body; the adapter delivers it.</p>
+        <pre data-only="py"><span class="p">$</span> celery beat → periodic_send_pending_notifications()</pre>
+        <pre data-only="ts"><span class="p">$</span> cron → await vintasend.sendPendingNotifications()</pre>
+      </div>
+      <div class="step reveal d2">
+        <div class="num">STEP 03</div>
+        <h3>Keep the trail</h3>
+        <p>The row becomes <code class="mono">SENT</code> or <code class="mono">FAILED</code>, with the timestamp, the context that was used, the template version that rendered and the git commit that sent it. Filter it, resend it, cancel it, from code or a dashboard.</p>
+        <pre data-only="py"><span class="p">&gt;&gt;&gt;</span> service.resend_notification(notification.id)</pre>
+        <pre data-only="ts"><span class="p">&gt;</span> await vintasend.resendNotification(notification.id)</pre>
+      </div>
+    </div>
+
+    <div class="split" style="margin-top:72px">
+      <div class="reveal">
+        <p class="kicker">Context at send time</p>
+        <h2>Schedule the notification, not the data.</h2>
+        <p>A notification stores a <b>context name</b> and the arguments to call it with, never the rendered data. The generator behind that name runs the moment the notification is sent, so a scheduled message always carries current information, and a template edit applies to everything still pending.</p>
+        <ul class="checks">
+          <li data-only="py"><b>One decorator.</b> <code class="mono">@register_context("name")</code> puts a sync or async function in the registry.</li>
+          <li data-only="ts"><b>One map.</b> A <code class="mono">contextGeneratorsMap</code> of classes with a <code class="mono">generate()</code> method, typed end to end.</li>
+          <li><b>Stored on send.</b> The context that actually rendered is kept with the record, so a resend can reuse it instead of regenerating.</li>
+          <li><b>Nothing to serialize.</b> Only the name and plain arguments travel through the queue, which is what makes background sending and replication safe.</li>
+        </ul>
+      </div>
+      <div class="panel reveal d1">
+        <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">notification · 8f3c…a21</span></div>
+        <div class="record">
+<div class="row"><span class="k">status</span>              <span class="s">"SENT"</span>                       <span class="cm"># was PENDING_SEND until monday</span></div>
+<div class="row"><span class="k">notification_type</span>   <span class="s">"EMAIL"</span></div>
+<div class="row"><span class="k">title</span>               <span class="s">"Invoice ready"</span>              <span class="cm"># for the audit trail</span></div>
+<div class="row"><span class="k">body_template</span>       <span class="s">"billing/invoice_ready"</span>      <span class="cm"># a path, or a managed key</span></div>
+<div class="row"><span class="k">context_name</span>        <span class="s">"invoice_ready"</span>              <span class="cm"># looked up at send time</span></div>
+<div class="row"><span class="k">context_kwargs</span>      <span class="v">&#123;"invoice_id": 4821&#125;</span></div>
+<div class="row"><span class="k">context_used</span>        <span class="v">&#123;"first_name": "Ada", …&#125;</span>    <span class="cm"># what actually rendered</span></div>
+<div class="row"><span class="k">send_after</span>          <span class="n">2026-11-09T09:00:00Z</span></div>
+<div class="row"><span class="k">sent_at</span>             <span class="n">2026-11-09T09:00:14Z</span></div>
+<div class="row"><span class="k">used_template_version</span> <span class="n">3</span>                           <span class="cm"># pinned, or whatever was current</span></div>
+<div class="row"><span class="k">git_commit_sha</span>      <span class="n">"c1f9e4…"</span>                   <span class="cm"># the revision that sent it</span></div>
+<div class="row"><span class="k">attachments</span>         <span class="v">[invoice-4821.pdf]</span>           <span class="cm"># deduplicated by checksum</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ ARCHITECTURE / SEAMS ============ -->
+<section class="section" id="seams">
+  <div class="wrap">
+    <div class="split rev">
+      <div class="panel flow reveal d1">
+        <svg viewBox="0 0 640 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The notification service talks to a backend, a template renderer and an adapter, plus optional seams">
+          <defs>
+            <linearGradient id="edgeGrad" x1="0" x2="1"><stop offset="0" style="stop-color:var(--accent)"/><stop offset="1" style="stop-color:var(--accent-2)"/></linearGradient>
+          </defs>
+          <!-- your app -->
+          <rect class="box" x="20" y="150" width="130" height="64" rx="12"/>
+          <text class="t" x="40" y="178">Your app</text>
+          <text class="s" x="40" y="198" data-only="py">create_notification()</text>
+          <text class="s" x="40" y="198" data-only="ts">createNotification()</text>
+          <path class="edge anim" d="M150 182 L220 182"/>
+          <!-- service -->
+          <rect class="box hi" x="220" y="130" width="190" height="104" rx="14"/>
+          <text class="t" x="240" y="162">NotificationService</text>
+          <text class="s" x="240" y="184">records · schedules · sends</text>
+          <text class="a" x="240" y="204">context registry inside</text>
+          <text class="a" x="240" y="220" data-only="py">sync and AsyncIO twins</text>
+          <text class="a" x="240" y="220" data-only="ts">VintaSendFactory&lt;Config&gt;</text>
+          <!-- required seams -->
+          <path class="edge anim" d="M410 150 C 440 150, 440 60, 470 60"/>
+          <path class="edge anim" d="M410 182 L470 182"/>
+          <path class="edge anim" d="M410 214 C 440 214, 440 304, 470 304"/>
+          <rect class="box" x="470" y="30" width="150" height="60" rx="12"/>
+          <text class="t" x="488" y="55">Backend</text>
+          <text class="s" x="488" y="75">store and query</text>
+          <rect class="box" x="470" y="152" width="150" height="60" rx="12"/>
+          <text class="t" x="488" y="177">Renderer</text>
+          <text class="s" x="488" y="197">template + context</text>
+          <rect class="box" x="470" y="274" width="150" height="60" rx="12"/>
+          <text class="t" x="488" y="299">Adapter</text>
+          <text class="s" x="488" y="319">email · SMS · push · in-app</text>
+          <text class="lbl" x="470" y="18">required · one each</text>
+          <!-- optional seams -->
+          <text class="lbl" x="20" y="268">optional · off until configured</text>
+          <rect class="box opt" x="20" y="280" width="118" height="44" rx="10"/><text class="s" x="32" y="307" style="fill:var(--text)">Attachments</text>
+          <rect class="box opt" x="150" y="280" width="118" height="44" rx="10"/><text class="s" x="162" y="307" style="fill:var(--text)">Queue</text>
+          <rect class="box opt" x="20" y="336" width="118" height="44" rx="10"/><text class="s" x="32" y="363" style="fill:var(--text)">Replication</text>
+          <rect class="box opt" x="150" y="336" width="118" height="44" rx="10"/><text class="s" x="162" y="363" style="fill:var(--text)">Git SHA</text>
+          <path class="edge" d="M268 302 C 300 302, 300 234, 315 234" stroke-dasharray="3 4"/>
+          <rect class="box opt" x="280" y="336" width="118" height="44" rx="10" data-only="ts"/><text class="s" x="292" y="363" style="fill:var(--text)" data-only="ts">Logger</text>
+        </svg>
+      </div>
+      <div class="reveal">
+        <p class="kicker">Architecture</p>
+        <h2>Three seams you implement. Four you can leave unset.</h2>
+        <p>The core defines the interfaces and the orchestration and ships none of the integrations. A <b>backend</b> persists and queries, a <b>template renderer</b> turns a template plus context into a body, an <b>adapter</b> delivers it. Each is a small base class with a working fake, and each is swapped without touching the code that creates notifications.</p>
+        <ul class="checks">
+          <li><b>Pick per seam.</b> Django ORM today, a faster store after the first million rows, same <span data-only="py"><code class="mono">create_notification</code></span><span data-only="ts"><code class="mono">createNotification</code></span> call.</li>
+          <li><b>Optional seams gate features.</b> No attachment manager, no attachments. No queue, no background sending. Nothing fails silently where it matters.</li>
+          <li><b>Versioned contract.</b> A new abstract method on a seam is a minor release with a backwards-compatibility note, so downstream packages are never surprised.</li>
+          <li data-only="py"><b>Settings or code.</b> Inject an instance, a dotted import string, or a <code class="mono">NOTIFICATION_*</code> setting read from Django, Flask, env vars or a config object.</li>
+          <li data-only="ts"><b>Typed end to end.</b> One <code class="mono">NotificationTypeConfig</code> ties the context map and id types through every factory.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="cards four" style="margin-top:56px">
+      <div class="card reveal"><h3>Backend <span class="tag on">required</span></h3><p>Persist, query and update notifications. Reports which filters, lookups and sort fields it supports so a UI can grey out the rest.</p></div>
+      <div class="card reveal d1"><h3>Adapter <span class="tag on">required</span></h3><p>Deliver a rendered notification over one channel. Returns the render so the service can record which template version went out.</p></div>
+      <div class="card reveal d2"><h3>Template renderer <span class="tag on">required</span></h3><p>Template plus context in, subject and body out. File-based, or wrapped by a managed-template renderer that reads from a store.</p></div>
+      <div class="card reveal d3"><h3>Attachment manager <span class="tag opt">optional</span></h3><p>Stores the bytes behind an attachment. The backend only keeps a checksum-indexed record and a join row.</p></div>
+      <div class="card reveal"><h3>Queue service <span class="tag opt">optional</span></h3><p>Enqueues a notification id for a worker to deliver. The worker rebuilds the service from a factory and reloads the real record.</p></div>
+      <div class="card reveal d1"><h3>Replication queue <span class="tag opt">optional</span></h3><p>Takes replica writes off the request path when a service runs more than one backend.</p></div>
+      <div class="card reveal d2"><h3>Git commit SHA provider <span class="tag opt">optional</span></h3><p>Returns the running revision so every sent notification records which code sent it.</p></div>
+      <div class="card reveal d3" data-only="py"><h3>AsyncIO twins <span class="tag">python</span></h3><p>Every seam except the renderer has an <code>AsyncIO</code> base class, and <code>AsyncIONotificationService</code> drives them with the same API, awaited.</p></div>
+      <div class="card reveal d3" data-only="ts"><h3>Logger <span class="tag on">required</span></h3><p>Receives structured <code>LogMessage</code>s built from ids, counts and labels, never free text, so logs stay free of personal data.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ FEATURES ============ -->
+<section class="section" id="features">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">What comes with the record</p>
+      <h2>Because every notification is a row, the rest follows.</h2>
+      <p>Scheduling, auditing, retries, dashboards and migrations are what you get when delivery is a state transition on a stored record rather than a side effect in a request handler.</p>
+    </div>
+    <div class="cards">
+      <div class="card reveal"><h3>Scheduling</h3><p>Set <span data-only="py"><code>send_after</code></span><span data-only="ts"><code>sendAfter</code></span> and the row waits. One periodic call drains everything that is due, safely re-runnable.</p></div>
+      <div class="card reveal d1"><h3>Attachments</h3><p>Files from paths, buffers, streams or stored references, deduplicated by checksum, reusable by id, stored by a pluggable manager such as S3.</p></div>
+      <div class="card reveal d2"><h3>One-off notifications</h3><p>Send to an email address or phone number that has no user record, with the recipient validated before anything is persisted.</p></div>
+      <div class="card reveal" data-only="py"><h3>In-app notifications</h3><p>Unread listing, counts and idempotent bulk read-marking scoped to a user, so one user can never mark another's as read.</p></div>
+      <div class="card reveal" data-only="ts"><h3>In-app notifications</h3><p>Unread listing and read marking on the same records as every other channel, with only <code>SENT</code> and <code>READ</code> ever exposed to the user.</p></div>
+      <div class="card reveal d1"><h3>Filtering and dashboards</h3><p>A JSON-friendly filter grammar with <code>and</code> / <code>or</code> / <code>not</code>, date ranges, string lookups, stable pagination and a capability report per backend.</p></div>
+      <div class="card reveal d2"><h3>Resend and cancel</h3><p>Resend clones the record and leaves the original untouched, optionally with the exact context it rendered with. Cancel stops a pending one.</p></div>
+      <div class="card reveal"><h3>Background sending</h3><p>An adapter opts in, the request enqueues only an id, and a worker delivers with the real record and its attachments reloaded from the backend.</p></div>
+      <div class="card reveal d1"><h3>Multiple backends</h3><p>A primary plus replicas, replicated inline or through a queue, with sync verification, per-backend health and a copy-only migration between stores.</p></div>
+      <div class="card reveal d2"><h3>Template versions</h3><p>Pin a notification to a template version, record the version that actually rendered, and keep templates in a database with a draft-to-archived lifecycle.</p></div>
+      <div class="card reveal"><h3>Git commit tracking</h3><p>Each sent notification records the 40-character revision that delivered it, resolved at send time and never allowed to block a send.</p></div>
+      <div class="card reveal d1"><h3>Historical rendering</h3><p>Render a notification against the template content it had at the time, from its stored context, for a preview or an audit, without sending anything.</p></div>
+      <div class="card reveal d2" data-only="py"><h3>Sync and AsyncIO</h3><p>Two services with the same API. FastAPI gets <code>await</code> all the way down; Django and Flask stay synchronous.</p></div>
+      <div class="card reveal d2" data-only="ts"><h3>Strict typing</h3><p>Context names and parameters are checked against your generator map at compile time, and the Prisma backend infers its types from your generated client.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ TWO LANGUAGES ============ -->
+<section class="section" id="languages">
+  <div class="wrap split">
+    <div class="reveal">
+      <p class="kicker">Python and TypeScript</p>
+      <h2>Siblings, not ports. One contract across both.</h2>
+      <p>Both libraries share the seams, the five statuses, the filter vocabulary and its capability keys, the managed-template tag language, and the OpenAPI contract the dashboard speaks. Names follow each language's conventions, and the few places the ecosystems differ are documented rather than papered over.</p>
+      <ul class="checks">
+        <li><b>One dashboard for both.</b> A Django service and a Node service can report to the same UI through the same API contract.</li>
+        <li><b>Shared template store.</b> <a href={withBase("/managed-templates/")} style="color:var(--accent-fg)">Managed templates</a> written by one library render in the other: same tags, same slug rules, same lifecycle.</li>
+        <li><b>Read, don't assume.</b> Python backends page from 1, TypeScript backends from 0, and <code class="mono">pagination.oneIndexed</code> tells you which.</li>
+      </ul>
+      <div class="cta-row" style="margin-top:22px">
+        <a class="btn" href={withBase("/docs/introduction/")}>Read the docs in either language</a>
+      </div>
+    </div>
+    <div class="panel reveal d1">
+      <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">same idea, each language's spelling</span></div>
+      <table class="names">
+        <thead><tr><th></th><th>Python</th><th>TypeScript</th></tr></thead>
+        <tbody>
+          <tr><td>Install</td><td><code>pip install vintasend</code></td><td><code>npm install vintasend</code></td></tr>
+          <tr><td>Service</td><td><code>NotificationService()</code></td><td><code>VintaSendFactory().create()</code></td></tr>
+          <tr><td>Context</td><td><code>@register_context("x")</code></td><td><code>contextGeneratorsMap</code></td></tr>
+          <tr><td>Create</td><td><code>create_notification()</code></td><td><code>createNotification()</code></td></tr>
+          <tr><td>Drain</td><td><code>send_pending_notifications()</code></td><td><code>sendPendingNotifications()</code></td></tr>
+          <tr><td>Query</td><td><code>filter_notifications()</code></td><td><code>filterNotifications()</code></td></tr>
+          <tr><td>Capabilities</td><td><code>fields.sentAtRange</code></td><td><code>fields.sentAtRange</code></td></tr>
+          <tr><td>First page</td><td><code>page=1</code></td><td><code>page = 0</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ ECOSYSTEM ============ -->
+<section class="section" id="ecosystem">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">Ecosystem</p>
+      <h2>Official implementations for the stack you already run.</h2>
+      <p>Every package implements one or more seams and is released on its own cycle. Pick one per required seam, add the optional ones you need, or start from the implementation template to write your own.</p>
+    </div>
+
+    <div class="eco" data-only="py">
+      <div class="card reveal"><h3>Backends</h3><ul>
+        <li><a href="https://github.com/vintasoftware/vintasend-django">vintasend-django</a><span>Django ORM, plus an email adapter and a template renderer</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-sqlalchemy">vintasend-sqlalchemy</a><span>SQLAlchemy, sync and async sessions</span></li>
+      </ul></div>
+      <div class="card reveal d1"><h3>Adapters</h3><ul>
+        <li><a href="https://github.com/vintasoftware/vintasend-fastapi-mail">vintasend-fastapi-mail</a><span>AsyncIO email through FastAPI-Mail</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-flask-mail">vintasend-flask-mail</a><span>Email through Flask-Mail</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-twilio">vintasend-twilio</a><span>SMS through Twilio, sync and AsyncIO</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-celery">vintasend-celery</a><span>Deferred delivery on sync backends</span></li>
+      </ul></div>
+      <div class="card reveal d2"><h3>Renderers and more</h3><ul>
+        <li><a href="https://github.com/vintasoftware/vintasend-jinja">vintasend-jinja</a><span>Jinja2 templates</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-aws-s3-attachments">vintasend-aws-s3-attachments</a><span>Attachments in S3 via boto3</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-managed-templates">vintasend-managed-templates</a><span>Store-backed, versioned templates</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-django-templates-manager">vintasend-django-templates-manager</a><span>Django storage for managed templates</span></li>
+      </ul></div>
+    </div>
+
+    <div class="eco" data-only="ts">
+      <div class="card reveal"><h3>Backends</h3><ul>
+        <li><a href="https://github.com/vintasoftware/vintasend-ts-prisma">vintasend-prisma</a><span>Prisma Client, typed from your generated client</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-medplum">vintasend-medplum</a><span>FHIR resources on Medplum; also an adapter, attachments and a logger</span></li>
+      </ul></div>
+      <div class="card reveal d1"><h3>Adapters</h3><ul>
+        <li><a href="https://github.com/vintasoftware/vintasend-nodemailer">vintasend-nodemailer</a><span>Email through any Nodemailer transport</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-ts-sendgrid">vintasend-sendgrid</a><span>SendGrid, with attachments</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-ts-mailgun">vintasend-mailgun</a><span>Mailgun, with attachments</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-ts-twilio">vintasend-twilio</a><span>SMS through Twilio</span></li>
+      </ul></div>
+      <div class="card reveal d2"><h3>Renderers and more</h3><ul>
+        <li><a href="https://github.com/vintasoftware/vintasend-liquidjs">vintasend-liquidjs</a><span>LiquidJS, safe for templates edited outside the repo</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-react-email">vintasend-react-email</a><span>React Email, TSX templates included</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-pug">vintasend-pug</a><span>Pug, for templates in your repository</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-ts-aws-s3-attachments">vintasend-aws-s3-attachments</a><span>S3 and S3-compatible stores</span></li>
+        <li><a href="https://github.com/vintasoftware/vintasend-winston">vintasend-winston</a><span>Winston logger</span></li>
+      </ul></div>
+    </div>
+    <p class="muted reveal" style="margin-top:18px;font-size:14px">Full list, with install commands and typical combinations, on the <a href={withBase("/docs/implementations/")} style="color:var(--accent-fg)">implementations page</a>.</p>
+  </div>
+</section>
+
+<!-- ============ TOOLS TEASER ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="teaser reveal">
+      <div>
+        <p class="kicker">Need a UI on top?</p>
+        <h2>A dashboard that works against either library.</h2>
+        <p class="muted">The notifications API (<span data-only="py">Django + django-ninja</span><span data-only="ts">TypeScript</span>) exposes a configured service over HTTP behind an API key, and the Next.js dashboard browses, previews, resends and cancels through that contract alone. Both language APIs ship the same <code class="mono">openapi.yaml</code> byte for byte, and a second API plus dashboard does the same for managed templates.</p>
+        <div class="cta-row" style="margin-top:22px">
+          <a class="btn btn-primary" href={withBase("/dashboard/")}>Meet the dashboard →</a>
+          <a class="btn" href={withBase("/managed-templates/")}>Managed templates →</a>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">dashboard · notifications</span></div>
+        <div class="record">
+<div class="row"><span class="cm">filter</span>  <span class="v">status in (FAILED) · sent_at last 24h</span></div>
+<div class="row"><span class="cm">──────────────────────────────────────────</span></div>
+<div class="row"><span class="n">8f3c…a21</span>  <span class="s">EMAIL</span>  invoice_ready    <span class="k">tenant=acme</span>  <span style="color:var(--red-300)">FAILED</span>  <span class="cm">[resend]</span></div>
+<div class="row"><span class="n">21d0…7be</span>  <span class="s">SMS</span>    appointment      <span class="k">tenant=acme</span>  <span style="color:var(--red-300)">FAILED</span>  <span class="cm">[resend]</span></div>
+<div class="row"><span class="n">c04e…f90</span>  <span class="s">EMAIL</span>  password_reset   <span class="k">tenant=beta</span>  <span style="color:var(--green-300)">SENT</span>    <span class="cm">[preview]</span></div>
+<div class="row"><span class="cm">──────────────────────────────────────────</span></div>
+<div class="row"><span class="cm">capabilities</span>  <span class="k">fields.tenant ✓  orderBy.sentAt ✓  pagination.oneIndexed</span> <span class="v" data-only="py">true</span><span class="v" data-only="ts">false</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ BIG CTA ============ -->
+<section class="section tight">
+  <div class="wrap">
+    <div class="big-cta reveal">
+      <h2>Install the core. Pick your seams.</h2>
+      <p>The core is tiny on purpose. Add one backend, one adapter and one renderer for your stack, and every feature above is already there.</p>
+      <div class="cta-row">
+        <button class="btn btn-primary btn-copy" data-only="py" data-copy="pip install vintasend vintasend-django"><span class="ico">⌘</span> pip install vintasend vintasend-django</button>
+        <button class="btn btn-primary btn-copy" data-only="ts" data-copy="npm install vintasend vintasend-prisma vintasend-nodemailer vintasend-liquidjs"><span class="ico">⌘</span> npm install vintasend vintasend-prisma …</button>
+        <a class="btn" href={withBase("/docs/")}>Documentation</a>
+        <a class="btn" data-only="py" href={PYPI}>PyPI</a>
+        <a class="btn" data-only="ts" href={NPM}>npm</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</Base>

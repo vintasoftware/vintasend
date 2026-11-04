@@ -448,6 +448,17 @@ Run `git submodule update --init` if `tools/` is empty.
 - Every PR must pass `poetry run ruff check .`, `poetry run mypy`, and `poetry run pytest`. CI also
   runs the full tox matrix — a change that only works on new Python will fail there, not locally.
 
+## Website
+
+`docs/` is the landing page and documentation site, published to GitHub Pages at
+<https://vintasoftware.github.io/vintasend/> by `.github/workflows/pages.yml` on every push to
+`main` that touches it. It is an Astro project with its own `package.json`, independent of the
+Python package: `cd docs && npm install && npm run dev`. One site covers both this library and
+`vintasend-ts`, with a language switch; every docs page is an MDX file under
+`docs/src/content/docs/` that carries examples for both languages in `<Py>` / `<Ts>` blocks.
+See [docs/README.md](docs/README.md) for the page conventions. **A public API change should
+update the matching docs page in the same PR**, the same way it updates `README.md`.
+
 ## Key documentation
 
 - **`README.md`** — public usage guide: getting started, attachments, one-off notifications, in-app

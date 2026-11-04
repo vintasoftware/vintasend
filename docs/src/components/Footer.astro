@@ -1,0 +1,17 @@
+---
+import { withBase, GITHUB_PY, GITHUB_TS, PYPI, NPM } from "../lib/urls";
+---
+<footer class="footer">
+  <div class="wrap">
+    <span>© <span data-year></span> <a href="https://www.vinta.com.br">Vinta Software</a> · MIT</span>
+    <div class="right">
+      <a href={withBase("/docs/")}>Docs</a>
+      <a href={withBase("/dashboard/")}>Dashboard</a>
+      <a href={withBase("/managed-templates/")}>Templates</a>
+      <a href={GITHUB_PY}>vintasend</a>
+      <a href={GITHUB_TS}>vintasend-ts</a>
+      <a href={PYPI}>PyPI</a>
+      <a href={NPM}>npm</a>
+    </div>
+  </div>
+</footer>

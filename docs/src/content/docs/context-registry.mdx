@@ -1,0 +1,171 @@
+---
+title: Context generators
+description: Why template data is generated at send time, how generators are registered and typed, and how the context that was used is stored and reused.
+section: Concepts
+order: 11
+---
+
+A notification does not store the data its template needs. It stores the **name** of a generator and the **arguments** to call it with. The generator runs when the notification is sent, and its return value, the *context*, is what the renderer sees.
+
+## Why send time and not creation time
+
+A reminder created today and scheduled for next week should show next week's balance, the current first name, the order's latest status. If the context were captured at creation, every scheduled notification would render stale data, and every change to a user's profile would have to find and rewrite pending records. Storing a name and a handful of ids instead keeps the record small and the data fresh.
+
+The cost is that the generator must exist, under the same name, in the process that sends. For a background worker or a cron job that drains scheduled notifications, that means the module defining the generator has to be loaded there too.
+
+## Registering a generator
+
+<Py>
+
+A generator is a plain function decorated with `@register_context("name")`. The decorator stores the function in the `Contexts` singleton under that name and returns it unchanged.
+
+```python
+from vintasend.services.notification_service import register_context
+from vintasend.services.dataclasses import NotificationContextDict
+
+@register_context("order_shipped")
+def order_shipped(order_id: int) -> NotificationContextDict:
+    order = Order.objects.get(pk=order_id)
+    return {"first_name": order.user.first_name, "tracking_url": order.tracking_url}
+```
+
+Both sync and async generators are accepted. The service checks the callable with `inspect.iscoroutinefunction`: `AsyncIONotificationService` awaits an async generator, and `NotificationService` runs it with `asyncio.run`, which means the sync service cannot be driven from inside an already running event loop when its generator is async.
+
+```python
+@register_context("order_shipped")
+async def order_shipped(order_id: int) -> NotificationContextDict:
+    order = await get_order(order_id)
+    return {"first_name": order.user.first_name, "tracking_url": order.tracking_url}
+```
+
+Registration is a side effect of importing the module. If the module has not been imported when the notification is sent, the lookup finds nothing and the send fails with `NotificationContextGenerationError("Context function not found")`. The same exception wraps any error the generator itself raises. Import your generator modules from somewhere that always runs: an app config `ready()` in Django, the module that builds the service, or the worker's startup.
+
+The registry is `Contexts()`, a singleton with `register_function(key, func)` and `get_function(key)`; the decorator is the only interface you normally need.
+
+</Py>
+
+<Ts>
+
+A generator is a class implementing the `ContextGenerator` interface, which has one method, `generate`. It may return the context or a promise of it.
+
+```typescript
+import type { ContextGenerator } from 'vintasend';
+
+class OrderShippedContext implements ContextGenerator<{ orderId: number }> {
+  async generate({ orderId }: { orderId: number }) {
+    const order = await getOrder(orderId);
+    return { firstName: order.user.firstName, trackingUrl: order.trackingUrl };
+  }
+}
+```
+
+Instances are collected in a `contextGeneratorsMap` object, declared `as const` so the keys stay literal types, and passed to the factory. There is no global registry: the map you pass is the only place the service looks.
+
+```typescript
+export const contextGeneratorsMap = {
+  orderShipped: new OrderShippedContext(),
+} as const;
+
+export type NotificationTypeConfig = {
+  ContextMap: typeof contextGeneratorsMap;
+  NotificationIdType: number;
+  UserIdType: number;
+};
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters, backend, logger, contextGeneratorsMap,
+});
+```
+
+The typing does the checking that Python does at runtime. `contextName` on `createNotification` is `string & keyof Config['ContextMap']`, so a name that is not in the map is a compile error, and `contextParameters` is typed as the parameter of that generator's `generate`, so a wrong argument shape is one too. The parameter type must extend `Record<string, JsonPrimitive>` and the return type `JsonObject`: the parameters are stored on the record and the result is stored after sending, so both have to survive a round trip through JSON.
+
+</Ts>
+
+## Arguments and the stored call
+
+The record holds two things about its context: the generator's name and the arguments to call it with, <Sw py="context_kwargs" ts="contextParameters" />. Keep the arguments to ids and scalars. They are serialized into the record, and a generator that looks data up by id is what makes the send-time rendering fresh.
+
+<Py>
+
+`context_kwargs` is a dict of `str` keys to `int`, `str` or `uuid.UUID` values. It is unpacked as keyword arguments, `generator(**context_kwargs)`, so the keys must match the function's parameter names.
+
+```python
+service.create_notification(
+    user_id=order.user_id,
+    notification_type=NotificationTypes.EMAIL,
+    title="Order shipped",
+    body_template="orders/shipped.html",
+    context_name="order_shipped",
+    context_kwargs={"order_id": order.id},
+)
+```
+
+`get_notification_context(notification)` on the service is the lookup-and-call step, usable on its own when you need the context for a preview.
+
+</Py>
+
+<Ts>
+
+`contextParameters` is passed as the single argument to `generate`. Its type comes from the generator the `contextName` points at.
+
+```typescript
+await vintasend.createNotification({
+  userId: order.userId,
+  notificationType: 'EMAIL',
+  title: 'Order shipped',
+  bodyTemplate: './templates/orders/shipped.html',
+  subjectTemplate: './templates/orders/shipped-subject.txt',
+  contextName: 'orderShipped',
+  contextParameters: { orderId: order.id },
+  sendAfter: null,
+  extraParams: null,
+});
+```
+
+`getNotificationContext(contextName, parameters)` on the service is the same lookup-and-call step, exposed for previews.
+
+</Ts>
+
+## What happens when generation fails
+
+<Py>
+
+Any failure in the generator, including a name that was never registered, surfaces as `NotificationContextGenerationError`. During a send the service marks the notification `FAILED` first, then either raises the error (`raise_on_failed_send=True`) or logs it and returns (the default). The context belongs to the notification rather than to one adapter, so no other adapter is tried.
+
+</Py>
+
+<Ts>
+
+A generator that throws is caught inside `send`: the error is logged and, with `raiseErrorOnFailedSend: true`, rethrown. The record is left as it was; the service does not mark it `FAILED` on a context failure, only on an adapter failure. A `contextName` that is missing from the map at runtime fails the same way, but the type system normally stops that at compile time.
+
+</Ts>
+
+## The stored context
+
+After a successful delivery the service asks the backend to store the context it rendered with and the adapter that delivered it. The record then carries <Sw py="context_used" ts="contextUsed" /> and <Sw py="adapter_used" ts="adapterUsed" />. This is an audit trail: it answers "what did this user actually receive" without re-running the generator against data that has since changed.
+
+The stored context has a second use: resending with the exact data that went out the first time.
+
+<Py>
+
+```python
+clone = service.resend_notification(notification.id, use_stored_context_if_available=True)
+```
+
+When `use_stored_context_if_available` is `True` and the source has a `context_used`, the clone is sent with that context verbatim and the generator is not called. Without it, or when the source was never sent, context is generated afresh. `render_email_template_from_content(notification, template_content, context)` renders a notification against a context you supply, typically a stored `context_used`, to reproduce a past render without sending.
+
+</Py>
+
+<Ts>
+
+```typescript
+const clone = await vintasend.resendNotification(notification.id, true);
+```
+
+When the second argument, `useStoredContextIfAvailable`, is `true`, the clone is created with the source's `contextUsed` and sent with it; if the source has no stored context the resend is refused (logged, or thrown with `raiseErrorOnFailedSend`). With `false`, the default, the clone's `contextUsed` is generated once at resend time and then used for the send. `renderEmailTemplateFromContent(notification, templateContent, contextInput)` renders against either a literal `context` or a `contextName` plus `contextParameters`, without sending.
+
+</Ts>
+
+<Callout kind="tip" title="Keep generators cheap and side-effect free">
+A generator runs once per send, inside the send path, and again on a resend without stored context. Read data, build a dict, return. Anything that writes or calls out to a slow service belongs in the adapter, or in the code that created the notification.
+</Callout>

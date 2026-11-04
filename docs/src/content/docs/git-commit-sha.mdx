@@ -1,0 +1,173 @@
+---
+title: Git commit SHA tracking
+description: Record which source-code revision rendered and sent each notification, through an opt-in provider that resolves the SHA at send time.
+section: Guides
+order: 27
+---
+
+Every notification can record the git commit SHA of the code that sent it. When a template bug ships, that field answers "which notifications went out under the broken revision" with a filter instead of a timeline reconstruction. It is **opt-in**: with no provider configured, nothing changes. No SHA is ever resolved or written, and <Sw py="git_commit_sha" ts="gitCommitSha" /> stays <Sw py="None" ts="null" /> on every notification.
+
+## Configuring a provider
+
+A provider is a single-method object that returns the SHA of the revision currently running, or <Sw py="None" ts="null" /> when it cannot be determined right now. It is called on every send, foreground and background alike, so it should be cheap: read a baked-in value or an environment variable rather than shelling out to `git` on a deployed artifact that has no `.git` directory.
+
+<Py>
+
+Implement `BaseGitCommitShaProvider` (sync) or `AsyncIOBaseGitCommitShaProvider` (AsyncIO), each with one abstract method, `get_current_git_commit_sha() -> str | None`:
+
+```python
+import os
+
+from vintasend.services.git_commit_sha_providers.base import BaseGitCommitShaProvider
+
+
+class EnvVarGitCommitShaProvider(BaseGitCommitShaProvider):
+    def get_current_git_commit_sha(self) -> str | None:
+        return os.environ.get("GIT_COMMIT_SHA")
+```
+
+Configure it the same way as the queue service or the attachment manager: an instance, a dotted import string, or the `NOTIFICATION_GIT_COMMIT_SHA_PROVIDER` setting.
+
+```python
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=backend,
+    git_commit_sha_provider=EnvVarGitCommitShaProvider(),  # or "myapp.git.EnvVarGitCommitShaProvider"
+)
+```
+
+```bash
+export NOTIFICATION_GIT_COMMIT_SHA_PROVIDER="myapp.git.EnvVarGitCommitShaProvider"
+```
+
+</Py>
+
+<Ts>
+
+Implement the `BaseGitCommitShaProvider` interface, a plain object with one method, `getCurrentGitCommitSha(): string | Promise<string | null> | null`, and pass it to the factory as `gitCommitShaProvider`:
+
+```typescript
+import { VintaSendFactory, type BaseGitCommitShaProvider } from 'vintasend';
+
+const gitCommitShaProvider: BaseGitCommitShaProvider = {
+  getCurrentGitCommitSha: () => process.env.GIT_COMMIT_SHA ?? null,
+};
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [adapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+  gitCommitShaProvider,
+});
+```
+
+The method may return synchronously or return a promise; the service awaits either.
+
+</Ts>
+
+### Provider examples
+
+<Py>
+
+```python
+import os
+import subprocess
+
+from vintasend.services.git_commit_sha_providers.base import BaseGitCommitShaProvider
+
+
+class EnvVarGitCommitShaProvider(BaseGitCommitShaProvider):
+    """CI/CD injects the SHA into the environment at deploy time."""
+
+    def get_current_git_commit_sha(self) -> str | None:
+        return os.environ.get("GIT_COMMIT_SHA")
+
+
+class ShellGitCommitShaProvider(BaseGitCommitShaProvider):
+    """Development only: asks git. Returns None when there is no repository."""
+
+    def get_current_git_commit_sha(self) -> str | None:
+        try:
+            return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() or None
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+
+class StaticGitCommitShaProvider(BaseGitCommitShaProvider):
+    """A fixed value, for deterministic environments and tests."""
+
+    def get_current_git_commit_sha(self) -> str | None:
+        return "0123456789abcdef0123456789abcdef01234567"
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+import { execSync } from 'node:child_process';
+
+// CI/CD injects the SHA into the environment at deploy time.
+const envProvider: BaseGitCommitShaProvider = {
+  getCurrentGitCommitSha: () => process.env.GIT_COMMIT_SHA ?? null,
+};
+
+// Development only: asks git. Returns null when there is no repository.
+const shellProvider: BaseGitCommitShaProvider = {
+  getCurrentGitCommitSha: async () => {
+    try {
+      return execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim() || null;
+    } catch {
+      return null;
+    }
+  },
+};
+
+// A fixed value, for deterministic environments and tests.
+const staticProvider: BaseGitCommitShaProvider = {
+  getCurrentGitCommitSha: () => '0123456789abcdef0123456789abcdef01234567',
+};
+```
+
+</Ts>
+
+## Semantics
+
+- **Resolved at send time, not creation time.** The provider is called at the top of both <Sw py="send()" ts="send()" /> and <Sw py="delayed_send()" ts="delayedSend()" />, so a scheduled notification records the revision that actually delivered it, foreground or from a background worker, not the one that created or enqueued it.
+- **One SHA per notification, not a history.** The field holds the revision that last sent it. A resend under a newer revision overwrites it.
+- **Written only when it changes.** The provider is called on every send, but the backend is asked to persist a new value only when it differs from what is already stored, so re-sending under the same revision is a no-op write. With additional backends configured, the write fans out like any other.
+- **Normalized and validated.** A returned SHA is trimmed and lowercased, and must then match 40 hexadecimal characters. A short SHA, a branch name or an empty string is a configuration error, not something to store silently. A <Sw py="None" ts="null" /> return means "unknown this call" and is skipped.
+- **System-managed.** The field is never settable through <Sw py="create_notification" ts="createNotification" /> or <Sw py="update_notification" ts="updateNotification" />, nor through a resend. Only the service writes it, at send time.
+
+<Py>
+
+A malformed, non-`None` value raises `InvalidGitCommitShaError`, regardless of `raise_on_failed_send`. Passing `git_commit_sha` to `update_notification` raises `GitCommitShaReassignmentError`.
+
+**Provider failures never block a send.** If the provider raises, the exception is caught and logged and treated exactly like a `None` return. Audit metadata is never worth failing a delivery over.
+
+On the backend side, the service writes through `store_git_commit_sha(notification_id, git_commit_sha)` on `BaseNotificationBackend`, called only when the value changed, so an implementation does not need to deduplicate writes itself.
+
+</Py>
+
+<Ts>
+
+A malformed, non-`null` value makes the send throw `Error('Invalid gitCommitSha resolved by provider. Expected a 40-character hexadecimal SHA.')`. The notification input and update types declare `gitCommitSha?: never`, so passing it is a compile-time error rather than a runtime one.
+
+**A provider that throws fails the send.** The service does not catch provider errors in TypeScript, so catch inside the provider and return `null`, as the shell example above does. The service persists the value through the backend's ordinary `persistNotificationUpdate` / `persistOneOffNotificationUpdate`, so a backend needs no new method, only a column.
+
+### Prisma migration
+
+If you use `vintasend-prisma`, the column has to exist before a provider is configured. In the `Notification` model add `gitCommitSha String?` and `@@index([gitCommitSha])`, then run a migration:
+
+```bash
+prisma migrate dev --name add-notification-git-commit-sha
+```
+
+Do not add `gitCommitSha` to your create or resend payloads afterwards; it is provider-managed.
+
+</Ts>
+
+<Callout kind="note" title="Reading it back">
+<Sw py="git_commit_sha" ts="gitCommitSha" /> comes back on every notification the service returns, so <Sw py="get_notification" ts="getNotification" /> shows which revision last sent it. It is not part of the filter vocabulary in either library; a "which notifications went out under revision X" query is a backend-side concern for now.
+</Callout>

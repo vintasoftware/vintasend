@@ -1,0 +1,19 @@
+{
+  "name": "vintasend-site",
+  "private": true,
+  "type": "module",
+  "description": "Landing page and documentation for VintaSend (Python) and VintaSend TS, published to GitHub Pages.",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^4.3.0",
+    "astro": "^5.13.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

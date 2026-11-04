@@ -1,0 +1,268 @@
+---
+title: Attachments
+description: Attach files to a notification, store them through a pluggable attachment manager, and reuse a stored file by reference.
+section: Guides
+order: 20
+---
+
+An attachment is two things: the bytes, stored somewhere (a disk, an S3 bucket, a FHIR server), and a row describing that blob. The **attachment manager** owns the bytes. The **notification backend** owns the row. A backend never opens a file or calls a storage API; it persists a checksum-indexed file record plus a join row per notification, and hands an opaque identifier back to whichever manager you configured.
+
+The library ships the manager interface and its fakes. A real manager lives in its own package, the same way a backend or an adapter does.
+
+## Attaching a file
+
+Pass a list of attachments to <Sw py="create_notification" ts="createNotification" /> or <Sw py="create_one_off_notification" ts="createOneOffNotification" />. Each entry is either an upload (bytes the service has to store) or a reference to a file that is already stored.
+
+<Py>
+
+`NotificationAttachment` is the upload. `file` accepts a local path, a URL string, raw `bytes`, or any file-like object with `read()`. `content_type` is guessed from the filename when you leave it out, falling back to `application/octet-stream`.
+
+```python
+import io
+
+from vintasend.constants import NotificationTypes
+from vintasend.services.dataclasses import NotificationAttachment
+
+from_disk = NotificationAttachment(
+    filename="invoice.pdf",
+    file="/var/exports/invoice-1042.pdf",
+    content_type="application/pdf",  # optional, detected from the filename
+    description="Invoice for March",
+)
+
+from_bytes = NotificationAttachment(filename="report.txt", file=b"Report content")
+
+from_url = NotificationAttachment(
+    filename="logo.png",
+    file="https://cdn.example.com/logo.png",  # downloaded with requests at persist time
+    is_inline=True,
+)
+
+from_buffer = NotificationAttachment(filename="data.bin", file=io.BytesIO(b"..."))
+
+service.create_notification(
+    user_id=user.id,
+    notification_type=NotificationTypes.EMAIL,
+    title="Your invoice",
+    body_template="billing/invoice.html",
+    subject_template="billing/invoice_subject.txt",
+    context_name="invoice_context",
+    context_kwargs={"invoice_id": 1042},
+    attachments=[from_disk, from_bytes, from_url, from_buffer],
+)
+```
+
+URL input recognizes `http://`, `https://`, `s3://`, `gs://` and `azure://` prefixes as remote. HTTP(S) URLs are downloaded with `requests`, the library's only runtime HTTP dependency. A `file` value the manager cannot read raises `UnsupportedAttachmentFileTypeError`.
+
+</Py>
+
+<Ts>
+
+An upload is a `NotificationAttachmentUpload`: `file` accepts a `Buffer`, a Node `Readable`, a web `ReadableStream`, or a string holding a local file path. `contentType` is detected from the filename when omitted. There is no URL input in TypeScript; fetch the bytes yourself and pass the `Buffer` or the stream.
+
+```typescript
+import { createReadStream } from 'node:fs';
+
+await vintasend.createNotification({
+  userId: user.id,
+  notificationType: 'EMAIL',
+  title: 'Your invoice',
+  bodyTemplate: './templates/billing/invoice.html',
+  subjectTemplate: './templates/billing/invoice-subject.txt',
+  contextName: 'invoiceContext',
+  contextParameters: { invoiceId: 1042 },
+  sendAfter: null,
+  extraParams: null,
+  attachments: [
+    {
+      file: invoiceBuffer,
+      filename: 'invoice.pdf',
+      contentType: 'application/pdf', // optional, detected from the filename
+      description: 'Invoice for March',
+    },
+    {
+      file: createReadStream('/var/exports/annual-report.pdf'),
+      filename: 'annual-report.pdf',
+    },
+  ],
+});
+```
+
+A stream is read into memory before upload (`fileToBuffer` on the manager does the conversion), so streaming saves you a `readFile`, not the memory.
+
+</Ts>
+
+## Deduplication by checksum
+
+Before a manager uploads anything, the backend reads the bytes once, computes a sha256 digest, and asks itself whether a file record with that checksum already exists. On a hit the upload is skipped and the existing record is reused; on a miss the manager stores the bytes and the backend persists a new record. Either way a new join row is written for the notification.
+
+Two notifications that attach identical bytes therefore share one file record and one copy in storage. The filename can differ between them: the join row carries the description and, in Python, the inline flag, so what is shared is only the blob.
+
+<Py>
+
+The reference implementation checks size alongside the digest, so a sha256 collision degrades to a fresh upload instead of serving the wrong file.
+
+</Py>
+
+## Attaching an already-stored file by reference
+
+When you already hold a file id, attach it without uploading again. No bytes are read and no new record is created; only a join row pointing at the existing file is written.
+
+<Py>
+
+```python
+from vintasend.services.dataclasses import NotificationAttachmentReference
+
+first = service.create_notification(..., attachments=[NotificationAttachment(filename="guide.pdf", file=guide_bytes)])
+file_id = first.attachments[0].file_id
+
+second = service.create_notification(
+    ...,
+    attachments=[NotificationAttachmentReference(file_id=file_id, description="Getting started guide")],
+)
+second.attachments[0].file_id == file_id  # True: same file record, new join row
+```
+
+A reference to a `file_id` the backend does not know raises `AttachmentFileNotFoundError`. A reference with an empty `file_id` is rejected with `NotificationError` before anything is persisted. On a stored attachment, `id` is the join row's own id and `file_id` is the record it points at; deleting the join row drops one reference and leaves the file record in place.
+
+</Py>
+
+<Ts>
+
+A reference is an object with `fileId` instead of `file`. `isAttachmentReference` from `vintasend` tells the two shapes apart.
+
+```typescript
+const first = await vintasend.createNotification({
+  ...,
+  attachments: [{ file: guideBuffer, filename: 'guide.pdf' }],
+});
+const fileId = first.attachments?.[0].fileId;
+
+await vintasend.createNotification({
+  ...,
+  attachments: [{ fileId, description: 'Getting started guide' }],
+});
+```
+
+A `StoredAttachment` on a persisted notification carries `id` (the join row), `fileId` (the file record) and a `file` handle with `read()`, `stream()`, `url(expiresIn?)` and `delete()`. What `url()` returns is up to the manager: a presigned URL for S3, a local path for the development manager.
+
+</Ts>
+
+## Inline attachments for HTML email
+
+<Py>
+
+Set `is_inline=True` on an upload or a reference to mark it as an inline part, the way an HTML email embeds a logo and references it by content id. The flag lives on the join row, not on the file record: the same stored image can be an inline logo on one notification and a plain attachment on another. Whether an email adapter honours the flag is that adapter's business; the service only stores and passes it through.
+
+</Py>
+
+<Ts>
+
+The TypeScript attachment input has no inline flag. Every attachment is delivered as a regular attachment, and an adapter that needs to embed a part has to decide that from the content type or the description.
+
+</Ts>
+
+## Configuring a manager
+
+Leaving the manager unset turns the feature off: the backend never receives one and never accepts an attachment.
+
+<Py>
+
+Pass an instance or a dotted import string to the service, or set `NOTIFICATION_ATTACHMENT_MANAGER` and let the settings layer resolve it. The constructor argument wins over the setting.
+
+```python
+from vintasend_aws_s3_attachments import S3AttachmentManager
+
+service = NotificationService(
+    notification_adapters=[adapter],
+    notification_backend=backend,
+    attachment_manager=S3AttachmentManager(bucket="my-notification-attachments"),
+)
+```
+
+```bash
+NOTIFICATION_ATTACHMENT_MANAGER=vintasend_aws_s3_attachments.S3AttachmentManager
+```
+
+Once resolved, the service calls `backend.inject_attachment_manager(manager)`. The check is duck-typed: a backend written before the seam existed, with no such method, keeps constructing and running without attachment support. `AsyncIONotificationService` takes the same argument and expects an `AsyncIOBaseAttachmentManager`.
+
+For tests and local runs, `FakeAttachmentManager` (and `FakeAsyncIOAttachmentManager`) from `vintasend.services.attachment_managers.stubs.fake_attachment_manager` keeps files in memory.
+
+</Py>
+
+<Ts>
+
+Pass `attachmentManager` to the factory. The service injects it into the backend (and into every additional backend) when the backend exposes `injectAttachmentManager`.
+
+```typescript
+import { VintaSendFactory } from 'vintasend';
+import { S3AttachmentManager } from 'vintasend-aws-s3-attachments';
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [adapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+  attachmentManager: new S3AttachmentManager({ bucket: 'my-notification-attachments', region: 'us-east-1' }),
+});
+```
+
+For development, the core package ships `LocalFileAttachmentManager`. It is Node-only, so it has its own entry point and is left out of the main `vintasend` export so that entry still loads in a browser:
+
+```typescript
+import { LocalFileAttachmentManager } from 'vintasend/local-file-attachment-manager';
+
+const attachmentManager = new LocalFileAttachmentManager({ baseDirectory: './uploads/attachments' });
+```
+
+It writes each file plus a `.metadata.json` sidecar under `baseDirectory` (created on construction unless `createDirectoryIfNotExists: false`), and `url()` returns a filesystem path. Do not use it in production.
+
+</Ts>
+
+## Official managers
+
+<Py>
+
+- [`vintasend-aws-s3-attachments`](https://github.com/vintasoftware/vintasend-aws-s3-attachments): `S3AttachmentManager`, one object per file in a bucket, sync and AsyncIO, built on boto3.
+
+</Py>
+
+<Ts>
+
+- [`vintasend-aws-s3-attachments`](https://github.com/vintasoftware/vintasend-ts-aws-s3-attachments): `S3AttachmentManager` with presigned URLs and streaming; works with S3-compatible services such as MinIO or Cloudflare R2.
+- [`vintasend-medplum`](https://github.com/vintasoftware/vintasend-medplum): stores files as FHIR `Binary` and `Media` resources alongside the notifications, for healthcare applications on Medplum.
+
+</Ts>
+
+## What a backend has to implement
+
+The manager side is three methods: upload a file and return a file record, rebuild a file handle from the record's storage identifiers, and delete the bytes behind a set of identifiers. The base class adds concrete helpers for content-type detection, sha256 checksums and reading any accepted input into bytes.
+
+The backend side is the row store: persist a file record, look one up by id, find one by checksum (the deduplication lookup), delete one, list the orphaned ones that no join row references, list the stored attachments of a notification with their handles rebuilt through the manager, and delete a single join row.
+
+<Py>
+
+Those seven are `@abstractmethod`s on `BaseNotificationBackend` and `AsyncIOBaseNotificationBackend`; `inject_attachment_manager` is concrete. `FakeFileBackend` is the full reference implementation.
+
+</Py>
+
+<Ts>
+
+Those methods are optional on `BaseNotificationBackend`; a backend that omits them has no attachment support, and the `supportsAttachments` type guard tells you which case you are in before you call them.
+
+</Ts>
+
+Nothing deletes a stored file automatically. Cancelling a notification or deleting a join row has no storage side effect; the orphan query exists so your own periodic task can delete the bytes through the manager and then drop the record.
+
+<Callout kind="note" title="Full data model">
+<Py>
+
+[ATTACHMENTS.md](https://github.com/vintasoftware/vintasend/blob/main/ATTACHMENTS.md) in the Python repository documents `AttachmentFileRecord`, `StoredAttachment`, `StorageIdentifiers`, the AsyncIO differences and a runnable example built only on the fakes.
+
+</Py>
+<Ts>
+
+[ATTACHMENTS.md](https://github.com/vintasoftware/vintasend-ts/blob/main/ATTACHMENTS.md) in the TypeScript repository documents the Prisma schema for the two tables, the `AttachmentFile` handle, adapter-side `prepareAttachments`, and a custom manager walkthrough.
+
+</Ts>
+</Callout>

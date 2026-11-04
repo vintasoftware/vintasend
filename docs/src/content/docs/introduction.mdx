@@ -1,0 +1,117 @@
+---
+title: Introduction
+description: What VintaSend is, what it is not, and how its pieces fit together.
+section: Getting started
+order: 1
+---
+
+VintaSend is a library for **transactional notifications**: the welcome email, the password reset, the "your order shipped" SMS, the in-app badge. It exists in two languages that share one design: [`vintasend`](https://github.com/vintasoftware/vintasend) for Python and [`vintasend-ts`](https://github.com/vintasoftware/vintasend-ts) for TypeScript. Pick a language with the switch above and every example on these pages follows it.
+
+## The three rules
+
+Every feature in the library follows from three decisions.
+
+1. **Every notification is a record.** Creating a notification writes a row to a data store before anything is sent. That row carries the status (`PENDING_SEND`, `SENT`, `FAILED`, `READ`, `CANCELLED`), the timestamps, the template it should render, and the name of the function that will produce its data. Nothing is ever fire-and-forget, so a dashboard can list, filter, resend and cancel.
+
+2. **Context is generated at send time, not at creation time.** A notification does not store the data its template needs. It stores a *context name* that points at a registered generator, plus the arguments to call it with. The generator runs the moment the notification is sent, so a reminder scheduled for next week renders next week's data.
+
+3. **Storage, rendering and delivery are seams.** The library defines a *backend* (where notifications are persisted), a *template renderer* (how a body is produced from a template plus context) and an *adapter* (how a rendered notification is delivered). It ships none of them. You install an implementation package for each, or write your own against a small interface, and swap any of the three without touching the code that creates notifications.
+
+## What a send looks like
+
+<Py>
+
+```python
+from vintasend.services.notification_service import NotificationService, register_context
+from vintasend.constants import NotificationTypes
+
+service = NotificationService(
+    notification_adapters=[DjangoEmailAdapter(DjangoTemplateRenderer(), backend)],
+    notification_backend=backend,
+)
+
+@register_context("order_shipped")
+def order_shipped(order_id: int):
+    order = Order.objects.get(pk=order_id)
+    return {"first_name": order.user.first_name, "tracking_url": order.tracking_url}
+
+service.create_notification(
+    user_id=order.user_id,
+    notification_type=NotificationTypes.EMAIL,
+    title="Order shipped",
+    body_template="orders/shipped.html",
+    subject_template="orders/shipped_subject.txt",
+    context_name="order_shipped",
+    context_kwargs={"order_id": order.id},
+)
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+import { VintaSendFactory, type ContextGenerator } from 'vintasend';
+
+class OrderShippedContext implements ContextGenerator<{ orderId: number }> {
+  async generate({ orderId }: { orderId: number }) {
+    const order = await getOrder(orderId);
+    return { firstName: order.user.firstName, trackingUrl: order.trackingUrl };
+  }
+}
+
+export const contextGeneratorsMap = { orderShipped: new OrderShippedContext() } as const;
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [adapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+});
+
+await vintasend.createNotification({
+  userId: order.userId,
+  notificationType: 'EMAIL',
+  title: 'Order shipped',
+  bodyTemplate: './templates/orders/shipped.html',
+  subjectTemplate: './templates/orders/shipped-subject.txt',
+  contextName: 'orderShipped',
+  contextParameters: { orderId: order.id },
+  sendAfter: null,
+  extraParams: null,
+});
+```
+
+</Ts>
+
+With no <Sw py="send_after" ts="sendAfter" /> in the past, the service sends immediately: it calls the context generator, hands the context and the notification to the adapter, the adapter asks the renderer for a body, delivers it, and the service marks the record `SENT` (or `FAILED`). Set <Sw py="send_after" ts="sendAfter" /> to a future date and the record waits until a periodic call to <Sw py="send_pending_notifications" ts="sendPendingNotifications" /> picks it up.
+
+## What the library gives you on top
+
+Because every notification is a record, a set of features comes for free and is covered in the guides:
+
+- **Scheduling**, with <Sw py="send_pending_notifications" ts="sendPendingNotifications" /> as the cron-driven drain.
+- **Attachments**, stored by a pluggable attachment manager and deduplicated by checksum.
+- **One-off notifications** to an email address or phone number that has no user record.
+- **In-app notifications** with unread listing, counts and read marking.
+- **Filtering, ordering and pagination** across every notification, with a capability report describing what the configured backend supports.
+- **Background sending** through a queue service, so the HTTP request returns before delivery.
+- **Multiple backends** with inline or queued replication, for migrations and hot standbys.
+- **Template version pinning** and **managed templates** that live in a data store with a publishing lifecycle.
+- **Git commit SHA tracking**, so a notification records the revision that sent it.
+
+## Two languages, one contract
+
+The Python and TypeScript libraries are siblings rather than ports: the same seams, the same status values, the same filter vocabulary and capability keys, the same managed-template tag language, and the same OpenAPI contract for the notifications API and dashboard. A team running Django on one service and Node on another can run one dashboard against both.
+
+Names follow each language's conventions (`create_notification` in Python, `createNotification` in TypeScript), and a few details differ where the ecosystems do. The one to know up front: Python backends page from 1, TypeScript backends page from 0. The [filtering guide](/vintasend/docs/filtering/) covers how to read that from the backend instead of assuming it.
+
+## What VintaSend is not
+
+- **Not a mail server or an SMS gateway.** Delivery is an adapter's job, and adapters wrap services you already use: Django's mailer, FastAPI-Mail, Flask-Mail, Nodemailer, SendGrid, Mailgun, Twilio.
+- **Not a scheduler.** Scheduled notifications wait in the store until something calls <Sw py="send_pending_notifications" ts="sendPendingNotifications" />. Wire that into cron, Celery Beat, a worker, or whatever already runs periodic jobs in your application.
+- **Not an authorization layer.** <Sw py="user_id" ts="userId" /> and `tenant` are opaque identifiers the library stores and filters on. Deciding who may read whose notifications stays with your application.
+
+<Callout kind="tip" title="Where next">
+[Installation](/vintasend/docs/installation/) picks the implementation packages for your stack, and the [quick start](/vintasend/docs/quickstart/) sends a first notification end to end.
+</Callout>

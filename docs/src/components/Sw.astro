@@ -1,0 +1,8 @@
+---
+// Inline switch for a name that differs between the two libraries:
+//   <Sw py="create_notification" ts="createNotification" />
+// Renders both as <code>; the page's language picks which one shows.
+interface Props { py: string; ts: string }
+const { py, ts } = Astro.props;
+---
+<code data-only="py">{py}</code><code data-only="ts">{ts}</code>

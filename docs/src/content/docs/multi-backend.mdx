@@ -1,0 +1,247 @@
+---
+title: Multiple backends and replication
+description: Keep extra copies of every notification in additional backends, inline or through a queue, and watch and repair the drift between them.
+section: Guides
+order: 25
+---
+
+A service holds one **primary** backend plus zero or more **additional backends**: extra copies of the same data, kept in sync by replication. The use cases are a hot standby, a region-local read replica, and a bridge while migrating from one storage backend to another. With no additional backends configured, everything on this page is inert and the service behaves exactly like a single-backend deployment.
+
+## Configuring additional backends
+
+<Py>
+
+Pass extra backend instances, or dotted import strings, through `additional_backends`:
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=primary_backend,
+    additional_backends=[replica_backend, another_replica_backend],
+)
+```
+
+</Py>
+
+<Ts>
+
+Pass extra backend instances through `additionalBackends`:
+
+```typescript
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters,
+  backend: primaryBackend,
+  additionalBackends: [replicaBackend, anotherReplicaBackend],
+  logger,
+  contextGeneratorsMap,
+});
+```
+
+The logger and the attachment manager, when configured, are injected into every additional backend the same way they are into the primary.
+
+</Ts>
+
+### Backend identifiers
+
+Every configured backend gets a stable string identifier that reads and repair operations use to address it. A backend can declare its own by implementing <Sw py="get_backend_identifier()" ts="getBackendIdentifier()" />; otherwise the service assigns `backend-{n}`, where `n` is the backend's position: the primary is `backend-0`, the first additional backend `backend-1`, and so on. Declare an identifier (a region, a database alias) when routing must not shift if the list is reordered.
+
+<Py>
+
+`get_backend_identifier() -> str | None` is a concrete method on `BaseNotificationBackend` that returns `None` by default, so every existing backend gets the positional default for free. Two backends that resolve to the same identifier raise `DuplicateBackendIdentifierError` at construction.
+
+```python
+service.get_primary_backend_identifier()      # "backend-0", or the primary's own identifier
+service.get_all_backend_identifiers()          # every identifier, primary first
+service.get_additional_backend_identifiers()   # every identifier except the primary's
+service.has_backend("backend-1")               # True / False
+```
+
+</Py>
+
+<Ts>
+
+`getBackendIdentifier?(): string` is an optional method on the `BaseNotificationBackend` interface. Two backends that resolve to the same identifier make the factory throw `Error('Duplicate backend identifier: ...')`.
+
+</Ts>
+
+## Read routing
+
+Every read method takes an optional trailing <Sw py="backend_identifier" ts="backendIdentifier" />. Omitted, it reads the primary, which is identical to a single-backend service. There is no fan-out read that queries every backend and merges the result: a read always targets exactly one backend.
+
+<Py>
+
+```python
+service.get_notification(notification_id)                                   # primary
+service.get_notification(notification_id, backend_identifier="backend-1")   # a replica
+service.get_notification(notification_id, backend_identifier="nope")        # BackendNotFoundError
+```
+
+`filter_notifications`, `get_future_notifications`, `get_pending_notifications`, the in-app getters and `get_backend_supported_filter_capabilities` all take the same keyword.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.getNotification(notificationId);                           // primary
+await vintasend.getNotification(notificationId, false, 'replica-backend'); // a replica
+await vintasend.getNotification(notificationId, false, 'nope');            // throws Error('Backend not found: nope')
+```
+
+`filterNotifications`, `getFutureNotifications`, `getPendingNotifications`, `getInAppUnread` and `getBackendSupportedFilterCapabilities` take the identifier as their last argument too.
+
+</Ts>
+
+## Inline and queued replication
+
+With additional backends configured, every write (create, update, mark sent or failed, mark read, cancel, store context, and the rest) replicates to them after the primary write succeeds. <Sw py="replication_mode" ts="replicationMode" /> decides how:
+
+- **`"inline"`**, the default. Replication runs on the request path, right after the primary write returns. No extra infrastructure; the right choice unless the latency of writing to every backend matters.
+- **`"queued"`**. The write enqueues **one replication task per destination backend** and returns. A worker drains the queue and converges each replica. Pick this when you already run a worker and want replica writes off the request path, at the cost of replicas converging a little later.
+
+Queued mode needs a **replication queue service**, a one-method seam that receives the notification id and the target backend identifier.
+
+<Py>
+
+```python
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=primary_backend,
+    additional_backends=[replica_backend],
+    replication_mode="queued",
+    replication_queue_service=MyReplicationQueueService(),  # or an import string
+)
+```
+
+```bash
+export NOTIFICATION_REPLICATION_MODE="queued"
+export NOTIFICATION_REPLICATION_QUEUE_SERVICE="myapp.queue_services.MyReplicationQueueService"
+```
+
+`NOTIFICATION_REPLICATION_MODE` defaults to `"inline"`; any other value than `"inline"` or `"queued"` is rejected at construction. The queue service implements `BaseNotificationReplicationQueueService` (or `AsyncIOBaseNotificationReplicationQueueService`) with a single `enqueue_replication(notification_id, backend_identifier)` method. `register_replication_queue_service(...)` injects one after construction, the same way `register_queue_service` works for background sending.
+
+The worker drains the queue by calling `process_replication`:
+
+```python
+service.process_replication(notification_id, target_backend_identifier=backend_identifier)
+```
+
+This reads the authoritative record from the primary and converges the named replica to it. A notification that no longer resolves on the primary raises `ReplicationError`; an unknown identifier raises `BackendNotFoundError`. The worker needs a service of its own, built from the same `NOTIFICATION_SERVICE_FACTORY` that [background sending](/vintasend/docs/background-sending/) uses.
+
+</Py>
+
+<Ts>
+
+```typescript
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters,
+  backend: primaryBackend,
+  additionalBackends: [replicaA, replicaB],
+  logger,
+  contextGeneratorsMap,
+  replicationQueueService,
+  options: {
+    raiseErrorOnFailedSend: false,
+    replicationMode: 'queued',
+  },
+});
+```
+
+The queue service implements `BaseNotificationReplicationQueueService`:
+
+```typescript
+interface BaseNotificationReplicationQueueService<Config extends BaseNotificationTypeConfig> {
+  enqueueReplication(notificationId: Config['NotificationIdType'], backendIdentifier: string): Promise<void>;
+}
+```
+
+`registerReplicationQueueService(...)` injects one after construction. The worker drains the queue by calling `processReplication` with the target it was handed:
+
+```typescript
+await vintasend.processReplication(notificationId, backendIdentifier);
+```
+
+Called without a target, `processReplication(notificationId)` converges every additional backend. A notification that no longer resolves on the primary throws; so does an unknown target identifier. The result is `{ successes: string[], failures: { backend: string; error: string }[] }`, so one failing replica never hides the others.
+
+Backends may implement the optional `applyReplicationSnapshotIfNewer(snapshot)` to make replication safe to reorder: the snapshot is applied only when the destination's state is older, and a duplicate create raised by a racing task is retried as an update. `vintasend-prisma` and `vintasend-medplum` both implement it.
+
+</Ts>
+
+**A broken queue never drops a replication.** If queued mode is configured but no replication queue service is set, or the record's id cannot be resolved, the service logs a warning and replicates inline to every backend. If enqueueing for a single backend fails, only that backend is replicated inline; the ones already enqueued are left to the worker. Nothing on the replication path can fail the primary write, which has already committed.
+
+## Monitoring and repair
+
+Three operations give a dashboard what it needs to watch replication and fix drift, plus one for bulk migration.
+
+<Py>
+
+```python
+# Per-field, per-backend agreement for one notification. Read-only.
+report = service.verify_notification_sync(notification_id)
+report["in_sync"]                  # True only if every backend holds the record and agrees
+report["backends_with_record"]     # identifiers that hold the record
+report["backends_missing_record"]  # identifiers that do not
+report["fields"]                   # [{"field", "in_agreement", "differing_values"}, ...]
+
+# Per-backend health: total count, or the error if the backend is unreachable.
+stats = service.get_backend_sync_stats()
+stats["backend-1"]                 # {"total_notifications": 1234, "status": "healthy"}
+                                   # or {"total_notifications": 0, "status": "error", "error": "..."}
+
+# Converge one notification to every additional backend, or to a single named one.
+service.replicate_notification(notification_id)
+service.process_replication(notification_id, target_backend_identifier="backend-1")
+
+# Copy every notification from one backend to another, batch_size rows at a time.
+result = service.migrate_to_backend(
+    destination_backend_identifier="backend-2",
+    batch_size=500,
+    source_backend_identifier=None,  # the primary when omitted
+)
+result["migrated"]   # records confirmed present on the destination
+result["failures"]   # [{"notification_id": ..., "error": ...}] -- never aborts the batch
+```
+
+`verify_notification_sync` treats a backend that lacks the record as absent, not as an error. `get_backend_sync_stats` reports a backend that raises as `status="error"` instead of propagating. `migrate_to_backend` is copy-only (it never deletes from the source) and idempotent (a record already on the destination is converged, never duplicated); it raises `BackendNotFoundError` for an unknown source or destination and `BackendMigrationError` for a non-positive `batch_size` or a destination equal to the source. It assumes the source is quiescent while it pages through it.
+
+</Py>
+
+<Ts>
+
+```typescript
+// Per-backend existence plus a list of field-level discrepancies. Read-only.
+const report = await vintasend.verifyNotificationSync(notificationId);
+report.synced;          // true only if every backend holds the record and agrees
+report.backends;        // { [identifier]: { exists, notification?, error? } }
+report.discrepancies;   // ['Notification missing in backend: backend-1', 'Field mismatch in ...']
+
+// Per-backend health.
+const stats = await vintasend.getBackendSyncStats();
+stats.backends['backend-1']; // { totalNotifications: 1234, status: 'healthy' } or { ..., status: 'error', error }
+
+// Converge one notification to every additional backend, or to a single named one.
+await vintasend.replicateNotification(notificationId);
+await vintasend.processReplication(notificationId, 'backend-1');
+
+// Copy every notification from a source backend into a destination backend instance.
+await vintasend.migrateToBackend(destinationBackend, 500, sourceBackendIdentifier);
+```
+
+`replicateNotification` is `processReplication` with no target. `getBackendSyncStats` counts by loading every notification through `getAllNotifications`, so treat it as a diagnostic rather than a metric to poll every second. `migrateToBackend` takes a backend **instance** rather than an identifier, pages through the source (the primary when `sourceBackendIdentifier` is omitted) in batches of `batchSize` (default 5000), strips each record's `id`, and writes the batch through the destination's `bulkPersistNotifications`. It returns nothing and never deletes from the source.
+
+</Ts>
+
+## Failure semantics
+
+Multi-backend replication is **not** synchronous multi-master, and it makes no read-your-writes guarantee across backends. What it promises:
+
+- **The primary write commits first, and its failure is the caller's failure.** If the primary rejects a write, the error propagates exactly as it would on a single-backend service.
+- **Replica writes are best-effort.** A replica that rejects a write is logged, not raised. The primary write already succeeded and is never rolled back. The replica is reconciled by the next write to that record, or by <Sw py="process_replication" ts="processReplication" /> / <Sw py="verify_notification_sync" ts="verifyNotificationSync" /> run by you.
+- **No automatic failover.** A down primary is an error, full stop. The library never promotes a replica to primary; that is an operational decision for a human or an external tool.
+- **Reading right after writing can see a stale replica.** A read addressed to a replica immediately after a write may not reflect it yet, especially in queued mode. Read the primary (the default) when you need the current state.
+
+<Callout kind="warning" title="Single-backend services never replicate">
+<Sw py="replication_mode" ts="replicationMode" /> and the replication queue service are ignored until at least one additional backend is configured. Setting them on a single-backend service does nothing.
+</Callout>
