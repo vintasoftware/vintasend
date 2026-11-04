@@ -4,6 +4,7 @@
 Usage:
     python scripts/clone.py /path/to/vintasend-my-integration
     python scripts/clone.py /path/to/vintasend-my-integration --package-name vintasend-my-integration
+    python scripts/clone.py /path/to/vintasend-my-integration --description "My backend for VintaSend"
 
 Copies this directory to the target path, then renames the package everywhere it appears:
 
@@ -11,6 +12,10 @@ Copies this directory to the target path, then renames the package everywhere it
   kebab-case name)
 - the import package directory and every import of it (``vintasend_implementation_template`` ->
   your snake_case name)
+
+It also replaces the ``description`` in ``pyproject.toml``, which PyPI shows on the package page.
+Without ``--description`` it becomes a ``TODO:`` line, so the template's own description never
+ships by accident.
 
 It does NOT touch:
 
@@ -27,6 +32,7 @@ Dependency-free: stdlib only.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -40,6 +46,9 @@ SOURCE_IMPORT_PACKAGE = "vintasend_implementation_template"
 SKIP_DIR_NAMES = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".git"}
 
 _KEBAB_NAME_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*")
+
+# The top-level ``description = "..."`` line in pyproject.toml.
+_DESCRIPTION_LINE_RE = re.compile(r'^description = ".*"$', re.MULTILINE)
 
 
 def kebab_to_snake(name: str) -> str:
@@ -80,8 +89,23 @@ def _rewrite_files_in_place(root: Path, old: str, new: str) -> None:
         path.write_text(text.replace(old, new), encoding="utf-8")
 
 
-def clone(source: Path, target: Path, package_name: str) -> Path:
+def _set_description(pyproject: Path, description: str) -> None:
+    """Replace the ``description`` line in ``pyproject``."""
+    text = pyproject.read_text(encoding="utf-8")
+    # A JSON string is also a valid TOML basic string: same quotes, same escapes.
+    new_text, count = _DESCRIPTION_LINE_RE.subn(
+        lambda _match: f"description = {json.dumps(description, ensure_ascii=False)}", text
+    )
+    if count != 1:
+        raise ValueError(f"expected one description line in {pyproject}, found {count}")
+    pyproject.write_text(new_text, encoding="utf-8")
+
+
+def clone(source: Path, target: Path, package_name: str, description: str | None = None) -> Path:
     """Copy ``source`` to ``target`` and rename the package to ``package_name`` throughout.
+
+    ``description`` replaces the template's own in ``pyproject.toml``; without one it becomes a
+    ``TODO:`` line.
 
     Returns the path to the renamed import package directory inside ``target``.
     """
@@ -94,6 +118,7 @@ def clone(source: Path, target: Path, package_name: str) -> Path:
 
     _rewrite_files_in_place(target, SOURCE_DISTRIBUTION_NAME, package_name)
     _rewrite_files_in_place(target, SOURCE_IMPORT_PACKAGE, import_package)
+    _set_description(target / "pyproject.toml", description or f"TODO: describe {package_name}")
 
     old_package_dir = target / SOURCE_IMPORT_PACKAGE
     new_package_dir = target / import_package
@@ -122,6 +147,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--description",
+        default=None,
+        help=(
+            "One-line description for pyproject.toml, shown on PyPI. "
+            "Defaults to a 'TODO:' placeholder."
+        ),
+    )
+    parser.add_argument(
         "--source",
         type=Path,
         default=Path(__file__).resolve().parent.parent,
@@ -143,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         # Same clean "error: ..." + exit(2) behavior argparse gives for --package-name failures.
         parser.error(str(exc))
 
-    clone(args.source, args.target, package_name)
+    clone(args.source, args.target, package_name, args.description)
 
     import_package = kebab_to_snake(package_name)
     print(f"Created {args.target} as '{package_name}' (import package: {import_package}).")
@@ -155,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
     print("  poetry run mypy")
     print()
     print("Then work through README.md's per-component checklist, replacing each TODO.")
+    if not args.description:
+        print(
+            "The description in pyproject.toml is a TODO too -- PyPI shows it on the package page."
+        )
     print(
         "Class names still start with 'ImplementationTemplate' -- rename them yourself as you "
         "implement each component."
