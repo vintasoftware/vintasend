@@ -1037,6 +1037,7 @@ VintaSend has many backend, adapter, and template renderer implementations. If y
 
 * **[vintasend-fastapi-mail](https://github.com/vintasoftware/vintasend-fastapi-mail/)**: AsyncIO implementation that sends emails using FastAPI-Mail
 * **[vintasend-flask-mail](https://github.com/vintasoftware/vintasend-flask-mail/)**: Sync implementation that sends emails using Flask-Mail.
+* **[vintasend-twilio](https://github.com/vintasoftware/vintasend-twilio/)**: Sync and AsyncIO implementations that send SMS notifications using Twilio.
 * **[vintasend-celery](https://github.com/vintasoftware/vintasend-celery/)**: Adapter factory that allows sending emails asynchronously on sync backends by using Celery.
 * **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)**: Sync implementation that sends emails using Django's builtin email sender.
 

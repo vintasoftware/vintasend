@@ -340,6 +340,7 @@ linked here as a git submodule so one checkout holds every package that has to s
 | `vintasend-celery` | `implementations/vintasend-celery` | adapter factory for deferred sending on sync backends |
 | `vintasend-fastapi-mail` | `implementations/vintasend-fastapi-mail` | AsyncIO email adapter |
 | `vintasend-flask-mail` | `implementations/vintasend-flask-mail` | sync email adapter |
+| `vintasend-twilio` | `implementations/vintasend-twilio` | SMS adapter (Twilio, sync and AsyncIO) |
 | `vintasend-jinja` | `implementations/vintasend-jinja` | Jinja2 template renderer |
 | `vintasend-aws-s3-attachments` | `implementations/vintasend-aws-s3-attachments` | attachment manager (AWS S3 via boto3, sync and AsyncIO) |
 | `vintasend-managed-templates` | `implementations/vintasend-managed-templates` | database-backed template management: its own `BaseTemplateManagerBackend` seam plus renderers that wrap a real renderer |
@@ -388,7 +389,7 @@ own release cycle**. Rules that follow from that:
 When a change to this repo affects them:
 
 1. Work out which packages are affected. Backend seam changes hit `vintasend-django` and
-   `vintasend-sqlalchemy`; adapter changes hit the four adapter packages; renderer changes hit
+   `vintasend-sqlalchemy`; adapter changes hit the five adapter packages; renderer changes hit
    `vintasend-django`, `vintasend-jinja` and `vintasend-managed-templates`.
 2. State the impact in the PR body — which packages, and whether the change is source-compatible.
 3. If implementers must change code (a new `@abstractmethod`, or any rename / removal), each
