@@ -43,3 +43,6 @@
 [submodule "tools/vintasend-templates-management-dashboard"]
 	path = tools/vintasend-templates-management-dashboard
 	url = git@github.com:vintasoftware/vintasend-templates-management-dashboard.git
+[submodule "implementations/vintasend-twilio"]
+	path = implementations/vintasend-twilio
+	url = git@github.com:vintasoftware/vintasend-twilio.git
