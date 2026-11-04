@@ -1,0 +1,234 @@
+---
+title: Notification lifecycle
+description: The five statuses, what moves a record between them, scheduling and draining, failure, cancelling, updating and resending.
+section: Concepts
+order: 12
+---
+
+Every notification is a record with a status. The service moves it forward; nothing else does. This page follows one record from creation to its terminal state and names the method behind each transition.
+
+## The five statuses
+
+| Status | Meaning | Reached by |
+|---|---|---|
+| `PENDING_SEND` | Created and not yet delivered. Scheduled notifications sit here until due | <Sw py="create_notification" ts="createNotification" /> |
+| `SENT` | An adapter delivered it. The `sent_at` / `sentAt` timestamp is set | A successful <Sw py="send" ts="send" /> |
+| `FAILED` | An adapter raised during delivery | A failed <Sw py="send" ts="send" /> |
+| `READ` | An in-app notification the user has opened. `read_at` / `readAt` is set | <Sw py="mark_read" ts="markRead" /> |
+| `CANCELLED` | Withdrawn before it was sent | <Sw py="cancel_notification" ts="cancelNotification" /> |
+
+The transitions are strict. Only a `PENDING_SEND` record can become `SENT`, `FAILED` or `CANCELLED`; only a `SENT` record can become `READ`. `FAILED`, `READ` and `CANCELLED` are terminal: a failed notification is not retried in place but [resent](#resending) as a new record.
+
+## Create, then send
+
+<Sw py="create_notification" ts="createNotification" /> always writes the record first and returns it. Whether it also sends depends on <Sw py="send_after" ts="sendAfter" />:
+
+- Unset, or a time in the past: the service calls <Sw py="send" ts="send" /> on the new record before returning.
+- A time in the future: the record stays `PENDING_SEND` and the call returns at once.
+
+<Py>
+
+```python
+import datetime
+
+notification = service.create_notification(
+    user_id=user.id,
+    notification_type=NotificationTypes.EMAIL,
+    title="Trial ending",
+    body_template="billing/trial_ending.html",
+    subject_template="billing/trial_ending_subject.txt",
+    context_name="trial_ending",
+    context_kwargs={"user_id": user.id},
+    send_after=datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=7),
+)
+notification.status  # "PENDING_SEND"
+```
+
+`send_after` is compared against `datetime.now(tz=utc)`, so pass an aware datetime.
+
+</Py>
+
+<Ts>
+
+```typescript
+const notification = await vintasend.createNotification({
+  userId: user.id,
+  notificationType: 'EMAIL',
+  title: 'Trial ending',
+  bodyTemplate: './templates/billing/trial-ending.html',
+  subjectTemplate: './templates/billing/trial-ending-subject.txt',
+  contextName: 'trialEnding',
+  contextParameters: { userId: user.id },
+  sendAfter: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+  extraParams: null,
+});
+notification.status; // 'PENDING_SEND'
+```
+
+`sendAfter` is required in the input; pass `null` to send immediately.
+
+</Ts>
+
+## Draining scheduled notifications
+
+Nothing in the library runs on a timer. A scheduled record waits until something calls <Sw py="send_pending_notifications" ts="sendPendingNotifications" />, which asks the backend for every `PENDING_SEND` record whose <Sw py="send_after" ts="sendAfter" /> is unset or in the past and sends each one. Call it from whatever already runs periodic jobs for your application; once a minute is a common choice.
+
+<Py>
+
+`send_pending_notifications()` never raises. Each failure is logged against its notification id, and a summary of sent and failed counts is logged at the end. The sync service sends sequentially; `AsyncIONotificationService` sends with `asyncio.gather`.
+
+`vintasend.tasks.periodic_tasks.periodic_send_pending_notifications` is a ready-made entry point for workers. Without an argument it builds the service from the `NOTIFICATION_SERVICE_FACTORY` setting (resolved once per process and cached); with an explicit service it uses that.
+
+```python
+# Celery Beat
+from celery import Celery
+from vintasend.tasks.periodic_tasks import periodic_send_pending_notifications
+
+celery_app = Celery()
+send_pending = celery_app.task(periodic_send_pending_notifications)
+
+celery_app.conf.beat_schedule = {
+    "vintasend-send-pending": {"task": send_pending.name, "schedule": 60.0},
+}
+```
+
+```python
+# A management command, a cron entry, or any script
+service = build_notification_service()
+service.send_pending_notifications()
+```
+
+</Py>
+
+<Ts>
+
+`sendPendingNotifications()` sends every due record with `Promise.all`. An adapter failure marks that record `FAILED` and does not stop the others. With `raiseErrorOnFailedSend: true`, a record with no adapter for its type or a failing context generator rejects the whole call.
+
+There is no bundled scheduler. Call the method from a cron job, a worker loop, or a scheduled task runner:
+
+```typescript
+import cron from 'node-cron';
+
+cron.schedule('* * * * *', async () => {
+  await vintasend.sendPendingNotifications();
+});
+```
+
+The process that runs this needs the same `contextGeneratorsMap` and adapters as the one that created the notifications, since context is generated here.
+
+</Ts>
+
+## What happens on failure
+
+Inside <Sw py="send" ts="send" />, an adapter that throws moves the record to `FAILED`. The record keeps its template, context name and arguments, so it can be inspected and resent later.
+
+<Py>
+
+Error handling is governed by the `raise_on_failed_send` constructor flag.
+
+- `False` (the default): every failure is logged and the remaining adapters still run. `create_notification` returns normally; the stored record is `FAILED`, so re-read it rather than trusting the returned object's status.
+- `True`: the failure is raised to the caller as `NotificationSendError` (adapter failed), `NotificationContextGenerationError` (generator failed; the record is also marked `FAILED`), `NotificationQueueServiceMissingError` (background adapter with no queue service), `NotificationMarkFailedError` or `NotificationMarkSentError` (the backend could not record the outcome).
+
+Marking `FAILED` happens before raising, so the record reflects what happened either way. `delayed_send`, the worker half of background sending, follows the same rules, with one addition: `NotificationNotFoundError` propagates regardless of the flag, because an id that resolves to nothing is a wiring problem rather than a failed send. A worker that receives the same id twice skips a record that is already `SENT`, `READ` or `CANCELLED`.
+
+</Py>
+
+<Ts>
+
+Error handling is governed by the `raiseErrorOnFailedSend` option passed to the factory, `false` by default.
+
+- An adapter error is logged, the record is marked `FAILED`, and `send` moves on to the next adapter. This never throws, whatever the option: `FAILED` on the record is the signal.
+- A missing adapter for the notification's type and a failing context generator are logged and leave the record untouched with the option `false`; with `true` they throw. A background adapter with no queue service is logged and skipped either way.
+
+`delayedSend`, the worker half of background sending, marks `FAILED` when the adapter throws, and with the option `true` throws for a missing record or a missing background adapter.
+
+</Ts>
+
+## Cancelling
+
+<Sw py="cancel_notification" ts="cancelNotification" /> withdraws a `PENDING_SEND` record. It takes only the notification id and returns nothing.
+
+<Py>
+
+```python
+service.cancel_notification(notification.id)
+```
+
+Raises `NotificationCancelError` when the record is not pending: already sent, already cancelled, or missing. What "cancelled" looks like in storage is the backend's decision. The Django backend sets the status to `CANCELLED` and excludes such rows from later reads; the in-repo fake deletes the row. Cancelling never deletes attachment files.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.cancelNotification(notification.id);
+```
+
+The service delegates to the backend's `cancelNotification` and logs the outcome. Whether a non-pending record throws, and whether the row is marked `CANCELLED` or removed, is the backend's decision; check the backend package you use.
+
+</Ts>
+
+## Updating before it is sent
+
+A pending record can be edited. Both libraries refuse to change the fields that identify the record or that the service manages itself.
+
+<Py>
+
+```python
+service.update_notification(
+    notification.id,
+    send_after=new_date,
+    body_template="billing/trial_ending_v2.html",
+)
+```
+
+`update_notification(notification_id, pin_template_versions=None, **kwargs)` accepts `title`, `body_template`, `context_name`, `context_kwargs`, `send_after`, `subject_template`, `preheader_template`, `adapter_extra_parameters`, `attachments` and `requested_template_version`. After the write, if the record's `send_after` is now unset or in the past, the service sends it immediately, exactly as `create_notification` would.
+
+Three fields raise rather than change: `tenant` (`TenantReassignmentError`), `git_commit_sha` (`GitCommitShaReassignmentError`) and `used_template_version` (`UsedTemplateVersionReassignmentError`). The last two are written only by the service at send time. `user_id`, `notification_type` and `status` are not in the accepted keyword set at all.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.updateNotification(notification.id, {
+  sendAfter: newDate,
+  bodyTemplate: './templates/billing/trial-ending-v2.html',
+});
+```
+
+`updateNotification(notificationId, fields, options?)` takes a `Partial` of the notification minus `id` and `tenant`. Passing `tenant` or `usedTemplateVersion` throws; `gitCommitSha` is typed as `never`. The service persists the update and returns the record. It does **not** send: moving `sendAfter` into the past makes the record due, and the next `sendPendingNotifications` picks it up.
+
+</Ts>
+
+## Resending
+
+<Sw py="resend_notification" ts="resendNotification" /> is the operation behind a dashboard's "retry" button. It does not touch the source record. It clones the source into a new `PENDING_SEND` record with <Sw py="send_after" ts="sendAfter" /> unset, sends the clone, and returns it. The source keeps its id, status and timestamps, so a `FAILED` record stays `FAILED` and the history stays honest.
+
+Two kinds of record are refused: one-off notifications (they have no user record to clone from; recreate them instead) and notifications still scheduled in the future (cancel or update those instead).
+
+<Py>
+
+```python
+clone = service.resend_notification(notification.id)
+clone = service.resend_notification(notification.id, use_stored_context_if_available=True)
+```
+
+The refusals raise `NotificationResendError`. The clone copies the user, type, title, templates, context name and arguments, adapter parameters, tenant and attachments. With `use_stored_context_if_available=True` and a stored `context_used` on the source, the clone is sent with that context verbatim; otherwise context is generated again. Send failures follow `raise_on_failed_send` as above.
+
+</Py>
+
+<Ts>
+
+```typescript
+const clone = await vintasend.resendNotification(notification.id);
+const same = await vintasend.resendNotification(notification.id, true);
+```
+
+A refusal (not found, one-off, scheduled in the future, or `useStoredContextIfAvailable` with no stored context) is logged and the method returns `undefined`; with `raiseErrorOnFailedSend: true` it throws. The clone copies the user, type, title, templates, context name and parameters, `extraParams` and tenant. Its `contextUsed` is set at creation, from the source's stored context or from a fresh generation, and the send is started without being awaited, so the returned clone is still `PENDING_SEND` at the moment it is returned.
+
+</Ts>
+
+<Callout kind="note" title="In-app notifications and READ">
+`READ` only applies to notifications a user can open. <Sw py="mark_read" ts="markRead" /> moves a `SENT` record to `READ`; the backend refuses any other starting status. Listing, counting and bulk marking are covered in the [in-app notifications guide](/vintasend/docs/in-app-notifications/).
+</Callout>

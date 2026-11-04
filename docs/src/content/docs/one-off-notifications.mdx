@@ -1,0 +1,198 @@
+---
+title: One-off notifications
+description: Send to an email address or phone number that has no user record, with the recipient's name supplied inline.
+section: Guides
+order: 21
+---
+
+A regular notification is addressed to a <Sw py="user_id" ts="userId" />, and the adapter resolves the actual address from your user model when it sends. A one-off notification skips that step: it carries the email address or phone number itself, plus a first and last name, so you can write to a prospect, an invitee, or a vendor who has no account yet.
+
+Everything else is the same. A one-off notification is a record with a status, it renders its context at send time, it can be scheduled with <Sw py="send_after" ts="sendAfter" />, it can carry attachments, and it goes out through the same adapter as a regular notification of the same type.
+
+## Creating one
+
+Use <Sw py="create_one_off_notification" ts="createOneOffNotification" />. It persists the record and, when <Sw py="send_after" ts="sendAfter" /> is unset or in the past, sends it immediately.
+
+### Email
+
+<Py>
+
+```python
+import datetime
+
+from vintasend.constants import NotificationTypes
+from vintasend.services.dataclasses import NotificationAttachment
+
+service.create_one_off_notification(
+    email_or_phone="prospect@example.com",
+    first_name="Ada",
+    last_name="Lovelace",
+    notification_type=NotificationTypes.EMAIL,
+    title="Welcome",
+    body_template="welcome/email.html",
+    subject_template="welcome/subject.txt",
+    context_name="welcome_context",
+    context_kwargs={"plan": "trial"},
+    send_after=datetime.datetime.now(tz=datetime.timezone.utc),
+    attachments=[
+        NotificationAttachment(filename="welcome_guide.pdf", file="/srv/docs/welcome_guide.pdf"),
+    ],
+)
+```
+
+`send_after`, `subject_template`, `preheader_template`, `adapter_extra_parameters`, `attachments`, `tenant`, `requested_template_version` and `pin_template_versions` are optional and behave exactly as they do on `create_notification`. `AsyncIONotificationService.create_one_off_notification` is the same signature, awaited.
+
+</Py>
+
+<Ts>
+
+```typescript
+const notification = await vintasend.createOneOffNotification({
+  emailOrPhone: 'prospect@example.com',
+  firstName: 'Ada',
+  lastName: 'Lovelace',
+  notificationType: 'EMAIL',
+  title: 'Welcome',
+  bodyTemplate: './templates/welcome/email.html',
+  subjectTemplate: './templates/welcome/subject.txt',
+  contextName: 'welcomeContext',
+  contextParameters: { plan: 'trial' },
+  sendAfter: null, // send now
+  extraParams: null,
+  attachments: [{ file: welcomeGuideBuffer, filename: 'welcome-guide.pdf' }],
+});
+```
+
+The input is `OneOffNotificationInput`: the same shape as a regular notification with `emailOrPhone`, `firstName` and `lastName` in place of `userId`. `attachments`, `tenant` and `requestedTemplateVersion` are optional, and a second argument takes the same `{ pinTemplateVersions }` options as `createNotification`.
+
+</Ts>
+
+### SMS
+
+The phone number goes in the same field. An SMS adapter for the type has to be configured, and the subject is unused.
+
+<Py>
+
+```python
+service.create_one_off_notification(
+    email_or_phone="+15551234567",
+    first_name="Ada",
+    last_name="Lovelace",
+    notification_type=NotificationTypes.SMS,
+    title="Appointment reminder",
+    body_template="appointments/reminder_sms.txt",
+    context_name="appointment_reminder",
+    context_kwargs={"appointment_id": 88},
+)
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.createOneOffNotification({
+  emailOrPhone: '+15551234567',
+  firstName: 'Ada',
+  lastName: 'Lovelace',
+  notificationType: 'SMS',
+  title: 'Appointment reminder',
+  bodyTemplate: './templates/appointments/reminder-sms.txt',
+  subjectTemplate: null,
+  contextName: 'appointmentReminder',
+  contextParameters: { appointmentId: 88 },
+  sendAfter: null,
+  extraParams: null,
+});
+```
+
+</Ts>
+
+## Recipient validation
+
+<Sw py="email_or_phone" ts="emailOrPhone" /> is checked for shape when the notification is created, before anything is persisted. It must be either an email address (something, `@`, something, a dot, something) or a phone number of 10 to 15 digits with an optional leading `+`. Empty, whitespace-only and malformed values are rejected, so a recipient that can never be delivered to fails up front rather than at send time.
+
+The check is on format only. It does not verify that the mailbox or the number exists, and it does not normalize anything: `+1 (555) 123-4567` is rejected because of the spaces and punctuation, so strip them before you call.
+
+<Py>
+
+A rejected value raises `InvalidOneOffNotificationRecipientError` from `vintasend.exceptions`, a `NotificationError` subclass.
+
+</Py>
+
+<Ts>
+
+A rejected value throws a plain `Error` (`emailOrPhone cannot be empty` or `Invalid email or phone format`). The same check runs on `updateOneOffNotification` when `emailOrPhone` is part of the update.
+
+</Ts>
+
+## First and last name inline
+
+A regular notification pulls the recipient's name from your user model inside the context generator or the adapter. A one-off notification has no model to pull from, so <Sw py="first_name" ts="firstName" /> and <Sw py="last_name" ts="lastName" /> are required fields on the record itself. Your templates and adapters read them from the notification the same way they would read any other field.
+
+## How they are stored
+
+One-off notifications live in the same table as regular notifications. A row is one or the other by which identity column is set: a regular notification has <Sw py="user_id" ts="userId" /> and no address; a one-off notification has <Sw py="email_or_phone" ts="emailOrPhone" /> and a null <Sw py="user_id" ts="userId" />.
+
+<Py>
+
+The backend returns the two as distinct dataclasses, `Notification` and `OneOffNotification`, so `isinstance` tells them apart. Methods that can return either are typed `Notification | OneOffNotification`: `get_notification`, `mark_read` and `filter_notifications`.
+
+</Py>
+
+<Ts>
+
+The backend returns `DatabaseNotification` or `DatabaseOneOffNotification`; `isOneOffNotification` from `vintasend` is the type guard. Methods that can return either are typed `AnyDatabaseNotification`: `getNotification`, `getNotifications` and `filterNotifications`.
+
+</Ts>
+
+## What does not apply to them
+
+- **Resending.** <Sw py="resend_notification" ts="resendNotification" /> refuses a one-off notification. Create a new one instead.
+- **In-app listing.** The in-app methods are scoped by <Sw py="user_id" ts="userId" />, which a one-off notification does not have, so it never appears in an unread list or count.
+- **Address lookup.** The adapter does not consult your user model. Whatever is in <Sw py="email_or_phone" ts="emailOrPhone" /> is the destination.
+
+<Py>
+
+The resend refusal is a `NotificationResendError`, the same error `resend_notification` raises for a notification still scheduled in the future. It is a refusal, not a silent no-op.
+
+</Py>
+
+<Ts>
+
+`resendNotification` logs an error and returns `undefined` for a one-off notification; with the `raiseErrorOnFailedSend` option set on the factory it throws instead.
+
+</Ts>
+
+Scheduling does apply: a future <Sw py="send_after" ts="sendAfter" /> leaves the record `PENDING_SEND` and <Sw py="send_pending_notifications" ts="sendPendingNotifications" /> picks it up with everything else.
+
+## Listing them
+
+<Py>
+
+There is no dedicated one-off listing on the service. `filter_notifications` returns regular and one-off notifications together, under the same filter grammar, and `get_notification` fetches either by id. Filter on the fields they share (`status`, `notification_type`, `tenant`, the date ranges) and check the type of each result when you need to tell them apart.
+
+```python
+from vintasend.services.dataclasses import OneOffNotification
+
+page = service.filter_notifications({"notification_type": NotificationTypes.SMS}, page=1, page_size=20)
+one_offs = [n for n in page if isinstance(n, OneOffNotification)]
+```
+
+</Py>
+
+<Ts>
+
+`getOneOffNotifications(page, pageSize)` lists only one-off notifications, and `getOneOffNotification(id)` fetches one (returning `null` when the id is unknown or not a one-off). Both take an optional `backendIdentifier` to read from a non-primary backend. Pages are 0-indexed, like every other paginated method in the TypeScript library.
+
+```typescript
+const firstPage = await vintasend.getOneOffNotifications(0, 20);
+```
+
+`filterNotifications` also returns them, mixed with regular notifications; use `isOneOffNotification` on each result if you need to separate them. There is also `updateOneOffNotification(id, partial)`, which re-sends when the updated `sendAfter` is in the past, mirroring `updateNotification`.
+
+</Ts>
+
+<Callout kind="tip" title="Related">
+Attachments on a one-off notification work exactly as described in the [attachments guide](/vintasend/docs/attachments/). The filter grammar used to find them is in [filtering, ordering and pagination](/vintasend/docs/filtering/).
+</Callout>

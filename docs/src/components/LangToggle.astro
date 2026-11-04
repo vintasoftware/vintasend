@@ -1,0 +1,16 @@
+---
+// The Python / TypeScript switch. It sets `data-lang` on <html>; everything marked
+// `data-only="py"` or `data-only="ts"` shows or hides from that one attribute.
+interface Props { class?: string }
+const { class: className = "" } = Astro.props;
+---
+<div class={`lang-toggle keep ${className}`} role="group" aria-label="Language">
+  <button type="button" data-lang-pick="py" aria-pressed="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11.9 2c-5 0-4.7 2.2-4.7 2.2v2.3h4.8v.7H5.3S2 6.8 2 12c0 5.1 2.8 4.9 2.8 4.9h1.7v-2.4s-.1-2.8 2.8-2.8h4.7s2.7 0 2.7-2.6V4.6S17.2 2 11.9 2zM9.3 3.5a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8z"/><path fill="currentColor" opacity=".7" d="M12.1 22c5 0 4.7-2.2 4.7-2.2v-2.3H12v-.7h6.7S22 17.2 22 12c0-5.1-2.8-4.9-2.8-4.9h-1.7v2.4s.1 2.8-2.8 2.8H10s-2.7 0-2.7 2.6v4.5S6.8 22 12.1 22zm2.6-1.5a.9.9 0 1 1 0-1.8.9.9 0 0 1 0 1.8z"/></svg>
+    <span>Python</span>
+  </button>
+  <button type="button" data-lang-pick="ts" aria-pressed="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="4" fill="currentColor" opacity=".9"/><path fill="var(--bg)" d="M5.5 11.1h7v1.8h-2.5v7.6H8V12.9H5.5zm8.3 7.5c.5.7 1.3 1.1 2.4 1.1 1 0 1.5-.4 1.5-1 0-.8-.7-1-1.9-1.4-1.6-.5-2.9-1.2-2.9-3 0-1.7 1.4-2.8 3.3-2.8 1.5 0 2.5.5 3.2 1.5l-1.5 1c-.4-.6-.9-.9-1.7-.9-.8 0-1.3.4-1.3.9 0 .7.6.9 1.9 1.4 1.7.6 3 1.2 3 3.1 0 1.9-1.5 2.9-3.6 2.9-1.9 0-3.1-.7-3.8-1.9z"/></svg>
+    <span>TypeScript</span>
+  </button>
+</div>

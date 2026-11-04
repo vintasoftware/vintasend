@@ -1,0 +1,319 @@
+---
+title: Dashboard and APIs
+description: The notifications dashboard, the templates management dashboard, and the two HTTP APIs behind them, in both ecosystems.
+section: Ecosystem
+order: 31
+---
+
+<Callout kind="tip" title="Overview first?">
+The [dashboard page](/vintasend/dashboard/) is the short version of this guide: what the dashboard and its API do and how they fit together. This page is the setup reference.
+</Callout>
+
+Because every notification is a record, it can be listed, previewed, resent and cancelled from outside the application that created it. VintaSend ships that as two pieces separated by one HTTP contract: an **API** that wraps a configured service, and a **dashboard** that is a pure client of the API. The same split exists a second time for managed templates.
+
+```
+vintasend-dashboard  ──HTTPS + API key──▶  vintasend-api (Python)   ──▶  vintasend
+                                    or ──▶  vintasend-ts-api (TS)   ──▶  vintasend-ts
+```
+
+The API owns everything that needs credentials: the database, template rendering, the GitHub token used for previews. The dashboard owns presentation and user login. It holds no backend, no database credentials and no template renderer, and reads and writes everything over the contract. That is why one dashboard serves both ecosystems, and why a team running Django on one service and Node on another can run a single UI against both.
+
+## The notifications API
+
+`openapi.yaml` is the normative document. It ships byte-identical in [vintasend-api](https://github.com/vintasoftware/vintasend-api) (Python) and [vintasend-ts-api](https://github.com/vintasoftware/vintasend-ts-api) (TypeScript), so one generated client works against either server. Both expose the same routes: `/health`, `/api/v1/capabilities`, `/api/v1/notifications` with `pending`, `future` and `one-off` listings, one notification by id, its rendered `preview`, and `resend` and `cancel` actions. Every `/api/v1` request carries `Authorization: Bearer <key>`, and errors always use the envelope `{ "error": { "code", "message", "details"? } }`.
+
+The API does not assume what the backend can do. It reads the service's filter capability report (<Sw py="get_backend_supported_filter_capabilities" ts="getBackendSupportedFilterCapabilities" />) and republishes it at `/api/v1/capabilities`, so the dashboard greys out a filter the backend cannot evaluate instead of sending it. String lookups and ordering are negotiated the same way: an unsupported ordering is dropped rather than failing the request. One key is kept private: `pagination.oneIndexed` tells the API whether the backend pages from 1 (Python) or 0 (TypeScript), the API converts, and the wire is unconditionally 1-indexed.
+
+<Py>
+
+`vintasend-api` is a Django app plus django-ninja, chosen because the reference backend (`vintasend-django`) needs a Django app registry to read from. A FastAPI application storing notifications through `vintasend-sqlalchemy` is served by the same API: the service factory is the only thing it calls.
+
+**Mount it in a Django project** by installing the app and including its URLs under a prefix:
+
+```bash
+pip install vintasend-api
+```
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    # ...
+    "vintasend_api.dashboard",
+]
+
+NOTIFICATION_SERVICE_FACTORY = "myproject.notifications.create_notification_service"
+VINTASEND_API_KEY = "..."  # or VINTASEND_API_AUTHENTICATOR
+```
+
+```python
+# urls.py
+from django.urls import include, path
+
+urlpatterns = [
+    path("notifications-api/", include("vintasend_api.dashboard.urls")),
+]
+```
+
+That serves `/notifications-api/health` and `/notifications-api/api/v1/`. The app has no models and no migrations. Include its URLconf once per project.
+
+The factory is a callable returning a configured service; it is called once per process and reused:
+
+```python
+# myproject/notifications.py
+from vintasend.services.notification_service import NotificationService
+
+
+def create_notification_service():
+    return NotificationService(
+        notification_adapters=[adapter],
+        notification_backend=backend,
+    )
+```
+
+**Run it on its own** with the bundled Django project and a WSGI server of your choice:
+
+```bash
+pip install vintasend-api gunicorn
+
+export DJANGO_SETTINGS_MODULE=vintasend_api.settings
+export NOTIFICATION_SERVICE_FACTORY=vintasend_config.create_notification_service
+export VINTASEND_API_KEY=...
+
+python -m django check
+gunicorn vintasend_api.wsgi:application --bind 0.0.0.0:3333
+```
+
+`python -m django check` fails on a missing key (`vintasend_api.E001`) or factory (`vintasend_api.E002`), so a bad deployment stops before the first request.
+
+Settings and environment variables it reads:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `NOTIFICATION_SERVICE_FACTORY` | yes | Dotted path to the callable building your service. |
+| `VINTASEND_API_KEY` | unless an authenticator is set | Shared secret clients send as a bearer token. |
+| `VINTASEND_API_AUTHENTICATOR` | no | Dotted path to a `(request) -> None` callable that authenticates callers in place of the key. Raise `ApiError.unauthorized(...)` or `ApiError.forbidden(...)` to refuse. |
+| `VINTASEND_BACKEND_IDENTIFIER` | no | Read from a non-primary backend registered in the service. |
+| `VINTASEND_UNHANDLED_ERROR_HANDLER` | no | Dotted path to a `(exc, request, request_id)` callable receiving every unexpected error. |
+| `VINTASEND_API_CORS_ORIGINS` | no | Browser origins allowed to call the API. Only needed when a browser calls it directly. |
+| `GITHUB_REPO`, `GITHUB_API_KEY` | preview only | Repository holding the templates and a read token, read only when `/preview` is called. |
+| `GITHUB_API_BASE_URL`, `GITHUB_TEMPLATES_BASE_PATH` | no | GitHub API root and a prefix added to template paths. |
+| `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_DB_*` | no | Standard Django knobs for the standalone project. |
+
+</Py>
+
+<Ts>
+
+`vintasend-api` is a Hono application, so `createApp` returns something any runtime with a `fetch`-style handler can serve.
+
+**Mount it in your own server:**
+
+```bash
+npm install vintasend-api vintasend
+```
+
+```typescript
+// app/api/v1/[...path]/route.ts — a Next.js app router route handler
+import {
+  ApiError,
+  asNotificationServicePort,
+  createApp,
+  createGitHubTemplateClientFromEnv,
+} from 'vintasend-api';
+import { notificationService } from '@/lib/notifications';
+import { getSession } from '@/lib/auth';
+
+const app = createApp({
+  getService: async () => asNotificationServicePort(notificationService),
+  authenticate: async (c) => {
+    const user = await getSession(c.req.raw);
+    if (!user) throw ApiError.unauthorized('Sign in first.');
+    if (!user.canManageNotifications) throw ApiError.forbidden('Not allowed.');
+    return {};
+  },
+  getTemplateClient: () => createGitHubTemplateClientFromEnv(),
+  onUnhandledError: (error, _c, { requestId }) => errorTracker.capture(error, { requestId }),
+});
+
+const handler = (request: Request) => app.fetch(request);
+export { handler as GET, handler as POST };
+```
+
+`getService` returns the service your application already sends with, wrapped by `asNotificationServicePort`. `authenticate` runs before every `/api/v1` route and replaces the shared key; throw `ApiError.unauthorized` or `ApiError.forbidden` to refuse. Behind Express, serve `app.fetch` through `getRequestListener` from `@hono/node-server` on a `server.all(...)` route.
+
+**Run it on its own** with the `vintasend-api` command, which needs `@hono/node-server` installed and a module that default-exports a factory returning a configured service:
+
+```bash
+VINTASEND_API_KEY=... VINTASEND_SERVICE_MODULE=./vintasend.config.js npx vintasend-api
+```
+
+Environment variables it reads:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `VINTASEND_API_KEY` | yes | Shared secret clients send as a bearer token. |
+| `VINTASEND_SERVICE_MODULE` | no | Module that builds the service. Default `./dist/vintasend.config.js`. |
+| `VINTASEND_BACKEND_IDENTIFIER` | no | Read from a non-primary backend registered in the service. |
+| `VINTASEND_API_CORS_ORIGINS` | no | Comma-separated browser origins allowed to call the API. |
+| `PORT`, `HOST` | no | Listen address. Defaults `3333` and `0.0.0.0`. |
+| `GITHUB_REPO`, `GITHUB_API_KEY` | preview only | Repository holding the templates and a read token, read only for `/preview`. |
+| `GITHUB_API_BASE_URL`, `GITHUB_TEMPLATES_BASE_PATH` | no | GitHub API root and a prefix added to template paths. |
+
+</Ts>
+
+## The notifications dashboard
+
+[vintasend-dashboard](https://github.com/vintasoftware/vintasend-dashboard) is a Next.js application for browsing, filtering, previewing, resending and cancelling notifications, with Clerk or Auth0 login selected by environment variable. It is the same application whichever API is behind it.
+
+The API key is a server-side secret, so the browser never calls the API directly. The client points at `/api/vintasend`, a route inside the dashboard that checks the visitor's session and re-signs the call with `VINTASEND_API_KEY`. That route is the only place the key exists.
+
+```bash
+npm install
+cp .env.example .env.local
+npm run dev        # http://localhost:3000
+```
+
+| Variable | Meaning |
+|---|---|
+| `VINTASEND_API_URL` | Base URL of the API, for example `http://localhost:3333`. |
+| `VINTASEND_API_KEY` | The key the API was started with. Server-side only. |
+| `AUTH_PROVIDER` | `clerk` or `auth0`. |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY` | Clerk credentials. |
+| `AUTH0_SECRET`, `APP_BASE_URL`, `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | Auth0 v4 credentials; auth routes mount at `/auth/*`. |
+
+Everything that is not UI lives in [vintasend-dashboard-core](https://github.com/vintasoftware/vintasend-dashboard-core): the typed client generated from `openapi.yaml`, TanStack Query hooks over it, and notification filters that live in the URL so a filtered view survives a reload. The dashboard repository is meant to be read as an example. To build the same screens inside your own admin app with your own design system, install the core and keep the proxy route:
+
+```bash
+npm install vintasend-dashboard-core @tanstack/react-query
+```
+
+```typescript
+import { useFilteredNotifications } from 'vintasend-dashboard-core';
+import { useNextRouterAdapter } from 'vintasend-dashboard-core/next';
+
+const { notifications, filters, setFilters, page, setPage, setSort, hasNextPage } =
+  useFilteredNotifications({ router: useNextRouterAdapter() });
+```
+
+`createVintaSendClient({ baseUrl: '/api/vintasend' })` points the hooks at your proxy; `getHeaders` or `apiKey` are for a server-side client or an API fronted by your own session.
+
+## The templates management API
+
+The templates side repeats the split for managed templates. [vintasend-templates-management-api](https://github.com/vintasoftware/vintasend-templates-management-api) (Python) and [vintasend-ts-templates-management-api](https://github.com/vintasoftware/vintasend-ts-templates-management-api) (TypeScript) expose a configured `ManagedTemplateService` over HTTP with the same conventions as the notifications API: bearer-token auth, the `{ data }` / `{ error }` envelope, 1-indexed pages, camelCase on the wire, and a byte-identical `openapi.yaml`.
+
+The routes cover template versions (`GET`/`POST /api/v1/templates`, `/templates/{key}/versions`), the lifecycle (`activate`, `deactivate`, `archive`, `status`, `status-history`), `composition` (what the engine actually receives, inheritance resolved), `preview` against a context you supply, and `/api/v1/tags`. Two conventions to know: `GET /templates` lists one row per key by default (`mostRecentActiveVersion=true`), and only a never-published version can be deleted; a published one answers 409 `CONFLICT`.
+
+Capabilities are negotiated here too, with a twist. The `fields.*`, `stringLookups.*` and `logical.*` namespaces default to supported and an unsupported filter is dropped, while `orderBy.*` defaults to not supported and an unsupported ordering is a 400. A UI reads `/api/v1/capabilities` and only makes a column sortable when the backend has declared it.
+
+<Py>
+
+```bash
+pip install vintasend-templates-management-api
+```
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    # ...
+    "vintasend_templates_management_api.templates_manager.apps.TemplatesManagerConfig",
+]
+
+MANAGED_TEMPLATE_SERVICE_FACTORY = "myproject.templates.create_managed_template_service"
+VINTASEND_API_KEY = "..."  # or VINTASEND_API_AUTHENTICATOR
+```
+
+```python
+# urls.py
+urlpatterns = [
+    path("templates-api/", include("vintasend_templates_management_api.templates_manager.urls")),
+]
+```
+
+The URL namespace is `vintasend_templates_management_api`, so a project can mount it beside `vintasend-api` without collision, and `VINTASEND_API_AUTHENTICATOR` has the same name and shape in both packages so one function can guard both.
+
+Standalone:
+
+```bash
+pip install vintasend-templates-management-api gunicorn
+export DJANGO_SETTINGS_MODULE=vintasend_templates_management_api.settings
+django-admin check
+gunicorn vintasend_templates_management_api.wsgi:application --bind 0.0.0.0:3334
+```
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `MANAGED_TEMPLATE_SERVICE_FACTORY` | yes | Dotted path to the callable building your `ManagedTemplateService`. |
+| `VINTASEND_API_KEY` | unless an authenticator is set | Shared secret clients send as a bearer token. |
+| `VINTASEND_API_AUTHENTICATOR` | no | `(request) -> None`, replacing the shared-key check. |
+| `MANAGED_TEMPLATE_BACKEND_NAME` | no | Backend name every new template is stored under, overriding the create body. |
+| `MANAGED_TEMPLATE_ACTOR_RESOLVER` | no | `(request) -> str \| None`, recorded as `changedBy` on status changes in place of the body. |
+| `MANAGED_TEMPLATE_UNHANDLED_ERROR_HANDLER` | no | `(exc, request, request_id) -> None` for unexpected errors. |
+| `VINTASEND_API_CORS_ORIGINS` | no | Browser origins allowed to call the API. |
+
+</Py>
+
+<Ts>
+
+```bash
+npm install vintasend-templates-management-api vintasend vintasend-managed-templates
+```
+
+```typescript
+// app/api/v1/[...path]/route.ts
+import { ApiError, createApp } from 'vintasend-templates-management-api';
+
+const app = createApp({
+  authenticate: async (c) => {
+    const user = await mySession(c);
+    if (!user) throw ApiError.unauthorized('Sign in to manage templates.');
+    if (!user.canEditTemplates) throw ApiError.forbidden('You cannot manage templates.');
+    return { actor: user.email }; // recorded as changedBy on every status change
+  },
+  getService: async () => myConfiguredService,
+  templateManagedBackend: 'medplum',
+  corsOrigins: ['https://admin.example'],
+  onUnhandledError: (error, c, { requestId }) => errorTracker.capture(error, { requestId }),
+});
+
+const handler = (request: Request) => app.fetch(request);
+export { handler as GET, handler as POST, handler as PUT, handler as PATCH, handler as DELETE };
+```
+
+`templateManagedBackend` stores every new template under that backend name whatever the create body says. Standalone, with `@hono/node-server` installed:
+
+```bash
+MANAGED_TEMPLATE_API_KEY=... MANAGED_TEMPLATE_SERVICE_MODULE=./templates.config.js \
+  npx vintasend-templates-management-api
+```
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `MANAGED_TEMPLATE_API_KEY` | yes | Shared secret clients send as a bearer token. |
+| `MANAGED_TEMPLATE_SERVICE_MODULE` | no | Module default-exporting a function that returns the `ManagedTemplateService`. Default `./dist/vintasend-templates.config.js`. |
+| `MANAGED_TEMPLATE_API_CORS_ORIGINS` | no | Comma-separated browser origins. Leave empty for server-side clients only. |
+| `PORT`, `HOST` | no | Defaults `3334` and `0.0.0.0`. |
+
+</Ts>
+
+## The templates management dashboard
+
+[vintasend-templates-management-dashboard](https://github.com/vintasoftware/vintasend-templates-management-dashboard) is the write-side sibling of the notifications dashboard: create templates, create versions (there is no edit; a new version is the edit, and omitted fields carry forward), move versions through the lifecycle using only the transitions each version reports in `allowedTransitions`, preview against a typed context, and manage tags. The detail panel splits **Source** (what someone typed) from **Composition** (the flat string the engine receives).
+
+It follows the same proxy pattern, at `/api/templates`, and the same Clerk or Auth0 login:
+
+```bash
+npm install
+cp .env.example .env.local
+npm run dev
+```
+
+| Variable | Meaning |
+|---|---|
+| `TEMPLATES_API_URL` | Base URL of the templates API, for example `http://localhost:3334`. |
+| `TEMPLATES_API_KEY` | The key the API was started with. Server-side only. |
+| `AUTH_PROVIDER` and the Clerk or Auth0 variables | Same as the notifications dashboard. |
+
+Its data layer is [vintasend-templates-management-dashboard-core](https://github.com/vintasoftware/vintasend-templates-management-dashboard-core), installed with `npm install vintasend-templates-management-dashboard-core @tanstack/react-query`. `createTemplatesClient({ baseUrl: '/api/templates' })` and `TemplatesProvider` set it up, and `useFilteredTemplates` exposes `sortableFields` and `canSortBy` so a header only becomes clickable once the backend has declared the field.
+
+<Callout kind="note" title="Which API do I run?">
+Run the API of the language your application is written in: it has to import your service. The dashboards do not care which one answers. A deployment with both a Python and a TypeScript service runs two APIs and one dashboard per contract, pointed at whichever API holds the records it should show.
+</Callout>

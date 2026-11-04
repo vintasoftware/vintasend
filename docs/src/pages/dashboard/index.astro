@@ -1,0 +1,336 @@
+---
+import { Code } from "astro:components";
+import Base from "../../layouts/Base.astro";
+import LangToggle from "../../components/LangToggle.astro";
+import { withBase } from "../../lib/urls";
+
+const links = [
+  { href: "#how", label: "How it fits" },
+  { href: "#features", label: "What it does" },
+  { href: "#api", label: "The API" },
+  { href: "#core", label: "Your own UI" },
+  { href: "#setup", label: "Setup" },
+];
+
+const pyMount = `# settings.py
+INSTALLED_APPS = [
+    # ...
+    "vintasend_api.dashboard",
+]
+NOTIFICATION_SERVICE_FACTORY = "myproject.notifications.create_notification_service"
+VINTASEND_API_KEY = os.environ["VINTASEND_API_KEY"]   # or VINTASEND_API_AUTHENTICATOR
+
+# urls.py
+urlpatterns = [
+    # ...
+    path("notifications-api/", include("vintasend_api.dashboard.urls")),
+]`;
+
+const tsMount = `// app/api/notifications/[...path]/route.ts  (Next.js), or any fetch-shaped server
+import { createApp } from 'vintasend-api';
+import { vintasend } from '@/notifications';   // the service you already built
+
+const api = createApp({
+  service: vintasend,
+  authenticate: async (request) => { /* your own check of who is calling */ },
+});
+
+export const GET = (request: Request) => api.fetch(request);
+export const POST = (request: Request) => api.fetch(request);
+
+// or, on its own, behind one shared key:
+//   VINTASEND_API_KEY=… vintasend-api            # port 3333`;
+
+const coreHook = `'use client';
+import { useFilteredNotifications, getApiErrorCode } from 'vintasend-dashboard-core';
+import { useNextRouterAdapter } from 'vintasend-dashboard-core/next';
+
+export function Inbox() {
+  const {
+    notifications, isLoading, error,          // the list, from the generated client
+    filters, setFilter, clearFilters,         // state that lives in the URL
+    page, hasNextPage, nextPage, setSort,     // 1-indexed on the wire
+  } = useFilteredNotifications({ router: useNextRouterAdapter() });
+
+  // …render with your own components
+}`;
+
+const theme = "github-dark-default";
+---
+<Base
+  title="VintaSend Dashboard — Browse, preview, resend and cancel notifications"
+  description="A Next.js dashboard and a REST API that expose a VintaSend service over HTTP. One OpenAPI contract, served by the Python or the TypeScript library, with the API key kept server-side."
+  links={links}
+  current="dashboard"
+>
+
+<!-- ============ HERO ============ -->
+<section class="hero">
+  <div class="hero-bg"><div class="glow"></div><div class="grid"></div></div>
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow reveal"><i class="dot"></i> Tools · notifications dashboard and API</span>
+      <h1 class="reveal d1">See every notification. <span class="grad">Resend the ones that failed.</span></h1>
+      <p class="lede reveal d2">Every notification is a row, so a dashboard is a query away. The VintaSend dashboard lists, filters, previews, resends and cancels notifications through one HTTP contract, served by <span data-only="py">the Python API on Django</span><span data-only="ts">the TypeScript API on Hono</span>. It holds no database credentials and never sees the API key in the browser.</p>
+      <div class="cta-row reveal d3" style="margin-bottom:14px"><LangToggle class="big" /></div>
+      <div class="cta-row reveal d3">
+        <a class="btn btn-primary" href={withBase("/docs/tools/")}>Setup guide</a>
+        <a class="btn" href="https://github.com/vintasoftware/vintasend-dashboard">vintasend-dashboard ↗</a>
+        <a class="btn" data-only="py" href="https://github.com/vintasoftware/vintasend-api">vintasend-api ↗</a>
+        <a class="btn" data-only="ts" href="https://github.com/vintasoftware/vintasend-ts-api">vintasend-ts-api ↗</a>
+      </div>
+      <div class="vendors reveal d4">
+        <span class="lbl">Built on</span>
+        <span class="v">Next.js</span><span class="v">TanStack Query</span><span class="v">OpenAPI</span><span class="v" data-only="py">Django + django-ninja</span><span class="v" data-only="ts">Hono</span><span class="v">Clerk / Auth0</span>
+      </div>
+    </div>
+    <div class="panel shot reveal d2">
+      <div class="app-top"><span>VintaSend</span><span class="tab on">Notifications</span><span class="tab">Templates</span><span class="right">acme-prod <i class="avatar"></i></span></div>
+      <div class="app-filters">
+        <span class="fchip">status = FAILED ×</span><span class="fchip">type = EMAIL ×</span><span class="fchip">sentAt ≥ 24h ×</span><span class="fchip ghost">+ tenant</span><span class="fchip ghost">+ template</span>
+        <span class="right">sort sentAt ↓</span>
+      </div>
+      <table>
+        <thead><tr><th>id</th><th>kind</th><th>template</th><th>recipient</th><th>status</th><th>sent</th></tr></thead>
+        <tbody>
+          <tr class="sel"><td class="mono">8f3c…a21</td><td class="dim">user</td><td class="mono">invoice_ready</td><td class="dim">user 4821</td><td><span class="st failed">FAILED</span></td><td class="dim">09:00</td></tr>
+          <tr><td class="mono">21d0…7be</td><td class="dim">one-off</td><td class="mono">appointment_sms</td><td class="dim">+1 555 …</td><td><span class="st failed">FAILED</span></td><td class="dim">08:41</td></tr>
+          <tr><td class="mono">c04e…f90</td><td class="dim">user</td><td class="mono">password_reset</td><td class="dim">user 917</td><td><span class="st sent">SENT</span></td><td class="dim">08:12</td></tr>
+          <tr><td class="mono">77ab…310</td><td class="dim">user</td><td class="mono">weekly_digest</td><td class="dim">user 4821</td><td><span class="st pending">PENDING</span></td><td class="dim">—</td></tr>
+          <tr><td class="mono">e1c2…9d4</td><td class="dim">user</td><td class="mono">welcome</td><td class="dim">user 5102</td><td><span class="st read">READ</span></td><td class="dim">yesterday</td></tr>
+        </tbody>
+      </table>
+      <div class="app-foot">
+        <span>8f3c…a21 · rendered at <span class="mono">c1f9e4</span> · template v3</span>
+        <span class="act">Preview</span><span class="act pri">Resend</span><span class="act">Cancel</span>
+        <span class="right">page 1 · hasMore</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ HOW IT FITS ============ -->
+<section class="section" id="how">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">How it fits</p>
+      <h2>A UI, an API, and your service. The key stays on the server.</h2>
+      <p>The dashboard is a pure client of the API. Everything that needs credentials, from database access to rendering a template at the commit that sent it, lives behind the API, next to the VintaSend service you already built to send notifications.</p>
+    </div>
+    <div class="panel flow reveal">
+      <svg viewBox="0 0 1000 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The browser talks to the dashboard's own proxy route, which adds the API key and calls the VintaSend API, which calls your notification service">
+        <defs><linearGradient id="edgeGrad" x1="0" x2="1"><stop offset="0" style="stop-color:var(--accent)"/><stop offset="1" style="stop-color:var(--accent-2)"/></linearGradient></defs>
+        <path class="edge anim" d="M250 110 L300 110"/>
+        <path class="edge anim" d="M540 110 L590 110"/>
+        <path class="edge anim" d="M800 110 L840 110"/>
+        <rect class="box" x="30" y="60" width="220" height="100" rx="14"/>
+        <text class="t" x="52" y="92">Browser</text>
+        <text class="s" x="52" y="114">vintasend-dashboard</text>
+        <text class="a" x="52" y="134">components + dashboard-core</text>
+        <text class="a" x="52" y="150">signed in with Clerk or Auth0</text>
+        <rect class="box" x="300" y="60" width="240" height="100" rx="14"/>
+        <text class="t" x="322" y="92">Proxy route</text>
+        <text class="s" x="322" y="114">/api/vintasend, server side</text>
+        <text class="a" x="322" y="134">checks the session</text>
+        <text class="a" x="322" y="150">adds the API key: the only place it exists</text>
+        <rect class="box hi" x="590" y="60" width="210" height="100" rx="14"/>
+        <text class="t" x="612" y="92">VintaSend API</text>
+        <text class="s" x="612" y="114" data-only="py">Django + django-ninja</text>
+        <text class="s" x="612" y="114" data-only="ts">Hono · createApp()</text>
+        <text class="a" x="612" y="134">openapi.yaml is the contract</text>
+        <text class="a" x="612" y="150">same bytes in both languages</text>
+        <rect class="box" x="840" y="60" width="140" height="100" rx="14"/>
+        <text class="t" x="860" y="92">Your service</text>
+        <text class="s" x="860" y="114">backend</text>
+        <text class="s" x="860" y="132">adapters</text>
+        <text class="s" x="860" y="150">renderer</text>
+        <text class="lbl" x="30" y="205">HTTPS + session</text>
+        <text class="lbl" x="300" y="205">HTTPS + Authorization: Bearer $VINTASEND_API_KEY</text>
+        <text class="lbl" x="590" y="205">in process</text>
+      </svg>
+    </div>
+    <div class="cards" style="margin-top:18px">
+      <div class="card reveal"><h3>One contract, two servers</h3><p>The Python and TypeScript APIs ship the same <code>openapi.yaml</code> byte for byte, so the dashboard is built once and does not know which library is behind it.</p></div>
+      <div class="card reveal d1"><h3>Nothing secret in the browser</h3><p>The UI calls its own route, which checks the visitor's session and re-signs the request with the bearer key. Set a CORS origin only if you put per-user auth in front of the API first.</p></div>
+      <div class="card reveal d2"><h3>Capabilities, not assumptions</h3><p>The UI reads the backend's capability report and greys out filters and sort fields it cannot honour, including which page number is the first.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ FEATURES ============ -->
+<section class="section" id="features">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">What it does</p>
+      <h2>The operations a support engineer actually needs.</h2>
+      <p>Read-mostly by design. The two writes it offers, resend and cancel, are the two things you cannot do from a mail provider's log.</p>
+    </div>
+    <div class="cards">
+      <div class="card reveal"><h3>Browse and filter</h3><p>Status, type, template, context name, tenant, date ranges and template versions, with ordering by any sortable field. Filters live in the URL, so a view is shareable and survives a reload.</p></div>
+      <div class="card reveal d1"><h3>Users and one-offs together</h3><p>Every row carries a <code>kind</code> of <code>user</code> or <code>one-off</code>, so notifications sent to an email address with no account sit in the same list, discriminated rather than sniffed.</p></div>
+      <div class="card reveal d2"><h3>Inspect the record</h3><p>One notification with its stored context, the context it was created with, the adapter that delivered it, the git commit that sent it and the template version that rendered.</p></div>
+      <div class="card reveal"><h3>Preview what went out</h3><p>Templates rendered at the notification's commit, fetched from the repository, or at the managed template version it used. A notification with no commit reports <code>PREVIEW_UNAVAILABLE</code> rather than a guess.</p></div>
+      <div class="card reveal d1"><h3>Resend</h3><p>Clones the notification and sends now, leaving the original untouched. Reuse the exact context it rendered with, or regenerate it through the context registry.</p></div>
+      <div class="card reveal d2"><h3>Cancel</h3><p>Stops a pending notification before its send time arrives. Everything already sent stays as the audit trail.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ THE API ============ -->
+<section class="section" id="api">
+  <div class="wrap">
+    <div class="split">
+      <div class="reveal">
+        <p class="kicker">The API</p>
+        <h2>Mount it in the app that already has your service.</h2>
+        <p data-only="py">The Python API is a Django app, <code class="mono">vintasend_api.dashboard</code>, built with django-ninja. Install it, include its URLs under a prefix, and point <code class="mono">NOTIFICATION_SERVICE_FACTORY</code> at the callable that builds your service. A FastAPI project storing notifications through SQLAlchemy is served the same way: the factory decides, the HTTP layer neither knows nor cares.</p>
+        <p data-only="ts">The TypeScript API is a Hono app returned by <code class="mono">createApp</code>. It takes a standard <code class="mono">Request</code> and returns a <code class="mono">Response</code>, so it mounts in a Next.js route handler, TanStack Start, behind Express, or anywhere that speaks <code class="mono">fetch</code>. Hand it the service you already built and your own check of who is calling.</p>
+        <ul class="checks">
+          <li><b>Or run it alone.</b> <span data-only="py">The package ships a project that runs the API by itself, behind one shared key.</span><span data-only="ts">The <code class="mono">vintasend-api</code> command runs a server configured from environment variables, behind one shared key, on port 3333.</span></li>
+          <li><b>Bring your own authentication.</b> <span data-only="py">Set <code class="mono">VINTASEND_API_AUTHENTICATOR</code> to a callable and the key is not checked.</span><span data-only="ts">Pass an <code class="mono">authenticate</code> function to <code class="mono">createApp</code> and the key is not checked.</span></li>
+          <li><b>Conventions a client can rely on.</b> Pages are 1-indexed on the wire, <code class="mono">hasMore</code> instead of a total count, ISO-8601 UTC timestamps, and one error envelope with a machine-readable <code class="mono">code</code>.</li>
+          <li><b>Read a replica.</b> <span data-only="py"><code class="mono">VINTASEND_BACKEND_IDENTIFIER</code> points the API at a non-primary backend</span><span data-only="ts">A backend identifier points the API at a non-primary backend</span> of a multi-backend service.</li>
+        </ul>
+        <div class="cta-row" style="margin-top:22px">
+          <a class="btn" data-only="py" href="https://pypi.org/project/vintasend-api/">pip install vintasend-api</a>
+          <a class="btn" data-only="ts" href="https://www.npmjs.com/package/vintasend-api">npm install vintasend-api</a>
+          <a class="btn" href={withBase("/docs/tools/")}>Settings reference</a>
+        </div>
+      </div>
+      <div class="panel hero-code reveal d1">
+        <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title" data-only="py">settings.py · urls.py</span><span class="title" data-only="ts">route.ts</span></div>
+        <div data-only="py"><Code code={pyMount} lang="python" theme={theme} /></div>
+        <div data-only="ts"><Code code={tsMount} lang="typescript" theme={theme} /></div>
+      </div>
+    </div>
+
+    <div class="panel reveal" style="margin-top:56px">
+      <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">openapi.yaml · /api/v1</span></div>
+      <div class="endpoints">
+        <div class="ep"><span class="m">GET</span><span class="p">/health<span>liveness probe, unauthenticated</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/capabilities<span>filter and order capabilities of the configured backend</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/notifications<span>list with filters, ordering and pagination</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/notifications/pending<span>awaiting send</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/notifications/future<span>scheduled for later</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/notifications/one-off<span>sent to an address or number, not a user</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/notifications/&#123;id&#125;<span>one notification, context payloads included</span></span></div>
+        <div class="ep"><span class="m">GET</span><span class="p">/api/v1/notifications/&#123;id&#125;/preview<span>templates rendered at the notification's commit</span></span></div>
+        <div class="ep"><span class="m post">POST</span><span class="p">/api/v1/notifications/&#123;id&#125;/resend<span>clone and send now</span></span></div>
+        <div class="ep"><span class="m post">POST</span><span class="p">/api/v1/notifications/&#123;id&#125;/cancel<span>stop a pending one</span></span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ YOUR OWN UI ============ -->
+<section class="section" id="core">
+  <div class="wrap split rev">
+    <div class="panel hero-code reveal d1">
+      <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">inbox.tsx</span></div>
+      <Code code={coreHook} lang="tsx" theme={theme} />
+    </div>
+    <div class="reveal">
+      <p class="kicker">Your own UI</p>
+      <h2>The dashboard is an example. The data layer is a package.</h2>
+      <p>Everything that is not a component comes from <code class="mono">vintasend-dashboard-core</code>: a typed client generated from the contract, TanStack Query hooks over it, and filter state that lives in the URL. Want the same screens inside your admin app, in your design system, with your login? Install the core and replace the components, not the data layer.</p>
+      <ul class="checks">
+        <li><b>Typed from the contract.</b> <code class="mono">openapi-typescript</code> and <code class="mono">openapi-fetch</code>, so a field the API renames fails at compile time.</li>
+        <li><b>Filters in the URL.</b> Illegal values are dropped or clamped, a changed filter resets to page 1, and the back button steps through views.</li>
+        <li><b>Router adapters.</b> Next.js app router, plain <code class="mono">window.history</code>, or two members of your own for react-router and friends.</li>
+        <li><b>Three ways to hold the key.</b> Through your own proxy route, with your app's session token, or server-side only.</li>
+      </ul>
+      <div class="cta-row" style="margin-top:22px">
+        <a class="btn" href="https://github.com/vintasoftware/vintasend-dashboard-core">vintasend-dashboard-core ↗</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ SETUP ============ -->
+<section class="section" id="setup">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">Setup</p>
+      <h2>Three steps from a service to a screen.</h2>
+    </div>
+    <div class="steps">
+      <div class="step reveal">
+        <div class="num">STEP 01</div>
+        <h3>Run the API next to your service</h3>
+        <p data-only="py">Install the Django app, include its URLs, and point the factory setting at your service. Or run the bundled project on its own.</p>
+        <p data-only="ts">Mount <code class="mono">createApp</code> in your server with the service you already built, or run the standalone command behind one key.</p>
+        <pre data-only="py"><span class="p">$</span> pip install vintasend-api</pre>
+        <pre data-only="ts"><span class="p">$</span> npm install vintasend-api vintasend</pre>
+      </div>
+      <div class="step reveal d1">
+        <div class="num">STEP 02</div>
+        <h3>Point the dashboard at it</h3>
+        <p>Two variables, read on the dashboard's server side only. The key is the same one the API was started with.</p>
+        <pre>VINTASEND_API_URL=http://localhost:3333
+VINTASEND_API_KEY=…</pre>
+      </div>
+      <div class="step reveal d2">
+        <div class="num">STEP 03</div>
+        <h3>Pick a login and start it</h3>
+        <p>Set <code class="mono">AUTH_PROVIDER</code> to <code class="mono">clerk</code> or <code class="mono">auth0</code> with that provider's keys. Route protection and the sign-in flow follow from it.</p>
+        <pre><span class="p">$</span> npm run dev   <span class="dim"># http://localhost:3000</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ TEMPLATES TEASER ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="teaser reveal">
+      <div>
+        <p class="kicker">The sibling for templates</p>
+        <h2>The same split, for the templates themselves.</h2>
+        <p class="muted">Where this dashboard is read-mostly, the templates management dashboard is a write tool: create templates, version them, move them through draft, active, inactive and archived, tag them and preview what they render to. Same architecture, same server-side key, its own API and its own core package.</p>
+        <div class="cta-row" style="margin-top:22px">
+          <a class="btn btn-primary" href={withBase("/managed-templates/")}>Managed templates →</a>
+          <a class="btn" href="https://github.com/vintasoftware/vintasend-templates-management-dashboard">vintasend-templates-management-dashboard</a>
+        </div>
+      </div>
+      <div class="panel shot">
+        <div class="app-top"><span>VintaSend</span><span class="tab">Notifications</span><span class="tab on">Templates</span><span class="right"><i class="avatar"></i></span></div>
+        <table>
+          <thead><tr><th>key</th><th>version</th><th>status</th><th>tags</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">welcome</td><td class="mono">v4</td><td><span class="st draft">draft</span></td><td class="dim">onboarding</td></tr>
+            <tr class="sel"><td class="mono">welcome</td><td class="mono">v3</td><td><span class="st active">active</span></td><td class="dim">onboarding</td></tr>
+            <tr><td class="mono">base-email</td><td class="mono">v2</td><td><span class="st active">active</span></td><td class="dim">layout</td></tr>
+            <tr><td class="mono">invoice-ready</td><td class="mono">v7</td><td><span class="st active">active</span></td><td class="dim">billing</td></tr>
+          </tbody>
+        </table>
+        <div class="app-foot"><span class="act">New version</span><span class="act">Preview</span><span class="act pri">Activate v4</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ BIG CTA ============ -->
+<section class="section tight">
+  <div class="wrap">
+    <div class="big-cta reveal">
+      <h2>Already sending with VintaSend? The dashboard is an afternoon.</h2>
+      <p>The API mounts next to the service you have. The dashboard clones, takes two environment variables and a login provider, and runs.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href={withBase("/docs/tools/")}>Read the setup guide</a>
+        <a class="btn" href="https://github.com/vintasoftware/vintasend-dashboard">GitHub</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</Base>

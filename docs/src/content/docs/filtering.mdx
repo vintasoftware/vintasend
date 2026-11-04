@@ -1,0 +1,409 @@
+---
+title: Filtering, ordering and pagination
+description: The composable filter grammar, the order_by shape, page numbering in each language, and the capability report a backend publishes.
+section: Guides
+order: 23
+---
+
+The in-app methods answer one question: what does this user see. <Sw py="filter_notifications" ts="filterNotifications" /> answers every other one. It is the query behind a monitoring dashboard: search across every user, every type and every status, page through the results in a chosen order, and find out from the backend which parts of that it can actually do.
+
+The filter is a plain object that round-trips through JSON, so an HTTP layer can accept one from a request body and hand it to the service unchanged. The same vocabulary, and the same capability keys, exist in both libraries, which is what lets one dashboard sit in front of a Python backend and a TypeScript one.
+
+## The filter grammar
+
+A filter is either a set of **field filters**, combined with an implicit AND, or a **group**: `and`, `or`, or `not` around further filters. Groups nest without limit.
+
+### Field equality and membership
+
+A scalar value means equality; a list means membership.
+
+<Py>
+
+Field names are snake_case. Build the dict from the `TypedDict`s in `vintasend.services.notification_backends.filters` and `mypy` checks the shape.
+
+```python
+from vintasend.constants import NotificationStatus
+
+# tenant == "acme" AND status == SENT
+service.filter_notifications(
+    {"tenant": "acme", "status": NotificationStatus.SENT.value}, page=1, page_size=10
+)
+
+# tenant in ("acme", "beta")
+service.filter_notifications({"tenant": ["acme", "beta"]}, page=1, page_size=10)
+```
+
+The membership fields are `status`, `notification_type`, `adapter_used`, `tenant`, `requested_template_version` and `used_template_version`. `user_id` takes a single value.
+
+</Py>
+
+<Ts>
+
+Field names are camelCase. The type is `NotificationFilter` (a `NotificationFilterFields` leaf or a group), exported from `vintasend`.
+
+```typescript
+// tenant == 'acme' AND status == 'SENT'
+await vintasend.filterNotifications({ tenant: 'acme', status: 'SENT' }, 0, 10);
+
+// tenant in ('acme', 'beta')
+await vintasend.filterNotifications({ tenant: ['acme', 'beta'] }, 0, 10);
+```
+
+The membership fields are `status`, `notificationType`, `adapterUsed`, `tenant`, `requestedTemplateVersion` and `usedTemplateVersion`. `userId` takes a single value.
+
+</Ts>
+
+### String lookups
+
+<Sw py="body_template" ts="bodyTemplate" />, <Sw py="subject_template" ts="subjectTemplate" /> and <Sw py="context_name" ts="contextName" /> accept either a bare string, which is a case-sensitive exact match, or a lookup object with `lookup`, `value` and an optional case-sensitivity flag that defaults to case-sensitive.
+
+<Py>
+
+Lookups are `"exact"`, `"starts_with"`, `"ends_with"` and `"includes"`; the flag is `case_sensitive`.
+
+```python
+service.filter_notifications(
+    {"body_template": {"lookup": "starts_with", "value": "WELCOME", "case_sensitive": False}},
+    page=1,
+    page_size=10,
+)
+```
+
+</Py>
+
+<Ts>
+
+Lookups are `'exact'`, `'startsWith'`, `'endsWith'` and `'includes'`; the flag is `caseSensitive`.
+
+```typescript
+await vintasend.filterNotifications(
+  { bodyTemplate: { lookup: 'startsWith', value: 'WELCOME', caseSensitive: false } },
+  0,
+  10,
+);
+```
+
+</Ts>
+
+### Date ranges
+
+<Sw py="send_after_range" ts="sendAfterRange" />, <Sw py="created_at_range" ts="createdAtRange" />, <Sw py="sent_at_range" ts="sentAtRange" /> and <Sw py="read_at_range" ts="readAtRange" /> take an object with `from` and `to`, either of which can be omitted for an open-ended range. **Both bounds are inclusive**: `from` is "greater than or equal", `to` is "less than or equal". A client computing "today" as midnight to midnight will double-count boundary rows if it assumes an exclusive upper bound.
+
+<Py>
+
+```python
+import datetime
+
+now = datetime.datetime.now(tz=datetime.timezone.utc)
+service.filter_notifications(
+    {"sent_at_range": {"from": now - datetime.timedelta(days=1), "to": now}},
+    page=1,
+    page_size=10,
+)
+```
+
+The key is spelled `from` even though it is a Python keyword; `DateRange` is declared with the functional `TypedDict` syntax for exactly that reason, so the wire shape matches TypeScript.
+
+</Py>
+
+<Ts>
+
+```typescript
+const now = new Date();
+await vintasend.filterNotifications(
+  { sentAtRange: { from: new Date(now.getTime() - 24 * 60 * 60 * 1000), to: now } },
+  0,
+  10,
+);
+```
+
+`readAtRange` is newer than the other three and support for it is opt-in per backend; check `fields.readAtRange` in the capability report before sending it.
+
+</Ts>
+
+### Template version fields
+
+<Sw py="requested_template_version" ts="requestedTemplateVersion" /> is the version a notification was pinned to; <Sw py="used_template_version" ts="usedTemplateVersion" /> is the version it actually rendered. Both are integer membership fields: a scalar or a list.
+
+<Py>
+
+The candidates must be real `int`s. `"3"` is a malformed filter, not a request for version 3, and one bad candidate rejects the whole leaf (it matches nothing, and therefore everything under `not`).
+
+```python
+service.filter_notifications({"requested_template_version": 3}, page=1, page_size=10)
+service.filter_notifications({"used_template_version": [1, 2]}, page=1, page_size=10)
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.filterNotifications({ requestedTemplateVersion: 3 }, 0, 10);
+await vintasend.filterNotifications({ usedTemplateVersion: [1, 2] }, 0, 10);
+```
+
+Both fields are opt-in per backend, with capability keys that default to `false`.
+
+</Ts>
+
+Both are null on a notification whose renderer does not version templates, and the used version is null until the notification has been sent. The NULL rule below applies, so there is no positive way to ask for "the unpinned ones".
+
+### `and`, `or` and `not` groups
+
+Each group takes the same filter shape, so a group can hold field filters or further groups.
+
+<Py>
+
+```python
+# Everything except acme's notifications and every reminder email
+service.filter_notifications(
+    {"not": {"or": [{"tenant": "acme"}, {"body_template": "reminder_email"}]}},
+    page=1,
+    page_size=10,
+)
+
+# acme's sent welcome emails
+service.filter_notifications(
+    {
+        "and": [
+            {"tenant": "acme"},
+            {"status": NotificationStatus.SENT.value},
+            {"body_template": {"lookup": "includes", "value": "welcome"}},
+        ]
+    },
+    page=1,
+    page_size=10,
+)
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+// Everything except acme's notifications and every reminder email
+await vintasend.filterNotifications(
+  { not: { or: [{ tenant: 'acme' }, { bodyTemplate: 'reminder_email' }] } },
+  0,
+  10,
+);
+
+// acme's sent welcome emails
+await vintasend.filterNotifications(
+  {
+    and: [
+      { tenant: 'acme' },
+      { status: 'SENT' },
+      { bodyTemplate: { lookup: 'includes', value: 'welcome' } },
+    ],
+  },
+  0,
+  10,
+);
+```
+
+</Ts>
+
+### NULL semantics under negation
+
+A positive filter on a field whose stored value is null never matches: membership on null is false, a string lookup on null is false, a date range on null is false. Negation is applied by the `not` wrapper around that positive result, so a null row **is included** under negation. A `not` around `tenant: "acme"` returns rows whose tenant is anything but acme, plus rows with no tenant at all. A `not` around <Sw py="read_at_range" ts="readAtRange" /> returns every notification that was never read.
+
+Every backend implements this the same way, including the SQL ones, so a filter means the same thing wherever it runs.
+
+### The empty filter
+
+An empty filter matches every notification, not none of them. There is no separate "list everything" method: <Sw py="filter_notifications" ts="filterNotifications" /> with an empty filter object is the unrestricted listing.
+
+## Ordering
+
+<Sw py="order_by" ts="orderBy" /> selects one primary field and a direction. The fields are <Sw py="send_after" ts="sendAfter" />, <Sw py="sent_at" ts="sentAt" />, <Sw py="read_at" ts="readAt" />, <Sw py="created_at" ts="createdAt" /> and <Sw py="updated_at" ts="updatedAt" />; the direction is `asc` or `desc`.
+
+<Py>
+
+```python
+service.filter_notifications(
+    {}, page=1, page_size=10, order_by={"field": "sent_at", "direction": "desc"}
+)
+```
+
+Leaving `order_by` out sorts by `created_at` descending. `created_at` maps to the notification's `created` column and `updated_at` to `modified`; the filter API's names do not have to match column names one to one.
+
+Every backend appends `id` as a tiebreaker in the same direction as the primary field. Without it, offset pagination over rows that share a timestamp would silently drop or duplicate rows across pages; with it, each row comes back exactly once.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.filterNotifications({}, 0, 10, { field: 'sentAt', direction: 'desc' });
+```
+
+The shape is `NotificationOrderBy`, exported from `vintasend`. When `orderBy` is omitted the backend applies its own default order. Stable paging over rows that share a timestamp depends on the backend breaking ties on `id` in the same direction as the primary field; a backend you write should, or offset pagination will drop or repeat rows across pages.
+
+</Ts>
+
+## Pagination
+
+The listing takes a page number and a page size and returns one page. There is no enforced maximum page size; a caller that asks for ten thousand rows loads ten thousand rows, so an endpoint exposing this to clients should cap it.
+
+**The two libraries number pages differently.** Python backends are 1-indexed: `page=1` is the first page. TypeScript backends are 0-indexed: page `0` is the first page. Getting this wrong raises nothing; you serve the wrong page, or an empty first one. The convention covers every paginated method in each library, not only the filter.
+
+Anything that translates between its own page numbers and a backend's (an HTTP API, an exporter, a sync job) should read `pagination.oneIndexed` from the capability report instead of assuming a base:
+
+<Py>
+
+```python
+caps = service.get_backend_supported_filter_capabilities()
+backend_page = page if caps["pagination.oneIndexed"] else page - 1
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+const caps = await vintasend.getBackendSupportedFilterCapabilities();
+const firstPage = caps['pagination.oneIndexed'] === true ? 1 : 0;
+```
+
+</Ts>
+
+### Counting
+
+<Py>
+
+`filter_notifications` returns an `Iterable`, so it cannot be `len()`-ed. `count_notifications` takes the same filter and returns the total ignoring pagination, which is what a `count` / `next` / `previous` envelope needs:
+
+```python
+page_1 = service.filter_notifications({"tenant": "acme"}, page=1, page_size=20)
+total = service.count_notifications({"tenant": "acme"})
+```
+
+</Py>
+
+<Ts>
+
+There is no count method on the TypeScript service or backend interface. `filterNotifications` returns an array, so a page's length is known, but the total across pages is not. A dashboard that needs one has to request pages until a short page comes back, or run its own count against the backend's store.
+
+</Ts>
+
+Every query method takes an optional backend identifier to read from a non-primary backend; an unknown identifier is an error, not a fallback to the primary.
+
+## Capability introspection
+
+A backend does not have to support every field, lookup, group and sort field. <Sw py="get_backend_supported_filter_capabilities" ts="getBackendSupportedFilterCapabilities" /> returns a flat map of dotted keys to booleans that a dashboard can use to grey out the controls the configured backend cannot handle.
+
+<Py>
+
+```python
+caps = service.get_backend_supported_filter_capabilities()
+caps["fields.tenant"]
+caps["stringLookups.startsWith"]
+caps["orderBy.sentAt"]
+caps["logical.or"]
+caps["negation.sentAtRange"]
+caps["pagination.oneIndexed"]
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+const caps = await vintasend.getBackendSupportedFilterCapabilities();
+caps['fields.tenant'];
+caps['stringLookups.startsWith'];
+caps['orderBy.sentAt'];
+caps['logical.or'];
+caps['negation.sentAtRange'];
+caps['pagination.oneIndexed'];
+```
+
+</Ts>
+
+| Namespace | Reports |
+| --- | --- |
+| `fields.*` | Whether a filter field can be used at all |
+| `stringLookups.*` | Which string lookups, and which case sensitivities, are available |
+| `logical.*` | Whether `and` / `or` / `not` groups can be assembled; `logical.notNested` is the separate question of whether `not` may wrap a group rather than a single field filter |
+| `negation.*` | Whether a date range specifically can be negated (a negated range has to include null rows, which not every query builder expresses) |
+| `orderBy.*` | Which sort fields are available |
+| `pagination.*` | The backend's page numbering convention |
+
+Capability keys are camelCase and dotted in **both** libraries, even though Python filter fields are snake_case. Filter fields are an in-process API you type by hand; capability keys are data a client reads over the wire, kept byte-identical across the two libraries so one dashboard consumes either report without a translation table.
+
+### A backend declares only what it cannot do
+
+A backend's own report is merged over an all-true default, so a missing key means supported. A filter field added in a later release does not force every existing backend to re-declare support for everything else.
+
+<Py>
+
+```python
+class TenantUnsupportedBackend(FakeFileBackend):
+    def get_filter_capabilities(self) -> dict[str, bool]:
+        return {"fields.tenant": False}
+
+
+caps = NotificationService(
+    notification_adapters=[adapter], notification_backend=TenantUnsupportedBackend()
+).get_backend_supported_filter_capabilities()
+caps["fields.tenant"]  # False
+caps["fields.status"]  # True: not declared, so supported
+```
+
+Every default is `True` in Python, including `pagination.oneIndexed`, `fields.readAtRange`, `negation.readAtRange` and the two template-version fields.
+
+</Py>
+
+<Ts>
+
+A backend implements the optional `getFilterCapabilities()` and returns only the keys it sets to `false`; a backend without the method is treated as supporting everything. The merged map is the exported `DEFAULT_BACKEND_FILTER_CAPABILITIES` underneath the backend's report.
+
+Seven keys default to `false` rather than `true`, and they are always present in what you receive because the defaults are merged under the report:
+
+- `pagination.oneIndexed`, because every TypeScript backend pages from 0.
+- `fields.readAtRange` and `negation.readAtRange`.
+- `fields.requestedTemplateVersion`, `fields.usedTemplateVersion`, `negation.requestedTemplateVersion` and `negation.usedTemplateVersion`.
+
+The last six are vocabulary no backend implemented when it was introduced. A `true` default would have made every shipped and third-party backend claim a filter it would ignore or throw on, which is the failure the report exists to prevent. A backend flips them to `true` when it implements the field. `vintasend-medplum` cannot search on `readAt` at all, and also reports `orderBy.readAt: false`.
+
+</Ts>
+
+### Reading the report across ecosystems
+
+`pagination.oneIndexed` is defined by both libraries, but the defaults differ because the backends do: `True` in Python, `false` in TypeScript. Never assume its value across ecosystems; read it. The other keys that default differently are the `readAtRange` and template-version keys listed above, `true` in Python and `false` in TypeScript. A client written against either map is safe in both directions as long as it reads the key rather than its memory of the default.
+
+### Case sensitivity is two capabilities
+
+`stringLookups.caseSensitive` and `stringLookups.caseInsensitive` are independent, not one flag and its negation:
+
+- A backend on a case-insensitive collation (MySQL's `*_ci`) reports `caseSensitive: false`. It matches case-insensitively and cannot be asked to do otherwise.
+- A backend with `LIKE` but no `ILIKE` and no case folding reports `caseInsensitive: false`. It matches case-sensitively only.
+- Most backends report both `true`.
+
+Deriving one from the other inverts the answer for exactly the backends that had a constraint worth reporting, and the failure is silent: you decline the one lookup the backend supports.
+
+## `tenant` is a filter field, not an access control
+
+`tenant` behaves like <Sw py="user_id" ts="userId" />: an opaque string the library stores and filters on without interpreting it. Filtering by `tenant` is not authorization. Nothing stops a caller from omitting the `tenant` filter and reading across every tenant, and nothing checks whether the caller may see the tenant it asked for. The host application decides what a tenant is and who may query it.
+
+<Py>
+
+`update_notification` refuses to change a notification's `tenant` after creation and raises `TenantReassignmentError`. That closes one accidental way to move a notification between tenants; it is defence in depth, not a security boundary.
+
+</Py>
+
+<Ts>
+
+`updateNotification` and `updateOneOffNotification` leave `tenant` out of the fields they accept, and throw at runtime if one is smuggled in anyway. That closes one accidental way to move a notification between tenants; it is defence in depth, not a security boundary.
+
+</Ts>
+
+## Query governance is the host's job
+
+Because the filter composes, a caller can build an arbitrarily deep `and` / `or` / `not` tree, and a deep `or` over an unindexed column is a slow scan the library has no planner to prevent. There is no built-in depth limit or leaf cap; any number chosen here would be arbitrary for every host. If a filter comes from untrusted input, validate or bound it before handing it to the service: a maximum nesting depth, a maximum number of leaf filters, a page-size cap, and indexes on the columns you let clients filter by.
+
+<Callout kind="tip" title="Related">
+The in-app listing methods, which are scoped to one user and exclude pipeline states, are in the [in-app guide](/vintasend/docs/in-app-notifications/). [One-off notifications](/vintasend/docs/one-off-notifications/) come back from this query mixed with regular ones.
+</Callout>

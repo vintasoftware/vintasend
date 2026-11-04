@@ -1,0 +1,142 @@
+---
+title: In-app notifications
+description: List a user's in-app notifications, count the unread ones, and mark them read one at a time or in bulk.
+section: Guides
+order: 22
+---
+
+An in-app notification is a notification whose type is `IN_APP`. It lives in the same store as every email and SMS, goes through the same create and send pipeline, and is "delivered" by an adapter that does nothing more than render it. What makes it different is what happens afterwards: the record stays in the store as the thing the user sees, so the service exposes methods to list it, count it, and mark it read.
+
+## Statuses: SENT and READ
+
+Once an in-app notification has been sent its status is `SENT`. Once the user has seen it, it becomes `READ` and <Sw py="read_at" ts="readAt" /> is set. Those are the only two statuses the in-app methods ever return.
+
+`PENDING_SEND`, `FAILED` and `CANCELLED` are pipeline states, and the listing methods exclude them on purpose. A notification scheduled for next week, or one whose adapter failed, is not something the user should see in a feed. If you need those rows, use [`filter_notifications`](/vintasend/docs/filtering/) with an explicit `status` filter; that query is built for dashboards, not for end users.
+
+"Unread" means `status == SENT`. "All" means `status in (SENT, READ)`.
+
+## The in-app adapter
+
+The service needs an adapter registered for the `IN_APP` type before any in-app method will work. The adapter's `send` is called like any other adapter's, but there is no external system to deliver to: it renders the template so rendering errors surface, and leaves the record in place.
+
+<Py>
+
+`FakeInAppAdapter` in `vintasend.services.notification_adapters.stubs.fake_in_app_adapter` is the whole shape of an in-app adapter. A real one looks the same, minus the list it keeps for tests:
+
+```python
+from vintasend.constants import NotificationTypes
+from vintasend.services.notification_adapters.base import BaseNotificationAdapter
+
+
+class InAppAdapter(BaseNotificationAdapter):
+    notification_type = NotificationTypes.IN_APP
+
+    def send(self, notification, context):
+        self.template_renderer.render(notification, context)
+```
+
+Register it next to your other adapters:
+
+```python
+service = NotificationService(
+    notification_adapters=[email_adapter, InAppAdapter(renderer, backend)],
+    notification_backend=backend,
+)
+```
+
+Every listing and count method below raises `NotificationError("No in-app notification adapter found")` when no adapter with `notification_type == IN_APP` is configured. `mark_read` and `mark_read_bulk` do not check; they are plain status updates. `FakeAsyncIOInAppAdapter` is the AsyncIO twin.
+
+</Py>
+
+<Ts>
+
+An in-app adapter is a `BaseNotificationAdapter` whose `notificationType` is `'IN_APP'` and whose `send` renders without delivering anywhere. The TypeScript service does not check that one is registered before `getInAppUnread` or `markRead`; those call straight through to the backend.
+
+</Ts>
+
+## Listing and counting
+
+<Py>
+
+Four methods, all scoped to one `user_id`. The two listings are paginated with `page` defaulting to `1` and `page_size` to `10`, and each pairs with a count so you can render a `count` / `next` / `previous` envelope. Results are newest first.
+
+```python
+# Unread only (status == SENT)
+unread = service.get_in_app_unread(user_id, page=1, page_size=10)
+unread_count = service.get_in_app_unread_count(user_id)
+
+# Read and unread (status in SENT, READ)
+everything = service.get_in_app_notifications(user_id, page=1, page_size=10)
+total = service.get_in_app_notifications_count(user_id)
+```
+
+The listings return an `Iterable[Notification]`, so call the matching count rather than `len()`. Each method also takes a `backend_identifier` to read from a non-primary backend; an unknown identifier raises `BackendNotFoundError`.
+
+On the backend, the counts have a working default that iterates the unpaginated `filter_all_*` variants, so a backend written before they existed keeps working. A backend you write yourself should override `count_in_app_notifications` and `count_in_app_unread_notifications` with a real `COUNT`.
+
+`AsyncIONotificationService` exposes the same four methods as coroutines.
+
+</Py>
+
+<Ts>
+
+The service exposes one listing:
+
+```typescript
+const unread = await vintasend.getInAppUnread(userId);
+```
+
+It returns every unread (`SENT`) in-app notification for the user, unpaginated, from the primary backend or from the `backendIdentifier` passed as the second argument. There is no count method and no read-plus-unread listing on the service. For a paginated unread list call the backend directly, which has `filterInAppUnreadNotifications(userId, page, pageSize)` with 0-indexed pages; for a count, take the length of `getInAppUnread`'s result or run `filterNotifications` with `{ userId, notificationType: 'IN_APP', status: 'SENT' }`.
+
+</Ts>
+
+## Marking as read
+
+<Py>
+
+`mark_read` marks a single notification and returns the updated record. It raises `NotificationUpdateError` when the notification is not currently `SENT`, so a double click on an already-read item is an error rather than a no-op. It can also raise `UnconfirmedNotificationUpdateError` when the backend could not tell whether the write landed; re-read the notification instead of assuming either outcome.
+
+```python
+notification = service.mark_read(notification_id)
+```
+
+`mark_read_bulk` is the method to put behind an endpoint. It is idempotent by construction and never raises for a row it cannot update:
+
+```python
+read_notifications = service.mark_read_bulk([id_1, id_2, id_3], user_id=user_id)
+```
+
+- Every id that is currently `SENT` moves to `READ` and gets `read_at` set.
+- Ids that are already `READ` are left alone, `read_at` untouched.
+- Ids that are missing, in another state (`PENDING_SEND`, `FAILED`, `CANCELLED`), or not owned by `user_id` are skipped silently.
+- The return value is the final `READ` state for the requested ids: newly marked plus already read. Skipped ids are absent from it.
+
+`user_id` is optional on the signature, but always pass it from an HTTP endpoint. Without it the update is unscoped, and a caller who can guess ids can mark another user's notifications as read. With it, ids the user does not own are among the ones skipped. The library stores `user_id` as an opaque value and does not check who is asking, so this scoping is the only guard.
+
+Both methods run through the multi-backend write path, so with additional backends configured the read mark is replicated the same way a send is.
+
+</Py>
+
+<Ts>
+
+`markRead` marks a single notification and returns the updated record:
+
+```typescript
+const notification = await vintasend.markRead(notificationId);
+```
+
+The second argument, `checkIsSent`, defaults to `true` and is passed to the backend's `markAsRead`: the backend only marks a notification that is currently `SENT`, and rejects one in any other state. Pass `false` to mark regardless of the current status.
+
+There is no bulk read marking on the TypeScript service, and `markRead` takes no `userId`: it does not check ownership. An endpoint that exposes it must load the notification first and confirm it belongs to the caller before marking it, or it will mark whatever id it is given.
+
+The write goes through the multi-backend path, so additional backends receive the same status change.
+
+</Ts>
+
+## Putting it behind an endpoint
+
+The methods take a <Sw py="user_id" ts="userId" /> and trust it. Take that value from the authenticated session, never from the request body, and the listing is scoped correctly by construction. The same goes for marking: scope the write to the session's user as described above, because the library has no notion of who the caller is.
+
+<Callout kind="note" title="Not an authorization layer">
+<Sw py="user_id" ts="userId" /> is an opaque identifier the library stores and filters on. Deciding who may read or mark whose notifications stays with your application; see [the introduction](/vintasend/docs/introduction/) for the three things the library is not.
+</Callout>

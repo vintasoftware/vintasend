@@ -1,0 +1,33 @@
+---
+import Wordmark from "./Wordmark.astro";
+import ThemeToggle from "./ThemeToggle.astro";
+import LangToggle from "./LangToggle.astro";
+import { withBase, GITHUB_PY, GITHUB_TS, PYPI, NPM } from "../lib/urls";
+
+interface Props {
+  // In-page anchors for the landing page; the docs pass none.
+  links?: { href: string; label: string }[];
+  current?: "home" | "docs" | "dashboard" | "templates";
+}
+const { links = [], current = "home" } = Astro.props;
+---
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href={withBase("/")}>
+      <Wordmark />
+      <span class="name">VintaSend</span>
+    </a>
+    <nav class="nav-links">
+      {links.map((l) => <a href={l.href}>{l.label}</a>)}
+      <a class:list={[{ on: current === "dashboard" }]} href={withBase("/dashboard/")}>Dashboard</a>
+      <a class:list={[{ on: current === "templates" }]} href={withBase("/managed-templates/")}>Templates</a>
+      <a class:list={["keep", { on: current === "docs" }]} href={withBase("/docs/")}>Docs</a>
+      <a class="ext keep" data-only="py" href={GITHUB_PY}>GitHub</a>
+      <a class="ext keep" data-only="ts" href={GITHUB_TS}>GitHub</a>
+    </nav>
+    <a class="btn nav-cta keep" data-only="py" href={PYPI}>PyPI</a>
+    <a class="btn nav-cta keep" data-only="ts" href={NPM}>npm</a>
+    <LangToggle />
+    <ThemeToggle />
+  </div>
+</header>

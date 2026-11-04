@@ -1,0 +1,227 @@
+---
+title: Configuration
+description: Where the service finds its backend, adapters and optional seams, and every setting and option it understands.
+section: Concepts
+order: 13
+---
+
+The two libraries configure themselves differently, and the difference is deliberate. Python applications usually have a settings object already (Django, Flask) and the library reads from it. TypeScript applications do not share one, so everything is passed to the factory as a value.
+
+<Py>
+
+## Framework detection
+
+`vintasend.app_settings` detects the host framework the first time settings are read, by probing in this order:
+
+1. **Django**, when `django` imports and `django.conf.settings.configured` is true.
+2. **Flask**, when `flask` imports and `flask.current_app` resolves, which means an application context is active.
+3. **FastAPI**, when `fastapi` imports.
+4. Otherwise **unknown**.
+
+None of the three is a dependency; they are probed, never required. The detected framework decides where a setting is read from: `django.conf.settings`, `flask.current_app.config`, or the `config` object you pass to the service constructor for FastAPI. Each framework also has its own default dict, so a Django project that sets nothing gets the `vintasend-django` backend, email adapter and renderer, while Flask and FastAPI projects default to the `vintasend-sqlalchemy` backend, `vintasend-jinja` renderer and the Flask-Mail or FastAPI-Mail adapter.
+
+## Precedence
+
+For every setting, resolution is:
+
+1. An **environment variable** of the same name, if set.
+2. The **framework setting** of the same name, if set and truthy.
+3. The framework's **default**.
+
+```python
+# settings.py (Django)
+NOTIFICATION_BACKEND = "vintasend_django.services.notification_backends.django_db_notification_backend.DjangoDbNotificationBackend"
+NOTIFICATION_ADAPTERS = [
+    (
+        "vintasend_django.services.notification_adapters.django_email.DjangoEmailNotificationAdapter",
+        "vintasend_django.services.notification_template_renderers.django_templated_email_renderer.DjangoTemplatedEmailRenderer",
+    ),
+]
+NOTIFICATION_DEFAULT_FROM_EMAIL = "no-reply@example.com"
+```
+
+```bash
+# Overrides the framework setting for this process
+export NOTIFICATION_QUEUE_SERVICE="myapp.queues.SQSQueueService"
+```
+
+Two consequences of how this is implemented:
+
+- Environment variables are read as plain strings. The list-valued settings, `NOTIFICATION_ADAPTERS` and `NOTIFICATION_DEFAULT_BCC_EMAILS`, are only practical from framework settings.
+- When no framework is detected, every setting resolves to empty, and neither environment variables nor a passed `config` are consulted. A plain Python process (a worker, a script) must pass its backend, adapters and optional seams to the constructor as instances or import strings.
+
+Settings are read into `NotificationSettings`, a singleton built the first time a service is constructed. The `config` passed to that first construction is the one it keeps.
+
+## The settings
+
+| Setting | Default | What it does |
+|---|---|---|
+| `NOTIFICATION_BACKEND` | per framework | Import string of the backend class. Instantiated with `notification_backend_kwargs` when given |
+| `NOTIFICATION_ADAPTERS` | per framework | List of `(adapter, renderer)` import-string pairs. Either element may be `(import_string, kwargs)` to pass constructor arguments |
+| `NOTIFICATION_MODEL` | per framework | Import string of the notification model, for backends built on an ORM. `NotificationSettings().get_notification_model_cls()` raises `ValueError` when unset |
+| `NOTIFICATION_ATTACHMENT_MANAGER` | unset | Import string of the attachment manager. Unset means attachments are unsupported |
+| `NOTIFICATION_QUEUE_SERVICE` | unset | Import string of the queue service for background adapters. Unset means background sending is unavailable |
+| `NOTIFICATION_REPLICATION_QUEUE_SERVICE` | unset | Import string of the queue service for queued replication to additional backends. Unset means queued replication falls back to inline |
+| `NOTIFICATION_REPLICATION_MODE` | `"inline"` | `"inline"` replicates on the request path; `"queued"` enqueues one task per additional backend. Any other value raises `NotificationError` at construction |
+| `NOTIFICATION_GIT_COMMIT_SHA_PROVIDER` | unset | Import string of the git commit SHA provider. Unset means no SHA is ever resolved or written |
+| `NOTIFICATION_SERVICE_FACTORY` | unset | Import string of a zero-argument callable returning a ready service. Used by the worker entry points in `vintasend.tasks`, which cannot build a service from settings alone |
+| `NOTIFICATION_DEFAULT_FROM_EMAIL` | a placeholder | Sender address used by the official email adapters |
+| `NOTIFICATION_DEFAULT_BCC_EMAILS` | `[]` | Addresses the official email adapters BCC on every email |
+| `NOTIFICATION_DEFAULT_BASE_URL_PROTOCOL` | `"http"` | With the domain below, the base URL the official email adapters expose to templates for absolute links |
+| `NOTIFICATION_DEFAULT_BASE_URL_DOMAIN` | `"example.com"` | See above |
+
+The last four are read by the adapter packages, not by the service itself; a custom adapter is free to ignore them.
+
+## The service constructor
+
+Every argument has the same three forms: an instance, an import string, or nothing (fall back to the setting). `AsyncIONotificationService` takes the same arguments and expects the AsyncIO twin of each seam.
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+service = NotificationService(
+    notification_adapters=None,            # list of adapters, or (adapter, renderer) import pairs
+    notification_backend=None,             # backend instance or import string
+    notification_backend_kwargs=None,      # kwargs for the backend when it is an import string
+    config=None,                           # host config object, for FastAPI-style apps
+    notification_queue_service=None,       # BaseNotificationQueueService | import string
+    attachment_manager=None,               # BaseAttachmentManager | import string
+    git_commit_sha_provider=None,          # BaseGitCommitShaProvider | import string
+    raise_on_failed_send=False,            # raise send failures instead of logging them
+    pin_template_versions=False,           # default for template version pinning on create/update
+    additional_backends=None,              # replica backends, instances or import strings
+    replication_queue_service=None,        # BaseNotificationReplicationQueueService | import string
+    replication_mode=None,                 # "inline" | "queued"; None reads the setting
+)
+```
+
+What each one does beyond its seam:
+
+- `raise_on_failed_send`: `False` logs failures to send, enqueue or record an outcome and lets the other adapters run; `True` raises them. See [lifecycle](/vintasend/docs/lifecycle/).
+- `pin_template_versions`: whether a notification created or repointed without an explicit `requested_template_version` is pinned to the version current at that moment. Every create and update takes its own `pin_template_versions` that overrides this. Only renderers that version templates can pin; a file-based renderer has nothing to pin.
+- `additional_backends`: each is addressed by its `get_backend_identifier()`, or `backend-{n}` by position. Two backends resolving to the same identifier raise `DuplicateBackendIdentifierError`.
+- `replication_mode`: ignored by a single-backend service.
+
+A queue service or replication queue service that is configured but cannot be imported or instantiated raises `NotificationQueueServiceResolutionError` at construction; one that is simply absent leaves the feature off.
+
+## FastAPI and other settings-less frameworks
+
+FastAPI has no global settings object, so the service cannot find one. Pass yours as `config`; the library reads `NOTIFICATION_*` attributes from it with `getattr`, with environment variables still taking precedence.
+
+```python
+from pydantic_settings import BaseSettings
+from vintasend.services.notification_service import AsyncIONotificationService
+
+class Settings(BaseSettings):
+    NOTIFICATION_BACKEND: str = "vintasend_sqlalchemy.services.notification_backends.sqlalchemy_notification_backend.SQLAlchemyNotificationBackend"
+    NOTIFICATION_DEFAULT_FROM_EMAIL: str = "no-reply@example.com"
+
+settings = Settings()
+
+service = AsyncIONotificationService(
+    notification_adapters=[FastAPIMailAdapter(JinjaTemplatedEmailRenderer(), backend)],
+    notification_backend=backend,
+    config=settings,
+)
+```
+
+The same `config` is accepted by `NotificationSettings(config)` and by the worker entry point `get_notification_service(config)` in `vintasend.tasks.background_tasks`.
+
+</Py>
+
+<Ts>
+
+## No settings layer
+
+There is no framework detection, no environment variable lookup and no import strings. Every backend, adapter and optional seam is constructed by your code and handed to `VintaSendFactory.create` as an instance. This keeps the library free of any opinion about how your application loads configuration, and it is why the `NotificationTypeConfig` generic can flow through every module: the factory sees the concrete types it is given.
+
+## Object-style configuration
+
+`new VintaSendFactory<Config>().create(params)` takes one object. Three keys are required: `adapters`, `backend` and `logger`. `contextGeneratorsMap` is required in the type as well.
+
+```typescript
+import { VintaSendFactory } from 'vintasend';
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [emailAdapter, smsAdapter],
+  backend: primaryBackend,
+  logger,
+  contextGeneratorsMap,
+  additionalBackends: [replicaBackend],
+  queueService,
+  replicationQueueService,
+  attachmentManager,
+  gitCommitShaProvider,
+  options: {
+    raiseErrorOnFailedSend: false,
+    replicationMode: 'inline',
+    pinTemplateVersions: false,
+  },
+});
+```
+
+| Key | Required | What it does |
+|---|---|---|
+| `adapters` | yes | Array of adapters. The factory throws if two declare the same `notificationType` |
+| `backend` | yes | The primary backend, where every read goes unless a `backendIdentifier` says otherwise |
+| `logger` | yes | A `BaseLogger` with `info`, `error` and `warn`. The service keeps it and calls `injectLogger` on every adapter, and on each backend and renderer that implements it |
+| `contextGeneratorsMap` | yes | The object of `ContextGenerator` instances. Its type is `Config['ContextMap']` |
+| `additionalBackends` | no | Replica backends. Writes fan out to them; two backends with the same identifier throw |
+| `queueService` | no | Where a background adapter (`enqueueNotifications: true`) sends notification ids. Without it, such adapters are logged and skipped |
+| `replicationQueueService` | no | Where `replicationMode: 'queued'` enqueues one task per additional backend. Without it, queued replication falls back to inline |
+| `attachmentManager` | no | Stores attachment files. Injected into any backend that exposes `injectAttachmentManager` |
+| `gitCommitShaProvider` | no | Resolves the commit SHA recorded on each send. Without it, no SHA is written |
+| `options` | no | See below. Omitted, it is `{ raiseErrorOnFailedSend: false }` |
+
+### Options
+
+- `raiseErrorOnFailedSend` (`false`): whether a missing adapter, a failing context generator, or a refused `resendNotification` or `delayedSend` throws instead of being logged. Adapter errors are never rethrown; they mark the record `FAILED`. See [lifecycle](/vintasend/docs/lifecycle/).
+- `replicationMode` (`'inline'`): `'inline'` replicates to additional backends on the request path; `'queued'` enqueues through `replicationQueueService`, falling back to inline when the queue is missing or an enqueue fails.
+- `pinTemplateVersions` (`false`): the default for whether a notification created or repointed without an explicit `requestedTemplateVersion` is pinned to the version current at that moment. Every `createNotification` and `updateNotification` takes a `pinTemplateVersions` of its own that overrides it. Never stored; only consulted at the moment of the create or update.
+
+### Late registration
+
+Two optional seams can be attached after construction, for applications that build the queue before the service or the other way round:
+
+```typescript
+vintasend.registerQueueService(queueService);
+vintasend.registerReplicationQueueService(replicationQueueService);
+```
+
+## The positional form
+
+The original signature is still supported and typed as deprecated. The parameter order is `adapters`, `backend`, `logger`, `contextGeneratorsMap`, then the optional `queueService`, `attachmentManager`, `options`, `gitCommitShaProvider`, `additionalBackends`, `replicationQueueService`.
+
+```typescript
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create(
+  [emailAdapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+  queueService,
+  undefined,                            // attachmentManager
+  { raiseErrorOnFailedSend: true },
+);
+```
+
+Prefer the object form: it reads without counting positions, and the positional one has already changed once, when `attachmentManager` was inserted before `options` in v0.4.0.
+
+## Putting the service somewhere
+
+Because the service holds live connections (a database client in the backend, a transport in the adapter), build it once per process and export it, rather than once per request. The same goes for a worker: a process that calls `sendPendingNotifications` or `delayedSend` needs a service built with the same backend and the same `contextGeneratorsMap` as the web process that created the notifications.
+
+```typescript
+// notifications.ts
+export const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [emailAdapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+});
+```
+
+</Ts>
+
+<Callout kind="tip" title="Start from a package">
+The [installation](/vintasend/docs/installation/) page lists the official backend, adapter and renderer packages for each stack, and each package's README documents its own constructor arguments.
+</Callout>

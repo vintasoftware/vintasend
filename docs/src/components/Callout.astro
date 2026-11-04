@@ -1,0 +1,10 @@
+---
+// A note, tip or warning box for the docs. `kind` picks the colour.
+interface Props { kind?: "note" | "tip" | "warning"; title?: string }
+const { kind = "note", title } = Astro.props;
+const labels = { note: "Note", tip: "Tip", warning: "Warning" };
+---
+<aside class={`callout callout-${kind}`}>
+  <p class="callout-title">{title ?? labels[kind]}</p>
+  <div class="callout-body"><slot /></div>
+</aside>

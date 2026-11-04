@@ -1,0 +1,349 @@
+---
+import { Code } from "astro:components";
+import Base from "../../layouts/Base.astro";
+import LangToggle from "../../components/LangToggle.astro";
+import { withBase } from "../../lib/urls";
+
+const links = [
+  { href: "#how", label: "How it works" },
+  { href: "#lifecycle", label: "Lifecycle" },
+  { href: "#composition", label: "Composition" },
+  { href: "#stack", label: "The stack" },
+  { href: "#dashboard", label: "Editing UI" },
+];
+
+const pyWire = `from vintasend_managed_templates.managed_template_renderer import ManagedTemplateEmailRenderer
+from vintasend_managed_templates.managed_template_service import ManagedTemplateService
+from vintasend_django_templates_manager.django_templates_manager import DjangoTemplateManager
+
+manager_backend = DjangoTemplateManager()                       # where the versions live
+renderer = ManagedTemplateEmailRenderer(manager_backend, inner_renderer)   # wraps any email renderer
+templates = ManagedTemplateService(manager_backend, renderer)   # create, version, publish, tag
+
+# The notification service is unchanged; only the renderer is wrapped.
+service = NotificationService(
+    notification_adapters=[DjangoEmailNotificationAdapter(renderer, notification_backend)],
+    notification_backend=notification_backend,
+)
+
+service.create_notification(
+    user_id=user.id,
+    notification_type="EMAIL",
+    title="Welcome",
+    body_template="welcome",          # a managed template key, not a file path
+    context_name="welcome_context",
+    context_kwargs={"user_id": user.id},
+    pin_template_versions=True,       # record the version that is current right now
+)`;
+
+const tsWire = `import { LiquidEmailTemplateRendererFactory } from 'vintasend-liquidjs';
+import { ManagedTemplateEmailRenderer, ManagedTemplateService } from 'vintasend-managed-templates';
+import { MedplumTemplateManagerBackend } from 'vintasend-medplum-template-manager';
+
+const managerBackend = new MedplumTemplateManagerBackend(medplum);   // where the versions live
+const liquid = new LiquidEmailTemplateRendererFactory<Config>().create({
+  renderLimit: 1_000,   // an edited template cannot make a send hang
+  strictFilters: true,
+});
+const renderer = new ManagedTemplateEmailRenderer<Config>(managerBackend, liquid);
+const templates = new ManagedTemplateService<Config>(managerBackend, renderer);
+
+// The notification service is unchanged; only the renderer is wrapped.
+await vintasend.createNotification(
+  {
+    userId: user.id,
+    notificationType: 'EMAIL',
+    title: 'Welcome',
+    bodyTemplate: 'welcome',          // a managed template key, not a file path
+    contextName: 'welcomeContext',
+    contextParameters: { userId: user.id },
+    sendAfter: null, subjectTemplate: null, extraParams: null,
+  },
+  { pinTemplateVersions: true },      // record the version that is current right now
+);`;
+
+const theme = "github-dark-default";
+---
+<Base
+  title="VintaSend Managed Templates — Versioned notification templates with a publishing lifecycle"
+  description="Move notification templates out of files and into a data store: every edit is a version, a version is published deliberately, templates compose from other templates, and a notification can be pinned to the exact version it should render. Python and TypeScript, with an API and a dashboard."
+  links={links}
+  current="templates"
+>
+
+<!-- ============ HERO ============ -->
+<section class="hero">
+  <div class="hero-bg"><div class="glow"></div><div class="grid"></div></div>
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow reveal"><i class="dot"></i> Managed templates · Python and TypeScript</span>
+      <h1 class="reveal d1">Change the copy without a deploy. <span class="grad">Keep every version.</span></h1>
+      <p class="lede reveal d2">A file-based renderer makes every template edit a deploy, and an edit changes what every notification renders, past and future. Managed templates live in a data store instead: someone who is not a developer edits them, every edit is a new version, a version is published on purpose, and a notification can be pinned to the exact one it should render.</p>
+      <div class="cta-row reveal d3" style="margin-bottom:14px"><LangToggle class="big" /></div>
+      <div class="cta-row reveal d3">
+        <a class="btn btn-primary" href={withBase("/docs/template-versioning/")}>Read the guide</a>
+        <a class="btn" data-only="py" href="https://github.com/vintasoftware/vintasend-managed-templates">vintasend-managed-templates ↗</a>
+        <a class="btn" data-only="ts" href="https://github.com/vintasoftware/vintasend-ts-managed-templates">vintasend-managed-templates ↗</a>
+        <a class="btn" href="#dashboard">The dashboard</a>
+      </div>
+      <div class="vendors reveal d4">
+        <span class="lbl">Stores</span>
+        <span class="v" data-only="py">Django ORM</span><span class="v" data-only="ts">Medplum (FHIR)</span><span class="v">your own backend</span>
+        <span class="lbl" style="margin-left:10px">Engines</span>
+        <span class="v" data-only="py">Django templates</span><span class="v" data-only="py">Jinja2</span><span class="v" data-only="ts">LiquidJS</span><span class="v" data-only="ts">in-memory maps</span>
+      </div>
+    </div>
+    <div class="panel shot reveal d2">
+      <div class="app-top"><span>VintaSend</span><span class="tab">Notifications</span><span class="tab on">Templates</span><span class="right"><i class="avatar"></i></span></div>
+      <div class="app-split">
+        <div class="app-list">
+          <h6>Templates</h6>
+          <div class="it"><span class="mono">welcome</span><span class="st draft">draft</span><span class="v">v4</span></div>
+          <div class="it on"><span class="mono">welcome</span><span class="st active">active</span><span class="v">v3</span></div>
+          <div class="it"><span class="mono">base-email</span><span class="st active">active</span><span class="v">v2</span></div>
+          <div class="it"><span class="mono">footer</span><span class="st active">active</span><span class="v">v7</span></div>
+          <div class="it"><span class="mono">invoice-ready</span><span class="st inactive">inactive</span><span class="v">v1</span></div>
+        </div>
+        <div>
+          <div class="tabs"><span class="on">Source</span><span>Composition</span><span>History</span><span>Tags</span></div>
+          <div class="app-src"><span class="tg">{"{%"} managed_extends "base-email" version=2 {"%}"}</span>
+<span class="tg">{"{%"} managed_block header {"%}"}</span>&lt;h1&gt;Welcome!&lt;/h1&gt;<span class="tg">{"{%"} managed_endblock {"%}"}</span>
+&lt;p&gt;Hi {"{{"} name {"}}"}, welcome aboard.&lt;/p&gt;
+<span class="cm">
+subject   {"{%"} managed_extends "base-email" {"%}"}Welcome aboard
+tags      onboarding · email
+activated 2026-11-02 by hugo@example.com</span></div>
+          <div class="app-foot"><span class="act">New version</span><span class="act">Preview</span><span class="act">Deactivate</span><span class="right">allowedTransitions: inactive, archived</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ HOW IT WORKS ============ -->
+<section class="section" id="how">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">How it works</p>
+      <h2>Wrap the renderer you have. Reference a key instead of a path.</h2>
+      <p>A managed-template renderer composes another renderer rather than replacing it: it fetches the stored template and hands the engine its source. The notification service does not change. The only difference a caller sees is that <span data-only="py"><code class="mono">body_template</code></span><span data-only="ts"><code class="mono">bodyTemplate</code></span> names a template key.</p>
+    </div>
+    <div class="steps">
+      <div class="step reveal">
+        <div class="num">STEP 01</div>
+        <h3>Write a draft</h3>
+        <p>A template has a key, a body, a subject<span data-only="py"> and an optional preheader</span>, tags and a tenant. Its first version is created in <code class="mono">draft</code>. Nothing sends it yet.</p>
+        <pre data-only="py"><span class="p">&gt;&gt;&gt;</span> templates.create_template(ManagedTemplateCreateInput(key="welcome", …))</pre>
+        <pre data-only="ts"><span class="p">&gt;</span> await templates.createTemplate({'{'} key: 'welcome', … {'}'})</pre>
+      </div>
+      <div class="step reveal d1">
+        <div class="num">STEP 02</div>
+        <h3>Preview, then activate</h3>
+        <p>Render the draft against a context you type, check the composed output, and publish it. Every status change is written to the audit trail with who made it.</p>
+        <pre data-only="py"><span class="p">&gt;&gt;&gt;</span> templates.activate("welcome", changed_by="hugo@example.com")</pre>
+        <pre data-only="ts"><span class="p">&gt;</span> await templates.activate('welcome', {'{'} changedBy: 'hugo@example.com' {'}'})</pre>
+      </div>
+      <div class="step reveal d2">
+        <div class="num">STEP 03</div>
+        <h3>Sends pick the newest active version</h3>
+        <p>An unpinned send renders the highest-numbered active version, never a draft. A pinned one renders the version it was pinned to, and records the version that actually rendered either way.</p>
+        <pre data-only="py"><span class="p">&gt;&gt;&gt;</span> notification.used_template_version  <span class="dim"># 3</span></pre>
+        <pre data-only="ts"><span class="p">&gt;</span> notification.usedTemplateVersion  <span class="dim">// 3</span></pre>
+      </div>
+    </div>
+
+    <div class="split" style="margin-top:72px">
+      <div class="reveal">
+        <p class="kicker">Wiring it up</p>
+        <h2>Three objects, and the notification service stays as it was.</h2>
+        <ul class="checks">
+          <li><b>A manager backend</b> stores the versions, the status history and the tags. <span data-only="py">The Django one ships models, migrations and an admin.</span><span data-only="ts">The Medplum one stores them as FHIR <code class="mono">MessageDefinition</code> resources.</span></li>
+          <li><b>A managed-template renderer</b> wraps any existing <span data-only="py">email or SMS</span><span data-only="ts">email</span> renderer and feeds it stored source instead of a path.</li>
+          <li><b>A managed-template service</b> is what editors and APIs call: create, version, publish, tag, filter, preview.</li>
+          <li data-only="py"><b>Fallbacks</b> let the application send a key before anyone has written its template: register a default per key and sends use it until a version is activated.</li>
+          <li data-only="ts"><b>Wrap an engine that cannot run code.</b> Liquid evaluates expressions and filters only. Pug compiles a template to JavaScript, so keep Pug for templates in your repository.</li>
+        </ul>
+      </div>
+      <div class="panel hero-code reveal d1">
+        <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title" data-only="py">notifications.py</span><span class="title" data-only="ts">notifications.ts</span></div>
+        <div data-only="py"><Code code={pyWire} lang="python" theme={theme} /></div>
+        <div data-only="ts"><Code code={tsWire} lang="typescript" theme={theme} /></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ LIFECYCLE ============ -->
+<section class="section" id="lifecycle">
+  <div class="wrap split rev">
+    <div class="panel lifecycle reveal d1" style="padding:28px 24px">
+      <svg viewBox="0 0 520 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A version moves from draft to active, active to inactive and back, and any of them to archived, which is terminal">
+        <defs><marker id="lcArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" style="fill:var(--line)"/></marker></defs>
+        <rect class="n draft" x="20" y="40" width="120" height="44" rx="10"/><text x="46" y="68">DRAFT</text>
+        <rect class="n active" x="200" y="40" width="120" height="44" rx="10"/><text x="224" y="68">ACTIVE</text>
+        <rect class="n inactive" x="380" y="40" width="120" height="44" rx="10"/><text x="398" y="68">INACTIVE</text>
+        <rect class="n archived" x="200" y="160" width="120" height="44" rx="10"/><text x="216" y="188">ARCHIVED</text>
+        <path class="e" d="M140 62 L198 62"/><text class="lbl" x="150" y="52">activate</text>
+        <path class="e" d="M320 54 L378 54"/><text class="lbl" x="326" y="44">deactivate</text>
+        <path class="e" d="M380 72 L322 72"/><text class="lbl" x="334" y="90">activate</text>
+        <path class="e" d="M80 84 C 80 160, 140 182, 198 182"/>
+        <path class="e" d="M260 84 L260 158"/>
+        <path class="e" d="M440 84 C 440 160, 380 182, 322 182"/>
+        <text class="lbl" x="150" y="140">archive · terminal</text>
+        <text class="lbl" x="20" y="222">every move is written to the status history, with changed_by</text>
+      </svg>
+    </div>
+    <div class="reveal">
+      <p class="kicker">Lifecycle</p>
+      <h2>Versioned, never edited in place. Published on purpose.</h2>
+      <p>An update copies the latest version forward and applies what changed, so a published version's body can never change under a notification that already referenced it. Status moves follow a transition table, and anything else is refused.</p>
+      <ul class="checks">
+        <li><b>Several versions can be active.</b> Activating v2 while v3 is active does not change what is sent: an unpinned send renders the highest-numbered active one.</li>
+        <li><b>Only a never-published version can be deleted.</b> A version that was ever active may be pinned by a notification, so it is archived instead. Status history is never deleted, and a deleted version's number is never reused.</li>
+        <li><b>Tags edit in place.</b> Tags are how a template is found, not part of what it renders, so retagging does not spawn a version. Slugs are derived by shared rules, so every store agrees on what a label becomes.</li>
+        <li><b>Allowed transitions travel with the payload.</b> A UI enables buttons from <code class="mono">allowedTransitions</code> instead of discovering the rules by catching errors.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ COMPOSITION ============ -->
+<section class="section" id="composition">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">Composition</p>
+      <h2>Bases, blocks and includes, resolved before the engine runs.</h2>
+      <p>Django's <code class="mono">extends</code> and Jinja's <code class="mono">include</code> hand a name to a loader, and a loader reads files. Stored templates reach the engine as source, so those tags have nothing to load. Managed templates bring their own tags, resolve them against the store, and hand the engine one flat string with no <code class="mono">managed_</code> tag left in it.</p>
+    </div>
+    <div class="split" style="align-items:start">
+      <div class="panel shot reveal">
+        <div class="tabs"><span class="on">Source</span><span>Composition</span></div>
+        <div class="app-src"><span class="cm">base-email  v2</span>
+&lt;html&gt;&lt;body&gt;
+  <span class="tg">{"{%"} managed_block header {"%}"}</span>&lt;h1&gt;Acme&lt;/h1&gt;<span class="tg">{"{%"} managed_endblock {"%}"}</span>
+  <span class="tg">{"{%"} managed_children {"%}"}</span>
+  <span class="tg">{"{%"} managed_include "footer" {"%}"}</span>
+&lt;/body&gt;&lt;/html&gt;
+
+<span class="cm">welcome  v3</span>
+<span class="tg">{"{%"} managed_extends "base-email" version=2 {"%}"}</span>
+<span class="tg">{"{%"} managed_block header {"%}"}</span>&lt;h1&gt;Welcome!&lt;/h1&gt;<span class="tg">{"{%"} managed_endblock {"%}"}</span>
+&lt;p&gt;Hi {"{{"} name {"}}"}, welcome aboard.&lt;/p&gt;
+
+<span class="cm">what the engine receives for welcome</span>
+&lt;html&gt;&lt;body&gt;
+  <span class="hl">&lt;h1&gt;Welcome!&lt;/h1&gt;</span>
+  <span class="hl">&lt;p&gt;Hi {"{{"} name {"}}"}, welcome aboard.&lt;/p&gt;</span>
+  &lt;p&gt;Acme Inc · unsubscribe&lt;/p&gt;
+&lt;/body&gt;&lt;/html&gt;</div>
+      </div>
+      <div class="reveal d1">
+        <table class="names">
+          <thead><tr><th>Tag</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code>managed_extends "key"</code></td><td>This template is a child of <code>key</code>. Pin the parent with <code>version=2</code>.</td></tr>
+            <tr><td><code>managed_children</code></td><td>In a base: where the child's content goes.</td></tr>
+            <tr><td><code>managed_block name</code></td><td>A named region a child may replace. Blocks may nest.</td></tr>
+            <tr><td><code>managed_super</code></td><td>Inside a child's block: the content it is overriding.</td></tr>
+            <tr><td><code>managed_include "key"</code></td><td>Splice another template in, composed in full first. Pins the same way.</td></tr>
+          </tbody>
+        </table>
+        <ul class="checks" style="margin-top:22px">
+          <li><b>Abstract templates.</b> A template with a <code class="mono">managed_children</code> hole, or blocks without a parent, is a base to build on. The flag is derived from the source on every write, so "the templates I can send" is a filter, not a parse.</li>
+          <li><b>Pin the parent too.</b> A notification pinned to v3 of <code class="mono">welcome</code> renders v3 of <code class="mono">welcome</code>, but an unpinned base still resolves to today's. Name the version on the reference when a child must keep composing against an exact parent.</li>
+          <li><b>Failures surface at edit time.</b> Unknown tags, missing references, cycles and runaway depth are the package's own errors, raised by validation before a send ever hits them.</li>
+          <li><b>One tag language, both ecosystems.</b> The Python and TypeScript packages agree on the tags, the slug rules and the filter vocabulary, so a store written by one renders in the other.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ THE STACK ============ -->
+<section class="section" id="stack">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="kicker">The stack</p>
+      <h2>Four packages, each on its own release cycle.</h2>
+      <p>The seam and the service, a store for it, an API over it, and a dashboard on the API. Install what you need; the lower layers work without the upper ones.</p>
+    </div>
+    <div class="cards four" data-only="py">
+      <div class="card reveal"><h3>vintasend-managed-templates</h3><p>The <code>BaseTemplateManagerBackend</code> seam, <code>ManagedTemplateService</code>, the email and SMS wrapping renderers, composition, tags and lifecycle rules. Storage-agnostic. <a href="https://github.com/vintasoftware/vintasend-managed-templates" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+      <div class="card reveal d1"><h3>vintasend-django-templates-manager</h3><p><code>DjangoTemplateManager</code>, the models behind it, and an admin that enforces the same delete rules as the service. <a href="https://github.com/vintasoftware/vintasend-django-templates-manager" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+      <div class="card reveal d2"><h3>vintasend-templates-management-api</h3><p>A Django + django-ninja REST API over a <code>ManagedTemplateService</code>. Mount it in your project or run it alone. Its <code>openapi.yaml</code> is generated from the routes and tested against them. <a href="https://github.com/vintasoftware/vintasend-templates-management-api" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+      <div class="card reveal d3"><h3>templates-management-dashboard</h3><p>A Next.js UI over that contract, with the data layer in a core package. Shared with the TypeScript ecosystem. <a href="https://github.com/vintasoftware/vintasend-templates-management-dashboard" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+    </div>
+    <div class="cards four" data-only="ts">
+      <div class="card reveal"><h3>vintasend-managed-templates</h3><p>The template manager seam, <code>ManagedTemplateService</code>, the wrapping renderer, composition, tags and lifecycle rules. Storage-agnostic. <a href="https://github.com/vintasoftware/vintasend-ts-managed-templates" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+      <div class="card reveal d1"><h3>vintasend-medplum-template-manager</h3><p>Stores managed templates as FHIR <code>MessageDefinition</code> resources, next to the notifications that reference them. <a href="https://github.com/vintasoftware/vintasend-medplum-template-manager" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+      <div class="card reveal d2"><h3>vintasend-templates-management-api</h3><p>A REST API over a configured <code>ManagedTemplateService</code>. Mount it with <code>createApp</code> or run the command on its own. Shares its <code>openapi.yaml</code> byte for byte with the Python API. <a href="https://github.com/vintasoftware/vintasend-ts-templates-management-api" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+      <div class="card reveal d3"><h3>templates-management-dashboard</h3><p>A Next.js UI over that contract, with the data layer in a core package. Shared with the Python ecosystem. <a href="https://github.com/vintasoftware/vintasend-templates-management-dashboard" style="color:var(--accent-fg)">GitHub ↗</a></p></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ============ DASHBOARD ============ -->
+<section class="section" id="dashboard">
+  <div class="wrap">
+    <div class="split">
+      <div class="reveal">
+        <p class="kicker">The dashboard</p>
+        <h2>A write tool for the people who own the copy.</h2>
+        <p>Where the <a href={withBase("/dashboard/")} style="color:var(--accent-fg)">notifications dashboard</a> is read-mostly, this one creates templates, versions them, moves them through the lifecycle, previews what they render to and manages the tags. It is a pure client of the templates API, with the key held in its own proxy route, and it is meant to be copied: the data layer is <code class="mono">vintasend-templates-management-dashboard-core</code>, the screens are one example in Tailwind and shadcn/ui.</p>
+        <ul class="checks">
+          <li><b>Templates screen.</b> One row per version, collapsed to each key's current version by default. Source and composition side by side, status history, every version the key has had.</li>
+          <li><b>Tags screen.</b> Create, rename, archive, restore, delete. Renaming is flagged, because the slug is the identity the filters match on.</li>
+          <li><b>Ordering is gated, filtering is not.</b> The two capability namespaces default in opposite directions, so a column only becomes sortable once the backend says so, and a filter control is not drawn when it cannot be honoured.</li>
+          <li><b>Three errors it understands.</b> <code class="mono">INVALID_STATUS_TRANSITION</code>, <code class="mono">TEMPLATE_COMPOSITION_ERROR</code> and <code class="mono">PREVIEW_UNAVAILABLE</code> get their own UI instead of a generic failure.</li>
+        </ul>
+        <div class="cta-row" style="margin-top:22px">
+          <a class="btn btn-primary" href={withBase("/docs/tools/")}>Setup guide</a>
+          <a class="btn" href="https://github.com/vintasoftware/vintasend-templates-management-dashboard-core">dashboard-core ↗</a>
+        </div>
+      </div>
+      <div class="panel reveal d1">
+        <div class="panel-bar"><span class="dots"><i></i><i></i><i></i></span><span class="title">openapi.yaml · /api/v1 · port 3334</span></div>
+        <div class="endpoints">
+          <div class="ep"><span class="m">GET</span><span class="p">/templates<span>one row per key by default</span></span></div>
+          <div class="ep"><span class="m post">POST</span><span class="p">/templates<span>first version, in draft</span></span></div>
+          <div class="ep"><span class="m post">POST</span><span class="p">/templates/&#123;key&#125;/versions<span>the edit: a new version from the latest</span></span></div>
+          <div class="ep"><span class="m">GET</span><span class="p">/templates/&#123;key&#125;/composition<span>what the engine receives</span></span></div>
+          <div class="ep"><span class="m post">POST</span><span class="p">/templates/&#123;key&#125;/preview<span>render against a supplied context</span></span></div>
+          <div class="ep"><span class="m post">POST</span><span class="p">/templates/&#123;key&#125;/activate<span>also deactivate, archive, status</span></span></div>
+          <div class="ep"><span class="m">GET</span><span class="p">/templates/&#123;key&#125;/status-history<span>the audit trail</span></span></div>
+          <div class="ep"><span class="m put">PUT</span><span class="p">/templates/&#123;key&#125;/tags<span>replace one version's tags</span></span></div>
+          <div class="ep"><span class="m del">DEL</span><span class="p">/templates/&#123;key&#125;/versions/&#123;v&#125;<span>never-published only; 409 otherwise</span></span></div>
+          <div class="ep"><span class="m">GET</span><span class="p">/tags<span>plus create, rename, archive, restore, delete</span></span></div>
+          <div class="ep"><span class="m">GET</span><span class="p">/capabilities<span>what the backend can filter and sort by</span></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ BIG CTA ============ -->
+<section class="section tight">
+  <div class="wrap">
+    <div class="big-cta reveal">
+      <h2>Wrap the renderer. Move the templates. Nothing else changes.</h2>
+      <p>The notification service, the adapters and the backend stay exactly as they are. A key replaces a path, and the copy stops being a deploy.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" data-only="py" href="https://pypi.org/project/vintasend-managed-templates/">pip install vintasend-managed-templates</a>
+        <a class="btn btn-primary" data-only="ts" href="https://www.npmjs.com/package/vintasend-managed-templates">npm install vintasend-managed-templates</a>
+        <a class="btn" href={withBase("/docs/template-versioning/")}>Template versions guide</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</Base>

@@ -2,6 +2,10 @@
 
 A flexible package for implementing transactional notifications in Python projects.
 
+**Website and docs:** <https://vintasoftware.github.io/vintasend/> covers this package and its
+TypeScript sibling, [vintasend-ts](https://github.com/vintasoftware/vintasend-ts), with a language
+switch for the examples. The source lives in [`docs/`](docs/README.md).
+
 ## Features
 * **Storing notifications in a Database**: This package relies on a data store to record all the notifications that will be sent. It also keeps it's state column up to date.
 * **Scheduling notifications**: Storing notifications to be send in the future. The notification's context for rendering the template is only evaluated at the moment the notification is sent due to the lib's context generation registry.

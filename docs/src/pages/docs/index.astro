@@ -1,0 +1,16 @@
+---
+// /docs/ is the first page of the sidebar, served at its own URL too.
+import { render } from "astro:content";
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import { getOrderedDocs } from "../../lib/docs";
+import Py from "../../components/Py.astro";
+import Ts from "../../components/Ts.astro";
+import Sw from "../../components/Sw.astro";
+import Callout from "../../components/Callout.astro";
+
+const [entry] = await getOrderedDocs();
+const { Content } = await render(entry);
+---
+<DocsLayout entry={entry}>
+  <Content components={{ Py, Ts, Sw, Callout }} />
+</DocsLayout>

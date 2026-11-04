@@ -1,0 +1,282 @@
+---
+title: Template versions and managed templates
+description: Pin a notification to a template version, record which version rendered, and move templates out of files into a versioned store with a publishing lifecycle.
+section: Guides
+order: 26
+---
+
+<Callout kind="tip" title="Overview first?">
+The [managed templates page](/vintasend/managed-templates/) is the short version: the lifecycle, composition and the packages involved, with the dashboard on top. This page is the reference for pinning and versions.
+</Callout>
+
+A template on disk has no version. Editing it changes what every notification renders, past and future, and nothing records which wording a notification went out with. A renderer that reads from a **versioned store** keeps every edit as a new version, and that makes two questions answerable: *which version should this notification render*, and *which version did it actually go out with*.
+
+Two fields on every notification (regular and one-off) hold the answers:
+
+| Field | Set by | Means |
+|---|---|---|
+| <Sw py="requested_template_version" ts="requestedTemplateVersion" /> | the caller, or the service at create time | Render this exact version. Unset means "whatever is current at send time". |
+| <Sw py="used_template_version" ts="usedTemplateVersion" /> | the service, at send time | The version the renderer reported it actually used. Read-only to callers. |
+
+With a renderer whose templates are not versioned, which is most of them, both stay unset and nothing on this page applies. The second half of the page covers `vintasend-managed-templates`, the renderer that makes them mean something.
+
+## Pinning a single notification
+
+Pass the version and it is used, whatever the service is configured with. The same field repoints an existing notification through an update.
+
+<Py>
+
+```python
+service.create_notification(
+    user_id=user.id,
+    notification_type="EMAIL",
+    title="Welcome",
+    body_template="welcome",          # a template key, not a path
+    context_name="welcome_context",
+    context_kwargs={"user_id": user.id},
+    requested_template_version=3,     # render v3, now and forever
+)
+
+service.update_notification(notification.id, requested_template_version=4)
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.createNotification({
+  userId: user.id,
+  notificationType: 'EMAIL',
+  title: 'Welcome',
+  bodyTemplate: 'welcome',          // a template key, not a path
+  contextName: 'welcomeContext',
+  contextParameters: { userId: user.id },
+  sendAfter: null,
+  subjectTemplate: null,
+  extraParams: null,
+  requestedTemplateVersion: 3,      // render v3, now and forever
+});
+
+await vintasend.updateNotification(notificationId, { requestedTemplateVersion: 4 });
+```
+
+</Ts>
+
+## Pinning without naming a version
+
+<Sw py="pin_template_versions" ts="pinTemplateVersions" /> resolves whatever version is current *now* and records it as the requested version, so a later edit to the template cannot change what an already-recorded notification renders. Ask for it per call, or set it as the service default and override it where it does not apply.
+
+<Py>
+
+```python
+# Per call
+service.create_notification(..., body_template="welcome", pin_template_versions=True)
+service.update_notification(notification.id, body_template="farewell", pin_template_versions=True)
+
+# As the service default, with a per-call override
+service = NotificationService(
+    notification_adapters=[...],
+    notification_backend=backend,
+    pin_template_versions=True,
+)
+service.create_notification(..., pin_template_versions=False)   # not this one
+```
+
+</Py>
+
+<Ts>
+
+Every create and update takes an options object after the notification argument:
+
+```typescript
+// Per call
+await vintasend.createNotification({ /* ... */ bodyTemplate: 'welcome' }, { pinTemplateVersions: true });
+await vintasend.updateNotification(notificationId, { bodyTemplate: 'farewell' }, { pinTemplateVersions: true });
+
+// As the service default, with a per-call override
+const vintasend = new VintaSendFactory<Config>().create({
+  adapters,
+  backend,
+  logger,
+  contextGeneratorsMap,
+  options: { raiseErrorOnFailedSend: false, pinTemplateVersions: true },
+});
+await vintasend.createNotification(input, { pinTemplateVersions: false }); // not this one
+```
+
+</Ts>
+
+The default is **off**, because turning it on changes what an existing deployment sends: unpinned, a notification scheduled for next week renders whatever the template says next week, which is sometimes exactly what a team wants. The flag is never stored. It decides what the requested version is set to at that moment, and nothing afterwards consults it.
+
+- **The call wins over the service.** A per-call value overrides the service default in both directions; leave it out to defer to the service.
+- **An explicit version wins over both.** The flag only decides what happens when the caller does not name a version, on create and on update alike.
+- **Resolved through the renderer.** The service asks the renderer configured for that notification type, via <Sw py="get_latest_template_version(template_key)" ts="getLatestTemplateVersion(templateKey)" />. The base implementation returns <Sw py="None" ts="null" />, so with a file-based renderer the flag has nothing to pin and quietly does nothing.
+- **Best-effort.** A renderer that fails while resolving is logged and the notification is created unpinned rather than failing the write. An unpinned notification still sends.
+- **Updates re-pin only when the template changes.** An update carrying a new <Sw py="body_template" ts="bodyTemplate" /> is re-pinned to that template's current version; an update to the title leaves an existing pin exactly as it was. Silently moving a pin forward is the one thing pinning exists to prevent.
+
+## Recording what rendered
+
+At send time the renderer reports the version it used on the payload it returns, the adapter hands that back from `send()`, and the service stores it.
+
+<Py>
+
+```python
+notification = service.get_notification(notification_id)
+notification.requested_template_version   # 3 -- what it asked for, or None
+notification.used_template_version        # 3 -- what rendered
+```
+
+Passing `used_template_version` to `update_notification` raises `UsedTemplateVersionReassignmentError`.
+
+</Py>
+
+<Ts>
+
+```typescript
+const notification = await vintasend.getNotification(notificationId);
+notification.requestedTemplateVersion; // 3 — what it asked for, or absent
+notification.usedTemplateVersion;      // 3 — what rendered
+```
+
+Passing `usedTemplateVersion` to `updateNotification` throws.
+
+</Ts>
+
+On an unpinned notification the used version is the *only* record of which version went out, since the template has moved on by the time anyone asks.
+
+- **System-managed.** Only the service writes it, at send time. Set the requested version to change what renders.
+- **Never blocks a send.** It is written after delivery, so a failure to record it is logged and the notification stays `SENT`.
+- **A pin covers the template named, not what that template builds on.** With a renderer that composes templates from other templates, pinning a notification to v3 of `welcome` renders v3 of `welcome`, but a base it extends without naming a version still resolves to whatever that base is today. Pin the reference too (`version=2` on the `managed_extends` tag, below) when a template must keep composing against an exact parent.
+
+## Managed templates
+
+A template renderer reads from wherever its engine looks, usually files on disk, so every copy change is a deploy. `vintasend-managed-templates` ([Python](https://github.com/vintasoftware/vintasend-managed-templates), [TypeScript](https://github.com/vintasoftware/vintasend-ts-managed-templates)) moves templates into a data store: someone who is not a developer edits them, every edit is a new version, and a version is published deliberately rather than the moment it is saved. The two packages agree on the tag language, the slug rules and the filter vocabulary, so a store written by one is readable by the other.
+
+The package is storage-agnostic. It defines its own seam, a **template manager backend**, and adds four things on top of it:
+
+- **Versioning.** A write creates the next version and leaves the previous one untouched, so a notification that went out against v1 renders v1 forever. A version is never edited in place.
+- **A lifecycle with an audit trail.** `draft → active → inactive → archived`, every move recorded. A draft is never sent: an unpinned send renders the key's newest **active** version, and a pinned notification renders its version whatever that version's status is today. Only a version that was never published can be deleted.
+- **Composition.** Stored templates reach the engine as source, so the engine's own `extends` and `include` have nothing to load. The package resolves its own tags against the store *before* the engine runs and hands it one flat string: `managed_extends` (one per template; pin the parent with `version=2`), `managed_children` (the hole in a base where the child's content goes), `managed_block` / `managed_endblock` (a named region a child may replace), `managed_super` (inside a child's block, the content it overrides) and `managed_include` (splice another template in, pinnable the same way). A template that declares a `managed_children` hole, or blocks without extending anything, is abstract: a base to build on rather than one to send.
+- **Tags and filtering**, spelled the same way the library spells its notification filters.
+
+To send through it, wrap a renderer and set the notification's <Sw py="body_template" ts="bodyTemplate" /> to a template **key** instead of a path. Nothing else about creating or sending notifications changes, and <Sw py="pin_template_versions" ts="pinTemplateVersions" /> now has something to pin: the key's newest active version.
+
+<Py>
+
+```python
+from vintasend_managed_templates.managed_template_renderer import ManagedTemplateEmailRenderer
+from vintasend_managed_templates.managed_template_service import ManagedTemplateService
+from vintasend_django_templates_manager.django_templates_manager import DjangoTemplateManager
+
+manager_backend = DjangoTemplateManager()
+renderer = ManagedTemplateEmailRenderer(manager_backend, inner_renderer)  # wraps any email renderer
+templates = ManagedTemplateService(manager_backend, renderer)
+
+notification_service = NotificationService(
+    notification_adapters=[MyEmailAdapter(template_renderer=renderer, backend=notification_backend)],
+    notification_backend=notification_backend,
+)
+
+notification_service.create_notification(
+    user_id=user.id,
+    notification_type="EMAIL",
+    title="Welcome",
+    body_template="welcome",   # a managed template key, not a file path
+    context_name="welcome_context",
+    context_kwargs={"user_id": user.id},
+)
+```
+
+Pass the renderer as a live instance, not a dotted import string: it takes a backend and an inner renderer as constructor arguments, which a string path cannot supply. The inner renderer receives template **source** in the field where it normally expects a name, so a renderer that resolves names through a loader (`JinjaTemplatedEmailRenderer`, `DjangoTemplatedEmailRenderer`) needs a loader that accepts source; for Jinja that is `Environment(loader=FunctionLoader(lambda source: source))`. `ManagedTemplateSMSRenderer` is the SMS twin. Everything in the package is synchronous, because both seams it composes are.
+
+The storage side is [vintasend-django-templates-manager](https://github.com/vintasoftware/vintasend-django-templates-manager): `DjangoTemplateManager`, the `ManagedTemplate` / `ManagedTemplateStatusRecord` models, and an admin for the people who edit the copy. [vintasend-templates-management-api](https://github.com/vintasoftware/vintasend-templates-management-api) is a django-ninja REST API over the same seam.
+
+</Py>
+
+<Ts>
+
+```typescript
+import { LiquidEmailTemplateRendererFactory } from 'vintasend-liquidjs';
+import { ManagedTemplateEmailRenderer, ManagedTemplateService } from 'vintasend-managed-templates';
+import { MedplumTemplateManagerBackend } from 'vintasend-medplum-template-manager';
+
+const managerBackend = new MedplumTemplateManagerBackend(medplum);
+const liquidRenderer = new LiquidEmailTemplateRendererFactory<Config>().create({
+  renderLimit: 1_000, // milliseconds: an edited template cannot make a send hang
+  strictFilters: true,
+});
+const renderer = new ManagedTemplateEmailRenderer<Config>(managerBackend, liquidRenderer);
+const templates = new ManagedTemplateService<Config>(managerBackend, renderer);
+
+await vintasend.createNotification({
+  // ...
+  bodyTemplate: 'welcome', // a managed template key, not a file path
+});
+```
+
+Every payload carries `allowedTransitions`, so a UI never has to discover the lifecycle rules by catching errors.
+
+The storage side is [vintasend-medplum-template-manager](https://github.com/vintasoftware/vintasend-medplum-template-manager), which stores managed templates as FHIR `MessageDefinition` resources alongside the notifications that reference them. [vintasend-templates-management-api](https://github.com/vintasoftware/vintasend-ts-templates-management-api) is a REST API over a configured `ManagedTemplateService`, sharing its `openapi.yaml` byte for byte with the Python one.
+
+<Callout kind="warning" title="Wrap a renderer whose engine cannot run code">
+A managed template is source that anyone who can edit templates hands straight to the engine. Liquid evaluates expressions and filters only. Pug compiles a template to JavaScript and runs it, so with Pug, editing a template is running code on the server. Keep `vintasend-pug` for templates that live in your repository and wrap `vintasend-liquidjs` for managed ones.
+</Callout>
+
+</Ts>
+
+## Rendering historical template content
+
+For a preview or an audit trail you sometimes need to reproduce how a notification rendered with template content you have on hand (a version stored alongside the notification, or a file at a known past revision), without touching the notification's current templates and without sending or persisting anything. The service exposes that as a read-shaped operation on the email renderer.
+
+<Py>
+
+```python
+from vintasend.services.notification_template_renderers.base_templated_email_renderer import (
+    EmailTemplateContent,
+)
+
+notification = service.get_notification(notification_id)
+
+historical = EmailTemplateContent(
+    subject_template="Your order {{ order_id }} has shipped",
+    body_template="<p>Hi {{ first_name }}, your order is on its way.</p>",
+    preheader_template="Your order is on its way",   # optional; Python only
+)
+
+email = service.render_email_template_from_content(
+    notification,
+    historical,
+    notification.context_used,   # the context it actually rendered with, verbatim
+)
+email.subject, email.body, email.preheader
+```
+
+No context is generated: the context you pass is used as is, typically the notification's stored `context_used`. It raises `NotificationRenderError` if the notification's type has no email adapter, or the adapter's renderer is not a `BaseTemplatedEmailRenderer`. `AsyncIONotificationService.render_email_template_from_content` is the same signature, awaited.
+
+</Py>
+
+<Ts>
+
+```typescript
+const notification = await vintasend.getNotification(notificationId);
+
+const email = await vintasend.renderEmailTemplateFromContent(
+  notification,
+  {
+    subject: 'Your order {{ orderId }} has shipped',
+    body: '<p>Hi {{ firstName }}, your order is on its way.</p>',
+  },
+  { context: notification.contextUsed }, // the context it actually rendered with
+);
+email.subject;
+email.body;
+```
+
+The third argument is either `{ context }` (used verbatim) or `{ contextName, contextParameters }`, in which case the service runs the named context generator first. It throws if no adapter is configured for the notification's type, or if that adapter's renderer does not implement `renderFromTemplateContent`.
+
+</Ts>
+
+<Callout kind="warning" title="Template content is an injection surface">
+The content is rendered as is through the configured renderer. Only pass template content sourced from your own application's history, never a string a user typed in. Autoescaping in the engine is a mitigation, not a substitute for keeping the template source trusted.
+</Callout>

@@ -1,0 +1,311 @@
+---
+title: Official implementations
+description: Every official backend, adapter, renderer, attachment manager, queue service, template manager and logger package, with what it provides and how to install it.
+section: Ecosystem
+order: 30
+---
+
+The core library ships none of its seams. Each one is a separate package you install next to <Sw py="vintasend" ts="vintasend" />, and each is released on its own cycle against a version range of the core. This page lists the official ones. Every package is a reference implementation as well as a product: when you write your own, read the closest one first.
+
+<Py>
+
+Every Python package below pins an exact `vintasend` version in its `pyproject.toml`, so upgrading the core means upgrading the packages with it. Install them with `pip install <name>` or `poetry add <name>`.
+
+</Py>
+
+<Ts>
+
+Every TypeScript package below declares `vintasend` as a peer dependency. Install the package with `npm install <name>` and keep `vintasend` itself on the same release line. Several repositories carry a `vintasend-ts-` prefix on GitHub while the package keeps the shorter name; the links below are the repositories.
+
+</Ts>
+
+## Backends
+
+A backend persists notifications and answers every query the service makes: pending and future sends, in-app listings, filtering, read marking, attachment rows.
+
+<Py>
+
+- **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)** — `DjangoDbNotificationBackend` stores notifications through the Django ORM, with `Notification`, `AttachmentFileRecord` and `NotificationAttachment` models and migrations. It implements the full backend contract, including the in-app listing methods (`filter_in_app_unread_notifications`, `filter_all_in_app_notifications`, the two counters) and the idempotent, user-scoped `mark_sent_as_read_bulk`. Django 4.2 to 6.1.
+
+  ```bash
+  pip install vintasend-django
+  ```
+
+- **[vintasend-sqlalchemy](https://github.com/vintasoftware/vintasend-sqlalchemy/)** — `SQLAlchemyNotificationBackend` (sync) and `SQLAlchemyAsyncIONotificationBackend` (AsyncIO), each taking a `sessionmaker` or `async_sessionmaker` plus your `GenericNotification` subclass. It persists the full 2.x contract (one-off notifications, `filter_notifications`, `tenant`, `git_commit_sha`, bulk read) and the template-version fields, and ships Alembic helper operations (`create_notification_table`, `upgrade_notification_table_to_2_0`, `upgrade_notification_table_to_2_1`, `create_attachment_tables`) with matching downgrades. SQLAlchemy 2.0+.
+
+  ```bash
+  pip install vintasend-sqlalchemy
+  ```
+
+</Py>
+
+<Ts>
+
+- **[vintasend-prisma](https://github.com/vintasoftware/vintasend-ts-prisma/)** — stores notifications through Prisma Client, against models you add to your own Prisma schema.
+
+  ```bash
+  npm install vintasend-prisma
+  ```
+
+- **[vintasend-medplum](https://github.com/vintasoftware/vintasend-medplum/)** — stores notifications as FHIR resources (`Communication`, with `Binary` and `Media` for attachments) on a Medplum server, for healthcare applications. The same package also provides an adapter, an attachment manager and a logger, listed below.
+
+  ```bash
+  npm install vintasend-medplum
+  ```
+
+</Ts>
+
+## Adapters
+
+An adapter delivers one notification type. It receives the notification and its generated context, asks its renderer for a body, and hands the result to a provider.
+
+<Py>
+
+- **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)** — `DjangoEmailNotificationAdapter` sends email through Django's built-in mail backend (`django.core.mail`). This is the adapter the Django default settings point at.
+
+- **[vintasend-flask-mail](https://github.com/vintasoftware/vintasend-flask-mail/)** — `FlaskMailNotificationAdapter` sends email through Flask-Mail. It is a sync adapter and requires a `flask_app` keyword argument holding the Flask application; construction raises `ValueError` without it.
+
+  ```bash
+  pip install vintasend-flask-mail
+  ```
+
+- **[vintasend-fastapi-mail](https://github.com/vintasoftware/vintasend-fastapi-mail/)** — `FastAPIMailNotificationAdapter` is an AsyncIO adapter that sends email through FastAPI-Mail (1.6.6 or later), for `AsyncIONotificationService`.
+
+  ```bash
+  pip install vintasend-fastapi-mail
+  ```
+
+- **[vintasend-twilio](https://github.com/vintasoftware/vintasend-twilio/)** — `TwilioSMSNotificationAdapter` (sync) and `TwilioAsyncIOSMSNotificationAdapter` (AsyncIO) send `SMS` notifications through Twilio's Messages API. They take any `BaseTemplatedSMSRenderer`; credentials and sender (`account_sid`, `auth_token`, `from_phone_number` or `messaging_service_sid`) come from keyword arguments or the `TWILIO_*` environment variables, and a missing one raises `TwilioConfigurationError` at construction rather than on the first send. A regular notification's recipient number is read from the generated context under `phone_number` (configurable with `phone_number_context_key`); a one-off notification carries its own.
+
+  ```bash
+  pip install vintasend-twilio
+  ```
+
+- **[vintasend-celery](https://github.com/vintasoftware/vintasend-celery/)** — not a delivery adapter, despite the README's historical listing. It is the queue service and task factories that let a `BackgroundNotificationAdapter` of your own deliver from a Celery worker. See **Queue services** below.
+
+</Py>
+
+<Ts>
+
+- **[vintasend-nodemailer](https://github.com/vintasoftware/vintasend-nodemailer/)** — sends email through Nodemailer, so any SMTP transport works.
+
+  ```bash
+  npm install vintasend-nodemailer
+  ```
+
+- **[vintasend-sendgrid](https://github.com/vintasoftware/vintasend-ts-sendgrid/)** — sends email through SendGrid's API, with attachment support.
+
+  ```bash
+  npm install vintasend-sendgrid
+  ```
+
+- **[vintasend-mailgun](https://github.com/vintasoftware/vintasend-ts-mailgun/)** — sends email through Mailgun's API, with attachment support.
+
+  ```bash
+  npm install vintasend-mailgun
+  ```
+
+- **[vintasend-twilio](https://github.com/vintasoftware/vintasend-ts-twilio/)** — sends `SMS` notifications through Twilio's API.
+
+  ```bash
+  npm install vintasend-twilio
+  ```
+
+- **[vintasend-medplum](https://github.com/vintasoftware/vintasend-medplum/)** — sends email through Medplum's email API, for applications already running on Medplum.
+
+</Ts>
+
+## Template renderers
+
+A renderer turns a template plus a context into the body an adapter sends. The seam has two methods: `render`, which resolves a template by the name stored on the notification, and <Sw py="render_from_template_content" ts="renderFromTemplateContent" />, which renders source handed to it directly. The second one is what managed templates use.
+
+<Py>
+
+- **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)** — `DjangoTemplatedEmailRenderer` renders subject, body and preheader through Django's template engine and loaders.
+
+- **[vintasend-jinja](https://github.com/vintasoftware/vintasend-jinja/)** — `JinjaTemplatedEmailRenderer` renders email templates with Jinja2. It is the renderer the Flask and FastAPI default settings point at.
+
+  ```bash
+  pip install vintasend-jinja
+  ```
+
+No official package ships a file-based SMS renderer. `vintasend-twilio` accepts any `BaseTemplatedSMSRenderer`, and `vintasend-managed-templates` provides `ManagedTemplateSMSRenderer` for templates kept in a store.
+
+</Py>
+
+<Ts>
+
+- **[vintasend-liquidjs](https://github.com/vintasoftware/vintasend-liquidjs/)** — renders email and SMS with LiquidJS, from template files or an in-memory template map. Liquid evaluates expressions and filters only, so it is the renderer to wrap when templates are edited by people who are not developers. Its factory takes a `renderLimit` in milliseconds and `strictFilters`.
+
+  ```bash
+  npm install vintasend-liquidjs
+  ```
+
+- **[vintasend-pug](https://github.com/vintasoftware/vintasend-pug/)** — renders email with Pug. Pug compiles a template to JavaScript and runs it, so use it only for templates in your repository, never for managed templates someone can edit.
+
+  ```bash
+  npm install vintasend-pug
+  ```
+
+- **[vintasend-react-email](https://github.com/vintasoftware/vintasend-react-email/)** — renders email with React Email, including uncompiled `.ts` and `.tsx` templates.
+
+  ```bash
+  npm install vintasend-react-email
+  ```
+
+</Ts>
+
+## Attachment managers
+
+An attachment manager owns the bytes of an attachment. The backend owns only the row describing them and an opaque `storageIdentifiers` map the manager hands back, so a backend never talks to the storage service itself. Leaving the seam unconfigured turns attachments off.
+
+<Py>
+
+- **[vintasend-aws-s3-attachments](https://github.com/vintasoftware/vintasend-aws-s3-attachments/)** — `S3AttachmentManager` and `S3AsyncIOAttachmentManager` store every uploaded file as an object in an S3 bucket through boto3, under a collision-free `<prefix>/<uuid>_<filename>` key. The handle returned by `reconstruct_attachment_file` is an `S3StoredFile` with `read()`, `stream()`, `url(expires_in=3600)` (a presigned GET URL) and `delete()`. A preconfigured client or `client_kwargs` (`endpoint_url` for MinIO or LocalStack) can be injected.
+
+  ```bash
+  pip install vintasend-aws-s3-attachments
+  ```
+
+- **[vintasend-django](https://github.com/vintasoftware/vintasend-django/)** — `DjangoAttachmentManager` keeps the bytes in a Django storage backend: `default_storage` under `notifications/attachments/` unless you pass a different `storage` or `upload_to`.
+
+- **[vintasend-sqlalchemy](https://github.com/vintasoftware/vintasend-sqlalchemy/)** — `FilesystemAttachmentManager` and `FilesystemAsyncIOAttachmentManager` write files under a base directory (`VINTASEND_ATTACHMENTS_PATH`, default `vintasend_attachments/`). Each SQLAlchemy backend defaults to one of these; configure a different manager on the service to store bytes elsewhere.
+
+</Py>
+
+<Ts>
+
+- **[vintasend-aws-s3-attachments](https://github.com/vintasoftware/vintasend-ts-aws-s3-attachments/)** — stores files in AWS S3 with presigned URLs and streaming, and works with any S3-compatible service (MinIO, DigitalOcean Spaces, Cloudflare R2).
+
+  ```bash
+  npm install vintasend-aws-s3-attachments
+  ```
+
+- **[vintasend-medplum](https://github.com/vintasoftware/vintasend-medplum/)** — FHIR-compliant storage through `Binary` and `Media` resources.
+
+The core library also ships `LocalFileAttachmentManager` under the `vintasend/local-file-attachment-manager` entry point. It writes to a directory on disk and is meant for development and tests, not production.
+
+</Ts>
+
+## Queue services
+
+A queue service is how a background adapter hands a notification id to a worker, which reloads the notification and delivers it. A service with no background adapter never needs one.
+
+<Py>
+
+Without one, `send()` on a service that has a `BackgroundNotificationAdapter` raises `NotificationQueueServiceMissingError`.
+
+</Py>
+
+<Ts>
+
+Without one, `send()` on a service whose adapter has `enqueueNotifications: true` logs an error and skips that adapter rather than throwing.
+
+</Ts>
+
+<Py>
+
+- **[vintasend-celery](https://github.com/vintasoftware/vintasend-celery/)** — `CeleryNotificationQueueService` and `AsyncIOCeleryNotificationQueueService` call `.delay(notification_id)` on a Celery task. `send_notification_task_factory` and `async_send_notification_task_factory` register the library's `send_notification` worker entry point as that task; `periodic_send_pending_notifications_task_factory` registers the scheduled drain for Celery Beat. The worker rebuilds the service from `NOTIFICATION_SERVICE_FACTORY`, so the web and worker processes must read the same `NOTIFICATION_BACKEND`.
+
+  ```bash
+  pip install vintasend-celery
+  ```
+
+</Py>
+
+<Ts>
+
+No official queue-service package is documented for TypeScript yet. The `BaseNotificationQueueService` interface is a single method, `enqueueNotification(notificationId)`, which is small enough to implement against whatever queue your application already runs.
+
+</Ts>
+
+## Template managers
+
+A template manager moves templates out of files and into a data store, so copy can change without a deploy. Every edit is a new version, and a version is published deliberately through a `draft`, `active`, `inactive`, `archived` lifecycle. The layer wraps a regular renderer rather than replacing it: a notification's <Sw py="body_template" ts="bodyTemplate" /> becomes a template key instead of a path, and nothing else about creating or sending changes. The Python and TypeScript packages agree on the tag language, the slug rules and the filter vocabulary, so a store written by one is readable by the other.
+
+<Py>
+
+- **[vintasend-managed-templates](https://github.com/vintasoftware/vintasend-managed-templates/)** — the layer itself: the `BaseTemplateManagerBackend` storage seam, `ManagedTemplateService` for creating, versioning, publishing and tagging, and `ManagedTemplateEmailRenderer` / `ManagedTemplateSMSRenderer`, which wrap any `BaseNotificationTemplateRenderer` and feed it the stored body through `render_from_template_content`. Storage-agnostic on its own; synchronous throughout, because both seams it composes are.
+
+  ```bash
+  pip install vintasend-managed-templates
+  ```
+
+- **[vintasend-django-templates-manager](https://github.com/vintasoftware/vintasend-django-templates-manager/)** — `DjangoTemplateManager` implements that storage seam with `ManagedTemplate`, `ManagedTemplateStatusRecord` and `ManagedTemplateTag` models, a Django admin, and database-side filtering and ordering (it declares all six `orderBy.*` capabilities). Only a never-published version can be deleted; status history is never deleted. Python 3.12 to 3.14, Django 4.2 to 6.0.
+
+  ```bash
+  pip install vintasend-django-templates-manager
+  ```
+
+</Py>
+
+<Ts>
+
+- **[vintasend-managed-templates](https://github.com/vintasoftware/vintasend-ts-managed-templates/)** — the layer itself: the template manager backend seam, `ManagedTemplateService`, and `ManagedTemplateEmailRenderer`, which wraps another renderer and hands it stored source. It also resolves the `managed_extends` / `managed_block` / `managed_include` composition tags against the store before the engine runs.
+
+  ```bash
+  npm install vintasend-managed-templates
+  ```
+
+- **[vintasend-medplum-template-manager](https://github.com/vintasoftware/vintasend-medplum-template-manager/)** — `MedplumTemplateManagerBackend` stores managed templates as FHIR `MessageDefinition` resources, beside the notifications that reference them.
+
+  ```bash
+  npm install vintasend-medplum-template-manager
+  ```
+
+</Ts>
+
+<Ts>
+
+## Loggers
+
+The TypeScript service requires a logger. It receives `LogMessage` values built with the `log` tagged template, whose interpolations are typed (`logId`, `logCount`, `logLabel`, `logTimestamp`, `logError`) so notification content cannot reach a log line by accident.
+
+- **[vintasend-winston](https://github.com/vintasoftware/vintasend-winston/)** — forwards the service's log entries to Winston.
+
+  ```bash
+  npm install vintasend-winston
+  ```
+
+- **[vintasend-medplum](https://github.com/vintasoftware/vintasend-medplum/)** — a console logger for Medplum applications.
+
+</Ts>
+
+<Py>
+
+There is no logger seam in Python. The service logs through the standard `logging` module, under loggers named after its modules (`vintasend.services.notification_service` and so on), so a host configures them like any other.
+
+</Py>
+
+## Picking a stack
+
+<Py>
+
+Three combinations cover most Python applications. The framework defaults in `app_settings.py` already point at the first two, so a Django or Flask host only has to install the packages.
+
+| Host | Backend | Adapter | Renderer |
+|---|---|---|---|
+| Django | `vintasend-django` | `vintasend-django` (Django mail) | `vintasend-django` |
+| Flask | `vintasend-sqlalchemy` (sync) | `vintasend-flask-mail` | `vintasend-jinja` |
+| FastAPI | `vintasend-sqlalchemy` (AsyncIO) | `vintasend-fastapi-mail` | `vintasend-jinja` |
+
+Add `vintasend-twilio` for SMS, `vintasend-aws-s3-attachments` when attachments should leave the application server, `vintasend-celery` when sends should leave the request, and `vintasend-managed-templates` plus `vintasend-django-templates-manager` when the copy is edited by someone who does not deploy.
+
+</Py>
+
+<Ts>
+
+Two combinations cover most TypeScript applications.
+
+| Stack | Backend | Adapter | Renderer | Logger |
+|---|---|---|---|---|
+| Relational database | `vintasend-prisma` | `vintasend-nodemailer`, `vintasend-sendgrid` or `vintasend-mailgun` | `vintasend-liquidjs` or `vintasend-react-email` | `vintasend-winston` |
+| Medplum end to end | `vintasend-medplum` | `vintasend-medplum` | `vintasend-liquidjs` | `vintasend-medplum` |
+
+The Medplum stack adds `vintasend-medplum-template-manager` under `vintasend-managed-templates` to keep templates in the same FHIR store as the notifications. Add `vintasend-twilio` for SMS and `vintasend-aws-s3-attachments` for attachments on either stack.
+
+</Ts>
+
+<Callout kind="tip" title="Nothing fits?">
+[Writing your own implementation](/vintasend/docs/writing-an-implementation/) walks through the seam contracts, the shipped fakes and the starter template. [Dashboard and APIs](/vintasend/docs/tools/) covers the tools built on top of these packages.
+</Callout>

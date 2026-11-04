@@ -1,0 +1,169 @@
+---
+title: Installation
+description: Install the core package, then pick a backend, an adapter and a template renderer for your stack.
+section: Getting started
+order: 2
+---
+
+The core package is deliberately incomplete. It defines the interfaces and the orchestration, and every real backend, adapter and renderer lives in a separate package. An install is therefore the core plus at least one package for each of the three required seams.
+
+## Requirements
+
+<Py>
+
+- Python 3.10 to 3.14.
+- The core depends only on `typing-extensions`, `packaging` and `requests`. Everything else comes with the implementation packages you choose.
+
+</Py>
+
+<Ts>
+
+- Node.js 20.16 or newer.
+- The core has no runtime dependencies of note. Everything else comes with the implementation packages you choose.
+
+</Ts>
+
+## Install the core
+
+<Py>
+
+```bash
+pip install vintasend
+```
+
+With Poetry, uv or pip-tools the package name is the same. Pin a version: the seams are a public contract and a new abstract method lands as a minor release with a note in the changelog, so `vintasend>=3.6,<4` is a sensible constraint.
+
+</Py>
+
+<Ts>
+
+```bash
+npm install vintasend
+```
+
+The package is published as `vintasend` on npm, with ESM output and bundled type declarations. `yarn add vintasend` and `pnpm add vintasend` work the same way.
+
+</Ts>
+
+## Pick an implementation for each seam
+
+A working service needs a **backend** (where notifications are stored), an **adapter** (how they are delivered) and a **template renderer** (how the body is produced). The [implementations page](/vintasend/docs/implementations/) lists every official package. These are the usual combinations.
+
+<Py>
+
+**Django.** One package covers all three seams: the ORM backend, an email adapter on Django's mailer and a renderer on Django's template engine.
+
+```bash
+pip install vintasend vintasend-django
+```
+
+**FastAPI.** An async SQLAlchemy backend, an AsyncIO email adapter and Jinja2 templates.
+
+```bash
+pip install vintasend vintasend-sqlalchemy vintasend-fastapi-mail vintasend-jinja
+```
+
+**Flask.** The sync SQLAlchemy backend, Flask-Mail and Jinja2.
+
+```bash
+pip install vintasend vintasend-sqlalchemy vintasend-flask-mail vintasend-jinja
+```
+
+Add-ons: `vintasend-twilio` for SMS, `vintasend-aws-s3-attachments` to store attachments in S3, `vintasend-celery` to deliver through Celery on a sync backend, and `vintasend-managed-templates` plus `vintasend-django-templates-manager` to keep templates in the database.
+
+</Py>
+
+<Ts>
+
+**Prisma + SMTP.** The Prisma backend, Nodemailer for delivery, LiquidJS templates and a Winston logger.
+
+```bash
+npm install vintasend vintasend-prisma vintasend-nodemailer vintasend-liquidjs vintasend-winston
+```
+
+**Transactional email APIs.** Swap the adapter for `vintasend-sendgrid` or `vintasend-mailgun`; both support attachments. `vintasend-twilio` adds SMS.
+
+**Medplum.** One package stores notifications as FHIR resources, sends through Medplum's email API, stores attachments as `Binary` resources and ships a console logger.
+
+```bash
+npm install vintasend vintasend-medplum vintasend-liquidjs
+```
+
+Add-ons: `vintasend-aws-s3-attachments` for S3 or any S3-compatible store, `vintasend-react-email` or `vintasend-pug` as alternative renderers, and `vintasend-managed-templates` plus a manager backend to keep templates in the database.
+
+</Ts>
+
+## Configure the service
+
+<Py>
+
+The service takes its pieces as constructor arguments. Each can be an instance or a dotted import string, and the three required ones can also come from settings, so a Django project can configure everything in `settings.py` and build the service with no arguments at all.
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+service = NotificationService(
+    notification_adapters=[
+        "vintasend_django.services.notification_adapters.django_email.DjangoEmailNotificationAdapter",
+    ],
+    notification_backend="vintasend_django.services.notification_backends.django_db_notification_backend.DjangoDbNotificationBackend",
+)
+```
+
+Settings are read from the host framework (Django, Flask, or a `config` object you pass for FastAPI), with an environment variable of the same name taking precedence. The [configuration page](/vintasend/docs/configuration/) lists every `NOTIFICATION_*` setting.
+
+</Py>
+
+<Ts>
+
+There is no settings layer: every piece is constructed in code and handed to `VintaSendFactory`. The generic `NotificationTypeConfig` ties the context generator map and the id types together so the service, backend and adapters agree on them.
+
+```typescript
+import { VintaSendFactory } from 'vintasend';
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [adapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+});
+```
+
+The [configuration page](/vintasend/docs/configuration/) covers every option the factory accepts.
+
+</Ts>
+
+## Verify the install
+
+<Py>
+
+The core ships fakes for every seam, so you can check that a service builds and sends before any real package is wired in. The fake backend writes to a JSON file and the fake email adapter records what it would have sent.
+
+```python
+from vintasend.services.notification_service import NotificationService
+from vintasend.services.notification_backends.stubs.fake_backend import FakeFileBackend
+from vintasend.services.notification_adapters.stubs.fake_adapter import FakeEmailAdapter
+from vintasend.services.notification_template_renderers.stubs.fake_templated_email_renderer import (
+    FakeTemplateRenderer,
+)
+
+backend = FakeFileBackend(database_file_name="notifications.json")
+service = NotificationService(
+    notification_adapters=[FakeEmailAdapter(FakeTemplateRenderer(), backend)],
+    notification_backend=backend,
+)
+```
+
+The same fakes are what the test suite runs against, and they double as reference implementations when you [write your own](/vintasend/docs/writing-an-implementation/).
+
+</Py>
+
+<Ts>
+
+A quick way to check that the pieces compile together is to build the service with `LocalFileAttachmentManager` and your real backend and adapter, then call `createNotification` with `sendAfter` in the future so nothing is delivered. The notification shows up in `getPendingNotifications(0, 10)`; cancel it with `cancelNotification` afterwards. The [quick start](/vintasend/docs/quickstart/) walks through the full setup.
+
+</Ts>
+
+<Callout kind="note" title="Fakes and stubs are part of the product">
+Both libraries ship a working fake for every seam. Downstream authors read them as the reference implementation, and the test suites run against them, so they are kept complete rather than left as stubs that throw.
+</Callout>

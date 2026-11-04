@@ -1,0 +1,59 @@
+---
+import Base from "./Base.astro";
+import LangToggle from "../components/LangToggle.astro";
+import { getOrderedDocs, groupBySection, type DocEntry } from "../lib/docs";
+import { withBase, GITHUB_PY } from "../lib/urls";
+
+interface Props { entry: DocEntry }
+const { entry } = Astro.props;
+
+const docs = await getOrderedDocs();
+const groups = groupBySection(docs);
+const index = docs.findIndex((d) => d.id === entry.id);
+const prev = index > 0 ? docs[index - 1] : null;
+const next = index < docs.length - 1 ? docs[index + 1] : null;
+const href = (d: DocEntry) => withBase(`/docs/${d.id}/`);
+const editUrl = `${GITHUB_PY}/edit/main/docs/src/content/docs/${entry.id}.mdx`;
+---
+<Base title={`${entry.data.title} · VintaSend docs`} description={entry.data.description} current="docs">
+  <div class="wrap docs">
+    <aside class="sidebar" aria-label="Documentation">
+      {groups.map((g) => (
+        <>
+          <h5>{g.section}</h5>
+          <ul>
+            {g.pages.map((d) => (
+              <li><a class:list={{ on: d.id === entry.id }} href={href(d)} aria-current={d.id === entry.id ? "page" : undefined}>{d.data.title}</a></li>
+            ))}
+          </ul>
+        </>
+      ))}
+    </aside>
+
+    <article>
+      <button class="btn docs-menu-btn" type="button" data-docs-menu aria-controls="docs-sidebar" style="margin-bottom:16px">☰ All pages</button>
+      <header class="doc-head">
+        <p class="kicker">{entry.data.section}</p>
+        <h1>{entry.data.title}</h1>
+        <p class="lede">{entry.data.description}</p>
+        <div class="doc-lang">
+          <span>Showing examples for</span>
+          <LangToggle />
+        </div>
+      </header>
+      <div class="prose">
+        <slot />
+      </div>
+      <nav class="doc-foot" aria-label="Previous and next page">
+        {prev && <a href={href(prev)}><span>Previous</span><b>{prev.data.title}</b></a>}
+        {next && <a class="next" href={href(next)}><span>Next</span><b>{next.data.title}</b></a>}
+      </nav>
+      <p class="doc-edit">Found a mistake? <a href={editUrl}>Edit this page on GitHub</a>.</p>
+    </article>
+
+    <aside class="toc" data-toc aria-label="On this page">
+      <h5>On this page</h5>
+      <ul></ul>
+    </aside>
+  </div>
+</Base>

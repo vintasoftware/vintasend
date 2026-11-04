@@ -1,0 +1,185 @@
+---
+title: Architecture
+description: The service at the centre, the three required seams, the optional seams, and how implementations are injected.
+section: Concepts
+order: 10
+---
+
+The library is one service class surrounded by interfaces it does not implement. The service owns the orchestration: it records a notification, decides when it is due, generates its context, asks an adapter to deliver it and writes the outcome back. Everything that touches a database, a file, a mail server or a message broker sits behind a *seam*: an abstract interface with a small contract, implemented by a separate package or by your own code.
+
+<Py>
+
+The service is `NotificationService` in `vintasend.services.notification_service`. Seams are abstract base classes under `vintasend.services`, one package per seam, each with a `base.py` and a `stubs/` directory holding a working fake.
+
+</Py>
+
+<Ts>
+
+The service is the `VintaSend` class, built through `VintaSendFactory` from the `vintasend` package. Seams are TypeScript interfaces under `src/services`, one folder per seam, and every module is generic over one `NotificationTypeConfig` described below.
+
+</Ts>
+
+## The required seams
+
+Without one of each, the service cannot record, render or deliver anything.
+
+| Seam | Responsibility | Base |
+|---|---|---|
+| Backend | Persist, query and update notification records; mark them sent, failed, read or cancelled; store the context used | `BaseNotificationBackend` |
+| Adapter | Deliver one rendered notification over one channel (email, SMS, push, in-app) | `BaseNotificationAdapter` |
+| Template renderer | Turn a template reference plus a context into a sendable body (and subject, for email) | `BaseNotificationTemplateRenderer` |
+
+An adapter owns a renderer: the service hands the adapter a notification and a context, and the adapter asks its renderer for the body before delivering it. One adapter serves one notification type, and the service refuses two adapters that declare the same type.
+
+<Py>
+
+```python
+from vintasend.services.notification_backends.base import BaseNotificationBackend
+from vintasend.services.notification_adapters.base import BaseNotificationAdapter
+from vintasend.services.notification_template_renderers.base import BaseNotificationTemplateRenderer
+```
+
+Adapters are generic over the other two, `BaseNotificationAdapter(Generic[B, T], ABC)`, where `B` is the backend type and `T` the renderer type. Each base class declares its contract with `@abstractmethod`, so a subclass missing a method fails with `TypeError` the moment it is constructed, not the first time the method is called. Raising `DuplicateNotificationAdapterError` is how the service rejects two adapters of the same type.
+
+</Py>
+
+<Ts>
+
+```typescript
+import type {
+  BaseNotificationBackend,
+  BaseNotificationAdapter,
+  BaseNotificationTemplateRenderer,
+} from 'vintasend';
+```
+
+These are interfaces, not classes, so an implementation is any object with the right shape. An adapter carries a `key` (its identifier, stored on the record as the adapter used), a `notificationType` and an `enqueueNotifications` flag; the flag marks it as a background adapter whose delivery runs in a worker. The factory throws if two adapters declare the same `notificationType`.
+
+</Ts>
+
+## The optional seams
+
+Each optional seam gates a feature. No default ships, so leaving one unconfigured turns the feature off.
+
+| Seam | Unset means |
+|---|---|
+| Attachment manager | Attachments are unsupported. The service never injects one into the backend, so a notification created with attachments has nowhere to store them |
+| Queue service | A background adapter has nothing to enqueue to. <Sw py="send" ts="send" /> logs the problem and skips that adapter (raises when configured to) |
+| Replication queue service | Queued replication to additional backends falls back to inline replication |
+| Git commit SHA provider | No commit SHA is ever resolved or written; the field stays empty on every record |
+
+Each has a guide: [attachments](/vintasend/docs/attachments/), [background sending](/vintasend/docs/background-sending/), [multiple backends](/vintasend/docs/multi-backend/) and [git commit SHA tracking](/vintasend/docs/git-commit-sha/).
+
+<Py>
+
+In Python these are `BaseAttachmentManager`, `BaseNotificationQueueService`, `BaseNotificationReplicationQueueService` and `BaseGitCommitShaProvider`, each in its own package under `vintasend.services`. The queue service is the one optional seam that does not fail silently: with a background adapter configured and no queue service, `send()` raises `NotificationQueueServiceMissingError` when `raise_on_failed_send=True`, and logs an error otherwise. A queue service that *is* configured but cannot be imported or instantiated raises `NotificationQueueServiceResolutionError` at construction time rather than being treated as unset.
+
+</Py>
+
+<Ts>
+
+In TypeScript these are `BaseAttachmentManager`, `BaseNotificationQueueService`, `BaseNotificationReplicationQueueService` and `BaseGitCommitShaProvider`. There is a fifth seam with no Python counterpart: the **logger**. `BaseLogger` has `info`, `error` and `warn`, each taking a `LogMessage` built with the `log` tagged template rather than a plain string, so a logger only ever receives ids, counts, labels, timestamps and reduced errors. It is required, not optional; `vintasend-winston` is the official implementation. Python has no logger seam because it writes to the standard `logging` module.
+
+</Ts>
+
+## How implementations are injected
+
+<Py>
+
+Every seam accepts three forms, resolved in this order:
+
+1. **An instance.** Used as is.
+2. **A dotted import string** such as `"myapp.notifications.MyBackend"`. The class is imported and instantiated with no arguments (the backend also accepts `notification_backend_kwargs`).
+3. **Nothing.** The matching `NOTIFICATION_*` setting is read, and the import string found there is resolved as in form 2.
+
+```python
+from vintasend.services.notification_service import NotificationService
+
+service = NotificationService(
+    notification_backend=backend,                                  # an instance
+    notification_adapters=[DjangoEmailAdapter(renderer, backend)], # instances
+    attachment_manager="myapp.attachments.S3AttachmentManager",    # an import string
+    # notification_queue_service left out: NOTIFICATION_QUEUE_SERVICE is read
+)
+```
+
+Adapters given as settings or import strings are pairs of `(adapter_import_string, renderer_import_string)`; either element may itself be a `(import_string, kwargs_dict)` tuple when the class needs constructor arguments. The service constructs the renderer, then the adapter, and hands the adapter the same backend it uses itself. The [configuration](/vintasend/docs/configuration/) page lists every setting.
+
+### Sync and AsyncIO services
+
+Almost every piece exists twice. `NotificationService` is synchronous; `AsyncIONotificationService` has the same constructor and the same methods as coroutines, and expects the AsyncIO twins of each seam: `AsyncIOBaseNotificationBackend`, `AsyncIOBaseNotificationAdapter`, `AsyncIOBaseAttachmentManager`, `AsyncIOBaseNotificationQueueService`, `AsyncIOBaseNotificationReplicationQueueService` and `AsyncIOBaseGitCommitShaProvider`.
+
+The renderer is the exception and has no async twin. Rendering is in-memory work with nothing to await, so both services call the same synchronous `BaseNotificationTemplateRenderer`.
+
+```python
+from vintasend.services.notification_service import AsyncIONotificationService
+
+service = AsyncIONotificationService(
+    notification_adapters=[FastAPIMailAdapter(JinjaTemplatedEmailRenderer(), backend)],
+    notification_backend=backend,
+)
+await service.create_notification(...)
+```
+
+Do not confuse `AsyncIOBaseNotificationAdapter` with `BackgroundNotificationAdapter`. The first is `async`/`await`. The second is a synchronous adapter that hands delivery to a queue service so a worker delivers later; it has an AsyncIO counterpart too, `AsyncIOBackgroundNotificationAdapter`.
+
+</Py>
+
+<Ts>
+
+Everything is passed as an instance to `VintaSendFactory.create({...})`. There is no settings layer, no import strings and no framework detection.
+
+```typescript
+import { VintaSendFactory } from 'vintasend';
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [emailAdapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+  attachmentManager,          // optional
+  queueService,               // optional
+  replicationQueueService,    // optional
+  gitCommitShaProvider,       // optional
+  additionalBackends: [],     // optional
+  options: { raiseErrorOnFailedSend: false },
+});
+```
+
+A backend that exposes `injectAttachmentManager` receives the attachment manager at construction time; a backend that does not is left alone. The [configuration](/vintasend/docs/configuration/) page lists every key and option.
+
+### The NotificationTypeConfig generic
+
+Every module, from the service to each backend, adapter and renderer, is generic over one configuration type:
+
+```typescript
+import type { BaseNotificationTypeConfig } from 'vintasend';
+
+export type NotificationTypeConfig = {
+  ContextMap: typeof contextGeneratorsMap;
+  NotificationIdType: number;
+  UserIdType: number;
+};
+```
+
+- `ContextMap` is the type of your `contextGeneratorsMap`. It makes `contextName` a union of the registered names and types `contextParameters` as the parameter of that generator's `generate`.
+- `NotificationIdType` is the type the backend uses for notification ids (a number for an autoincrement column, a string for a UUID).
+- `UserIdType` is the type of `userId` in your application.
+
+The factory, the backend factory and the adapter factory all take the same `Config` so that a notification created through the service is the same type the backend stores and the adapter receives. Define it once, next to the context map, and import it everywhere.
+
+</Ts>
+
+## What happens on a send
+
+1. The service looks up the adapters for the notification's type.
+2. For a background adapter it hands the notification id to the queue service and stops; a worker will finish the job with <Sw py="delayed_send" ts="delayedSend" />.
+3. Otherwise it calls the context generator named by the record (see [context generators](/vintasend/docs/context-registry/)).
+4. The adapter asks its renderer for the body and delivers it.
+5. The backend marks the record `SENT` or `FAILED`, and on success stores the context and adapter that were used.
+
+The [lifecycle](/vintasend/docs/lifecycle/) page covers each status, what raises and what is skipped.
+
+<Callout kind="note" title="Changing a seam is a breaking change">
+Every implementation package implements these interfaces. Adding a required method to one breaks each of them at once. If you write your own implementation, pin the library version and read the release notes before upgrading.
+</Callout>

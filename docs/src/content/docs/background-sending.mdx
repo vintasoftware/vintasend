@@ -1,0 +1,231 @@
+---
+title: Background sending
+description: Hand delivery to a worker through a queue service, so the request that creates a notification returns before anything is sent.
+section: Guides
+order: 24
+---
+
+By default the service delivers in the process that calls it: the HTTP request that creates a notification also renders the template and talks to the mail provider. Background sending moves that last part to a worker. The service enqueues **only the notification id**, returns, and a worker reloads the record from the backend, generates the context, and delivers it.
+
+Two pieces are involved: an adapter that declares it delivers in the background, and a **queue service** that knows how to enqueue an id. Nothing else about creating notifications changes.
+
+## Declaring a background adapter
+
+<Py>
+
+An adapter opts in by subclassing `BackgroundNotificationAdapter` (from `vintasend.services.notification_adapters.async_base`) instead of `BaseNotificationAdapter`, or `AsyncIOBackgroundNotificationAdapter` (from `asyncio_background_base`) for an AsyncIO adapter. The subclass has one extra abstract method, `delayed_send(notification_id)`, and it is a marker only: the service never calls it. Delivery still lives in `send()`.
+
+```python
+from vintasend.services.notification_adapters.async_base import BackgroundNotificationAdapter
+
+
+class CeleryEmailAdapter(BackgroundNotificationAdapter):
+    def send(self, notification, context):
+        # Called in the worker, after delayed_send reloads the notification.
+        email = self.template_renderer.render(notification, context)
+        self._send_email(notification.email_or_phone, email, notification.attachments)
+
+    def delayed_send(self, notification_id):
+        # Marker only. Core never calls this; delivery happens in send().
+        pass
+```
+
+Despite its module name, `async_base` has nothing to do with `async`/`await`. `BackgroundNotificationAdapter` is a sync adapter whose delivery is deferred to a worker. The `async`/`await` adapter base is `AsyncIOBaseNotificationAdapter` in `asyncio_base`, and its background twin is `AsyncIOBackgroundNotificationAdapter`. The pre-2.0 name `AsyncBaseNotificationAdapter` still imports as an alias of `BackgroundNotificationAdapter`.
+
+</Py>
+
+<Ts>
+
+An adapter declares background delivery through the third constructor argument of `BaseNotificationAdapter`, `enqueueNotifications: boolean`. The official adapter factories expose it as the second argument of `create`:
+
+```typescript
+const adapter = new MyNotificationAdapterFactory<NotificationTypeConfig>().create(
+  templateRenderer,
+  true, // enqueueNotifications: hand the id to the queue service instead of sending now
+);
+```
+
+With `true`, `send()` on the service never calls the adapter's `send()`. It enqueues the id and moves on; the adapter's `send()` runs later, inside the worker.
+
+</Ts>
+
+## The queue service
+
+The queue service is the seam between the service and whatever broker you run. It has one method, and it receives the notification id and nothing else.
+
+<Py>
+
+Implement `BaseNotificationQueueService` (or `AsyncIOBaseNotificationQueueService`) from `vintasend.services.notification_queue_services` and pass it to the service as an instance, a dotted import string, or the `NOTIFICATION_QUEUE_SERVICE` setting:
+
+```python
+from vintasend.services.notification_service import NotificationService
+from myapp.queue_services import MyQueueService
+
+service = NotificationService(
+    notification_adapters=[CeleryEmailAdapter(...)],
+    notification_backend=backend,
+    notification_queue_service=MyQueueService(),  # or "myapp.queue_services.MyQueueService"
+)
+```
+
+```bash
+export NOTIFICATION_QUEUE_SERVICE="myapp.queue_services.MyQueueService"
+```
+
+`register_queue_service(queue_service)` injects one after construction.
+
+**When a background adapter has no queue service**, `send()` logs an error and skips that adapter. With `raise_on_failed_send=True` it raises `NotificationQueueServiceMissingError` instead. An adapter that is not a background adapter never needs a queue service, so leaving `NOTIFICATION_QUEUE_SERVICE` unset is harmless until the first background adapter shows up. A queue service that raises a `NotificationError` while enqueueing is logged, or re-raised as `NotificationSendError` under `raise_on_failed_send=True`.
+
+</Py>
+
+<Ts>
+
+Implement the `BaseNotificationQueueService` interface and pass it to the factory as `queueService`:
+
+```typescript
+import type { BaseNotificationQueueService } from 'vintasend';
+
+class SqsQueueService implements BaseNotificationQueueService<NotificationTypeConfig> {
+  async enqueueNotification(notificationId: number): Promise<void> {
+    await sqs.send(new SendMessageCommand({ QueueUrl, MessageBody: String(notificationId) }));
+  }
+}
+
+const vintasend = new VintaSendFactory<NotificationTypeConfig>().create({
+  adapters: [adapter],
+  backend,
+  logger,
+  contextGeneratorsMap,
+  queueService: new SqsQueueService(),
+});
+```
+
+`registerQueueService(queueService)` injects one after construction.
+
+**When a background adapter has no queue service**, `send()` logs an error and skips that adapter. It does not throw, even with `raiseErrorOnFailedSend: true`. An enqueue that rejects is logged the same way and the notification stays `PENDING_SEND`.
+
+</Ts>
+
+## The worker
+
+The payload is an id, so the worker needs a service of its own to resolve it: the same backend, the same adapters, the same context generators as the web process.
+
+<Py>
+
+### Building the service in the worker
+
+Settings alone cannot build the service in every host (a SQLAlchemy backend needs a live session, for instance), so the worker reads `NOTIFICATION_SERVICE_FACTORY`: a dotted path to a callable that returns a ready `NotificationService` or `AsyncIONotificationService`. The factory is resolved and called **once per worker process** and the result is cached, so it must be safe to call once per process and the service it returns must be safe to reuse across tasks.
+
+```python
+# myapp/worker.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from vintasend.services.notification_service import NotificationService
+from vintasend_sqlalchemy.backends import SQLAlchemyNotificationBackend
+
+_engine = create_engine("postgresql://...")
+_SessionLocal = sessionmaker(bind=_engine)
+
+
+def notification_service_factory():
+    session = _SessionLocal()
+    backend = SQLAlchemyNotificationBackend(session)
+    return NotificationService(
+        notification_backend=backend,
+        notification_adapters=[CeleryEmailAdapter(...)],
+    )
+```
+
+```bash
+export NOTIFICATION_SERVICE_FACTORY="myapp.worker.notification_service_factory"
+```
+
+A setting that is unset, does not import, is not callable, raises, or returns something that is not a service raises `NotificationServiceFactoryError`. The worker and the web process must read the same `NOTIFICATION_BACKEND` and `NOTIFICATION_QUEUE_SERVICE`: a worker pointed at a different backend will not find the id it was handed.
+
+### Worker entrypoints
+
+`vintasend.tasks.background_tasks` ships the two functions a host registers as its queue task. Each takes the notification id and an optional explicit service, for hosts that would rather pass one than go through the factory:
+
+```python
+# Sync host (Celery example)
+from celery import Celery
+from vintasend.tasks.background_tasks import send_notification
+
+celery_app = Celery()
+celery_app.task(send_notification)
+
+# AsyncIO host
+from vintasend.tasks.background_tasks import async_send_notification
+celery_app.task(async_send_notification)
+```
+
+Both call `service.delayed_send(notification_id)`, which reloads the notification, resolves the git commit SHA if a provider is configured, generates the context at delivery time, and calls the background adapter's `send()`. Neither entrypoint raises: a failure is logged, and `delayed_send` has already marked the notification `FAILED`. `send_notification` refuses an `AsyncIONotificationService` (and `async_send_notification` a sync one) with `NotificationServiceFactoryError`, so a mismatched registration fails loudly on the first task rather than silently.
+
+Delivery is at-least-once. `delayed_send` may be called twice for the same id; a notification that is already `SENT`, `READ`, or `CANCELLED` is skipped rather than sent again, and an adapter's `send()` should tolerate the rest.
+
+### Celery
+
+[vintasend-celery](https://github.com/vintasoftware/vintasend-celery) packages the queue service and the task registration for Celery. It does not ship an adapter; delivery is still your own `BackgroundNotificationAdapter` subclass.
+
+```python
+from celery import Celery
+from vintasend.services.notification_service import NotificationService
+from vintasend_celery.services.notification_queue_services.celery_queue_service import (
+    CeleryNotificationQueueService,
+)
+from vintasend_celery.tasks.background_tasks import send_notification_task_factory
+
+celery_app = Celery("myapp", broker="redis://localhost:6379/0")
+
+# Registers vintasend's send_notification as a Celery task.
+send_notification_task = send_notification_task_factory(celery_app)
+
+service = NotificationService(
+    notification_adapters=[CeleryEmailAdapter(...)],
+    notification_backend=backend,
+    notification_queue_service=CeleryNotificationQueueService(
+        send_notification_task=send_notification_task
+    ),
+)
+```
+
+`AsyncIOCeleryNotificationQueueService` and `async_send_notification_task_factory` are the AsyncIO pair, and `periodic_send_pending_notifications_task_factory` registers the scheduled drain for Celery beat.
+
+### Attachments
+
+Attachments work on the background path without extra effort. The worker reloads the real notification from the backend, so `notification.attachments` carries the stored attachment records and their file handles, exactly as in a foreground send. Nothing about attachments is serialized into the queue payload.
+
+</Py>
+
+<Ts>
+
+### Worker entrypoint
+
+The worker builds its own service with the same factory call as the web process (same backend, same adapters with `enqueueNotifications: true`, same `contextGeneratorsMap`) and calls `delayedSend(notificationId)` for each message it pulls:
+
+```typescript
+// worker.ts
+const vintasend = getNotificationService(); // the same factory call the web process uses
+
+for await (const message of pollQueue()) {
+  await vintasend.delayedSend(Number(message.body));
+}
+```
+
+`delayedSend` reloads the notification through `getNotification`, resolves the git commit SHA if a provider is configured, generates the context at delivery time, and calls `send()` on every adapter flagged `enqueueNotifications` for that type. Then it marks the record `SENT`, or `FAILED` if the adapter rejected, and stores the adapter key and the context used. If the id resolves to nothing, or no adapter is flagged for background delivery, it logs an error and returns; with `raiseErrorOnFailedSend: true` it throws instead.
+
+There is no settings layer in TypeScript, so there is no service factory setting either: the worker imports and calls the same function your application already uses to build the service.
+
+### Attachments
+
+Attachments work on the background path. The worker reloads the notification from the backend, so the adapter receives the stored attachment records and can fetch their content through the attachment manager. Nothing about attachments is serialized into the queue payload.
+
+### AWS SQS
+
+The `vintasend-ts` repository tracks a [vintasend-ts-aws-sqs](https://github.com/vintasoftware/vintasend-ts-aws-sqs) submodule, a queue service for Amazon SQS. Its README documents the configuration; the interface it implements is the one-method `BaseNotificationQueueService` above.
+
+</Ts>
+
+<Callout kind="note" title="Scheduled notifications still need a drain">
+Background sending changes *where* a notification is delivered, not *when*. A notification with a future <Sw py="send_after" ts="sendAfter" /> still waits until <Sw py="send_pending_notifications" ts="sendPendingNotifications" /> runs; at that moment the service enqueues it instead of sending inline.
+</Callout>
