@@ -546,6 +546,67 @@ A backend that returns a detached object from `persist_notification` may hand ba
 still looks `PENDING_SEND` even though the clone was, in fact, sent; re-fetch through
 `get_notification` or `filter_notifications` if you need the backend's own freshest copy.
 
+#### Requeueing a failed or cancelled notification
+
+`requeue_notification` retries the same notification instead of cloning it. It moves a `FAILED`
+or `CANCELLED` notification back to `PENDING_SEND` and clears `sent_at`. The id, content,
+template pin, stored context, adapter used, git commit SHA and attachments stay as they are:
+
+```python
+notification_service.requeue_notification(notification_id)                   # keep its send_after
+notification_service.requeue_notification(notification_id, send_after=None)  # send it now
+notification_service.requeue_notification(notification_id, send_after=tomorrow)
+```
+
+Leaving `send_after` out keeps the notification's own schedule, and `None` means "send it now".
+When the requeued notification is due, it is sent right away, as `create_notification` does: an
+adapter that uses the queue service puts it back on the queue. A stored `context_used` is reused
+for that send rather than generated again. The method returns the notification as it stands right
+after being requeued, from before that send.
+
+`PENDING_SEND` is refused because it is already queued. `SENT` and `READ` are refused, because
+requeueing would deliver the notification twice under one record; use `resend_notification` for
+those.
+
+#### Repinning a notification to a template version
+
+`repin_notification` changes `requested_template_version` on a notification that was not
+delivered (`PENDING_SEND`, `FAILED` or `CANCELLED`). Use it after publishing a fixed template, to
+move those notifications onto the fix:
+
+```python
+notification_service.repin_notification(notification_id)                      # the current version
+notification_service.repin_notification(notification_id, template_version=4)  # a version you name
+notification_service.requeue_notification(notification_id, send_after=None)   # then retry it
+```
+
+Without a version, it pins the version that the template renderer for the notification's type
+reports as current (`get_latest_template_version`). It sends nothing and leaves the status alone,
+so repin a failed notification and then requeue it. Repinning to the version already pinned
+writes nothing.
+
+Both methods refuse with `NotificationActionError` before anything is written. Branch on its
+`reason`, not its message:
+
+| `reason` | Meaning |
+|---|---|
+| `NOT_FOUND` | No notification has that id in the primary backend |
+| `INVALID_STATUS` | The status does not allow the action. `error.status` says which, when known |
+| `NO_TEMPLATE_VERSION` | Repin only: no version was given, and the renderer reports none (or raised) |
+
+The error also carries `action` (`"requeue"` or `"repin"`) and `notification_id`. Its message
+names the notification by id only, so it is safe to log and to return to a client. A
+`template_version` that is not a non-negative `int` (a `bool` included) raises
+`InvalidTemplateVersionError`, a `ValueError`, before anything is read.
+
+Both actions write to the primary backend and then to every additional backend, like other
+writes. `REQUEUEABLE_NOTIFICATION_STATUSES` and `REPINNABLE_NOTIFICATION_STATUSES` in
+`vintasend.constants` list the allowed statuses.
+
+Requeueing a cancelled notification needs a backend that keeps cancelled rows. The Django and
+SQLAlchemy backends and the in-repo fake keep them with status `CANCELLED`, and `get_notification`
+returns them. A backend that deletes cancelled rows can only requeue failed ones.
+
 #### Rendering a notification from historical template content
 
 `render_email_template_from_content` reproduces how an email notification rendered in the past,

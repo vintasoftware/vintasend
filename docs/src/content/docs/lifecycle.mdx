@@ -1,6 +1,6 @@
 ---
 title: Notification lifecycle
-description: The five statuses, what moves a record between them, scheduling and draining, failure, cancelling, updating and resending.
+description: The five statuses, what moves a record between them, scheduling and draining, failure, cancelling, updating, resending, requeueing and repinning.
 section: Concepts
 order: 12
 ---
@@ -17,7 +17,7 @@ Every notification is a record with a status. The service moves it forward; noth
 | `READ` | An in-app notification the user has opened. `read_at` / `readAt` is set | <Sw py="mark_read" ts="markRead" /> |
 | `CANCELLED` | Withdrawn before it was sent | <Sw py="cancel_notification" ts="cancelNotification" /> |
 
-The transitions are strict. Only a `PENDING_SEND` record can become `SENT`, `FAILED` or `CANCELLED`; only a `SENT` record can become `READ`. `FAILED`, `READ` and `CANCELLED` are terminal: a failed notification is not retried in place but [resent](#resending) as a new record.
+The transitions are strict. Only a `PENDING_SEND` record can become `SENT`, `FAILED` or `CANCELLED`; only a `SENT` record can become `READ`. A `FAILED` or `CANCELLED` record can go back to `PENDING_SEND` by [requeueing](#requeueing) it, which retries the same record. `SENT` and `READ` are terminal: to send a delivered notification again, [resend](#resending) it as a new record.
 
 ## Create, then send
 
@@ -154,7 +154,7 @@ Error handling is governed by the `raiseErrorOnFailedSend` option passed to the 
 service.cancel_notification(notification.id)
 ```
 
-Raises `NotificationCancelError` when the record is not pending: already sent, already cancelled, or missing. What "cancelled" looks like in storage is the backend's decision. The Django backend sets the status to `CANCELLED` and excludes such rows from later reads; the in-repo fake deletes the row. Cancelling never deletes attachment files.
+Raises `NotificationCancelError` when the record is not pending: already sent, already cancelled, or missing. The Django and SQLAlchemy backends and the in-repo fake keep the row with status `CANCELLED`, and `get_notification` returns it, so a cancelled notification can be [requeued](#requeueing). A backend that deletes cancelled rows instead can only requeue failed ones. Cancelling never deletes attachment files.
 
 </Py>
 
@@ -182,7 +182,7 @@ service.update_notification(
 )
 ```
 
-`update_notification(notification_id, pin_template_versions=None, **kwargs)` accepts `title`, `body_template`, `context_name`, `context_kwargs`, `send_after`, `subject_template`, `preheader_template`, `adapter_extra_parameters`, `attachments` and `requested_template_version`. After the write, if the record's `send_after` is now unset or in the past, the service sends it immediately, exactly as `create_notification` would.
+`update_notification(notification_id, pin_template_versions=None, **kwargs)` accepts `title`, `body_template`, `context_name`, `context_kwargs`, `send_after`, `subject_template`, `preheader_template`, `adapter_extra_parameters`, `attachments` and `requested_template_version`. After the write, if the record is `PENDING_SEND` and its `send_after` is now unset or in the past, the service sends it immediately, exactly as `create_notification` would. A `FAILED` or `CANCELLED` record can be updated too, and stays where it is until it is [requeued](#requeueing).
 
 Three fields raise rather than change: `tenant` (`TenantReassignmentError`), `git_commit_sha` (`GitCommitShaReassignmentError`) and `used_template_version` (`UsedTemplateVersionReassignmentError`). The last two are written only by the service at send time. `user_id`, `notification_type` and `status` are not in the accepted keyword set at all.
 
@@ -226,6 +226,70 @@ const same = await vintasend.resendNotification(notification.id, true);
 ```
 
 A refusal (not found, one-off, scheduled in the future, or `useStoredContextIfAvailable` with no stored context) is logged and the method returns `undefined`; with `raiseErrorOnFailedSend: true` it throws. The clone copies the user, type, title, templates, context name and parameters, `extraParams` and tenant. Its `contextUsed` is set at creation, from the source's stored context or from a fresh generation, and the send is started without being awaited, so the returned clone is still `PENDING_SEND` at the moment it is returned.
+
+</Ts>
+
+## Requeueing
+
+<Sw py="requeue_notification" ts="requeueNotification" /> puts a `FAILED` or `CANCELLED` record back into `PENDING_SEND`, so it is sent again. Unlike resending, it keeps the record: the id, content, template pin, stored context, adapter used, git commit SHA and attachments all stay as they are. It clears <Sw py="sent_at" ts="sentAt" />.
+
+<Sw py="send_after" ts="sendAfter" /> decides when the retry goes out. Left out, the record keeps its own. `None` / `null` means "now". Once the record is pending again, it is due when that value is unset or in the past, and then it is sent at once, the same as on create. An adapter that uses the queue service puts it back on the queue. A future value leaves it for whatever sends pending notifications. The method returns the record as it stands right after requeueing, from before that send.
+
+`PENDING_SEND` is refused because it is already queued. `SENT` and `READ` are refused because requeueing a delivered notification would deliver it twice under one record; resend it instead.
+
+<Py>
+
+```python
+service.requeue_notification(notification.id)                   # keep its send_after
+service.requeue_notification(notification.id, send_after=None)  # send it now
+service.requeue_notification(notification.id, send_after=tomorrow)
+```
+
+A refusal raises `NotificationActionError` before anything is written. Branch on its `reason`: `NOT_FOUND` or `INVALID_STATUS`. It also carries `action` (`"requeue"`), `notification_id` and, for a status refusal, `status`. The message names the notification by id only, so it is safe to log. A stored `context_used` is reused for the send rather than generated again. The write goes to the primary backend and then to every additional backend, like every other write.
+
+`REQUEUEABLE_NOTIFICATION_STATUSES` in `vintasend.constants` lists the allowed statuses. Every backend implements `requeue_notification(notification_id, send_after=UNSET)`, which checks the status and writes in one step, so two callers racing cannot both succeed.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.requeueNotification(notification.id);                      // keep its sendAfter
+await vintasend.requeueNotification(notification.id, { sendAfter: null }); // send it now
+await vintasend.requeueNotification(notification.id, { sendAfter: tomorrow });
+```
+
+A refusal throws `NotificationActionError` before anything is written, with `reason` set to `NOT_FOUND` or `INVALID_STATUS`. Test for it with `isNotificationActionError`, which also recognises the error from another copy of the package. `REQUEUEABLE_NOTIFICATION_STATUSES` lists the allowed statuses, and every backend implements `requeueNotification`.
+
+</Ts>
+
+## Repinning to a template version
+
+<Sw py="repin_notification" ts="repinNotification" /> changes which template version a record renders. Use it after publishing a fixed template, to move notifications that were not delivered onto the fix. An update keeps the pin unless the body template changes, so updating cannot do this.
+
+It works on `PENDING_SEND`, `FAILED` and `CANCELLED` records, whether they were pinned before or not. `SENT` and `READ` are refused, because a delivered record's pin records what it was asked to render. Without a version, the record is pinned to the version that the template renderer for its type reports as current. It changes nothing else: it neither sends nor changes the status, so repin a failed notification, then requeue it. Repinning to the version already pinned writes nothing.
+
+<Py>
+
+```python
+service.repin_notification(notification.id)                      # the current version
+service.repin_notification(notification.id, template_version=4)  # a version you name
+service.requeue_notification(notification.id, send_after=None)
+```
+
+A `template_version` that is not a non-negative `int` raises `InvalidTemplateVersionError`, a `ValueError`, before anything is read. A `bool` is refused too. Other refusals raise `NotificationActionError` with `reason` set to `NOT_FOUND`, `INVALID_STATUS`, or `NO_TEMPLATE_VERSION` when no version was given and the renderer reports none. A renderer that raises is logged and counts as reporting none. The write goes through `persist_notification_update` on every backend. `REPINNABLE_NOTIFICATION_STATUSES` lists the allowed statuses.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.repinNotification(notification.id);                         // the current version
+await vintasend.repinNotification(notification.id, { templateVersion: 4 }); // a version you name
+await vintasend.requeueNotification(notification.id, { sendAfter: null });
+```
+
+An invalid `templateVersion` throws a `RangeError`. Other refusals throw `NotificationActionError` with `reason` set to `NOT_FOUND`, `INVALID_STATUS` or `NO_TEMPLATE_VERSION`. `REPINNABLE_NOTIFICATION_STATUSES` lists the allowed statuses.
 
 </Ts>
 

@@ -71,7 +71,8 @@ persist_notification                 persist_one_off_notification
 persist_notification_update
 mark_pending_as_sent                 mark_pending_as_failed
 mark_sent_as_read                    mark_sent_as_read_bulk
-cancel_notification                  get_notification
+cancel_notification                  requeue_notification
+get_notification
 filter_all_in_app_unread_notifications   filter_in_app_unread_notifications
 filter_all_in_app_notifications      filter_in_app_notifications
 filter_notifications
@@ -82,6 +83,8 @@ find_attachment_file_by_checksum     delete_attachment_file
 get_orphaned_attachment_files        get_attachments
 delete_notification_attachment
 ```
+
+`requeue_notification(notification_id, send_after=UNSET)` is required since 3.7.0. It moves only a `FAILED` or `CANCELLED` notification back to `PENDING_SEND`, checking the status and writing in one step (a conditional `UPDATE ... WHERE id = ? AND status IN (...)` on SQL). It raises `NotificationNotFoundError` for an unknown id and `NotificationRequeueError` for any other status, clears `sent_at`, applies `send_after` only when it is passed (`None` included), and returns the full notification with its attachments. `persist_notification_update` must accept a `FAILED` or `CANCELLED` notification as well as a pending one, because `repin_notification` writes through it.
 
 Nine methods have working defaults you override only when the database can do better: `count_in_app_notifications` and `count_in_app_unread_notifications` (they iterate the filter methods), `get_all_notifications`, `count_notifications`, `get_filter_capabilities` (reports everything supported and `pagination.oneIndexed: True`; a backend that pages from 0 must override it), `get_backend_identifier`, `apply_replication_snapshot_if_newer`, `store_template_version` and `inject_attachment_manager`. Pagination is 1-indexed: `page=1` is the first page.
 
@@ -100,7 +103,7 @@ persistNotificationUpdate
 getAllNotifications                  getNotifications
 markAsSent                           markAsFailed
 markAsRead                           cancelNotification
-getNotification
+getNotification                      requeueNotification
 filterAllInAppUnreadNotifications    filterInAppUnreadNotifications
 filterNotifications
 getUserEmailFromNotification         storeAdapterAndContextUsed

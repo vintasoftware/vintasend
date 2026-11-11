@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+from vintasend.constants import UNSET, UnsetType
 from vintasend.services.dataclasses import ApplyResult
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
@@ -171,6 +172,14 @@ class BaseNotificationBackend(ABC):
         Update a notification in the backend. This method should return the updated notification.
         Notifications that have already been sent should not be updated. If a notification has already been sent,
         the method should raise a NotificationUpdateError.
+
+        A notification that did not go out (``PENDING_SEND``, ``FAILED`` or ``CANCELLED``, the
+        statuses in ``vintasend.constants.REPINNABLE_NOTIFICATION_STATUSES``) must be
+        updatable. ``NotificationService.repin_notification`` writes through this method.
+
+        The service passes ``notification_id`` and ``update_data`` positionally, because
+        released implementations name the second parameter ``updated_data``. Keep the
+        seam's names in a new implementation all the same.
         """
 
     @abstractmethod
@@ -227,6 +236,40 @@ class BaseNotificationBackend(ABC):
 
     @abstractmethod
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None: ...
+
+    @abstractmethod
+    def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> "Notification | OneOffNotification":
+        """Put a notification that did not go out back into ``PENDING_SEND``, so it is sent again.
+
+        Works for regular and one-off notifications alike. An implementation must:
+
+        * only move a notification whose status is one of
+          ``vintasend.constants.REQUEUEABLE_NOTIFICATION_STATUSES`` (``FAILED`` and
+          ``CANCELLED``). Where the store allows it, check the status and write in one step, so
+          two callers racing cannot both succeed, for example against a notification a worker
+          sent in the meantime. A SQL backend does this with a conditional
+          ``UPDATE ... WHERE id = ? AND status IN (...)`` and checks the row count;
+        * raise ``NotificationNotFoundError`` when no notification has that ID, and
+          ``NotificationRequeueError`` when it exists in any other status. Name the
+          notification by its ID only in either message;
+        * set the status to ``PENDING_SEND`` and clear ``sent_at``;
+        * set ``send_after`` to the given value when one is passed, ``None`` included, and leave
+          it as it is when the argument is left out (``UNSET``).
+
+        Everything else stays as it is. The template pin, ``context_used``, ``adapter_used``,
+        the git commit SHA and the attachments are history of the earlier attempt, and the next
+        send overwrites what it needs to.
+
+        Return the full notification, attachments included, the same way ``get_notification``
+        does. The service sends whatever this returns.
+
+        Required since 3.7.0. A backend written against an earlier version must add it.
+        """
+        ...
 
     @abstractmethod
     def get_notification(

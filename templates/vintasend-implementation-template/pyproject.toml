@@ -17,9 +17,10 @@ include = [
 ]
 
 [tool.poetry.dependencies]
-# Pinned to the current vintasend line (2.0) so a freshly cloned package starts
-# with a correct, working pin against the seams this template's stubs subclass.
-vintasend = "^3.5.0"
+# Pinned to the first release with every seam method this template's stubs implement
+# (requeue_notification arrived in 3.7.0), so a freshly cloned package starts with a
+# correct, working pin.
+vintasend = "^3.7.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.3"
