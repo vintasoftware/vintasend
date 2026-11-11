@@ -1,6 +1,6 @@
 # Release Notes
 
-## Version 3.7.0 (unreleased)
+## Version 3.7.0 (2026-11-10)
 
 Two notification actions, so nobody has to edit notification rows in the database to retry a
 failed send or to move a notification onto a fixed template. They match the TypeScript
