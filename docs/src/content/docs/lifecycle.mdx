@@ -233,33 +233,41 @@ A refusal (not found, one-off, scheduled in the future, or `useStoredContextIfAv
 
 <Sw py="requeue_notification" ts="requeueNotification" /> puts a `FAILED` or `CANCELLED` record back into `PENDING_SEND`, so it is sent again. Unlike resending, it keeps the record: the id, content, template pin, stored context, adapter used, git commit SHA and attachments all stay as they are. It clears <Sw py="sent_at" ts="sentAt" />.
 
-<Sw py="send_after" ts="sendAfter" /> decides when the retry goes out. Left out, the record keeps its own. `None` / `null` means "now". Once the record is pending again, it is due when that value is unset or in the past, and then it is sent at once, the same as on create. An adapter that uses the queue service puts it back on the queue. A future value leaves it for whatever sends pending notifications. The method returns the record as it stands right after requeueing, from before that send.
+<Sw py="send_after" ts="sendAfter" /> decides when the retry goes out. Left out, the record keeps its own. `None` / `null` means "now". Once the record is pending again, it is due when that value is unset or in the past, and then it is sent at once, the same as on create. An adapter that uses the queue service puts it back on the queue. A future value leaves it for whatever sends pending notifications, and so does `send` set to false, even for a due record. No adapter is used then, so a process that only requeues can be built with no adapters and no delivery credentials.
+
+It returns the record as it stands after any send it started, read again from the primary backend: `SENT` when it went out, `FAILED` when the adapter failed, `PENDING_SEND` when it is waiting. That holds when the service is configured not to raise on a failed send, so read `status` to know what happened.
+
+<Sw py="template_version" ts="templateVersion" /> pins that version in the same backend write that requeues, so the record is never left pinned but not pending, or pending on the old pin. Repinning first and requeueing after still works, in two writes.
 
 `PENDING_SEND` is refused because it is already queued. `SENT` and `READ` are refused because requeueing a delivered notification would deliver it twice under one record; resend it instead.
 
 <Py>
 
 ```python
-service.requeue_notification(notification.id)                   # keep its send_after
-service.requeue_notification(notification.id, send_after=None)  # send it now
+service.requeue_notification(notification.id)                     # keep its send_after
+service.requeue_notification(notification.id, send_after=None)    # send it now
 service.requeue_notification(notification.id, send_after=tomorrow)
+service.requeue_notification(notification.id, template_version=4)  # pin it in the same write
+service.requeue_notification(notification.id, send=False)         # leave it for the pending sender
 ```
 
-A refusal raises `NotificationActionError` before anything is written. Branch on its `reason`: `NOT_FOUND` or `INVALID_STATUS`. It also carries `action` (`"requeue"`), `notification_id` and, for a status refusal, `status`. The message names the notification by id only, so it is safe to log. A stored `context_used` is reused for the send rather than generated again. The write goes to the primary backend and then to every additional backend, like every other write.
+A refusal raises `NotificationActionError` before anything is written. Branch on its `reason`: `NOT_FOUND`, `INVALID_STATUS`, `CHANGED` or `UNSUPPORTED` (see [moving notifications safely](#moving-notifications-safely)). It also carries `action` (`"requeue"`), `notification_id` and, for a status refusal, `status`. The message names the notification by id only, so it is safe to log. A stored `context_used` is reused for the send rather than generated again. The write goes to the primary backend and then to every additional backend, like every other write.
 
-`REQUEUEABLE_NOTIFICATION_STATUSES` in `vintasend.constants` lists the allowed statuses. Every backend implements `requeue_notification(notification_id, send_after=UNSET)`, which checks the status and writes in one step, so two callers racing cannot both succeed.
+`REQUEUEABLE_NOTIFICATION_STATUSES` in `vintasend.constants` lists the allowed statuses. Every backend implements `requeue_notification`, which checks the status and writes in one step, so two callers racing cannot both succeed.
 
 </Py>
 
 <Ts>
 
 ```typescript
-await vintasend.requeueNotification(notification.id);                      // keep its sendAfter
-await vintasend.requeueNotification(notification.id, { sendAfter: null }); // send it now
+await vintasend.requeueNotification(notification.id);                        // keep its sendAfter
+await vintasend.requeueNotification(notification.id, { sendAfter: null });   // send it now
 await vintasend.requeueNotification(notification.id, { sendAfter: tomorrow });
+await vintasend.requeueNotification(notification.id, { templateVersion: 4 }); // pin it in the same write
+await vintasend.requeueNotification(notification.id, { send: false });       // leave it for the pending sender
 ```
 
-A refusal throws `NotificationActionError` before anything is written, with `reason` set to `NOT_FOUND` or `INVALID_STATUS`. Test for it with `isNotificationActionError`, which also recognises the error from another copy of the package. `REQUEUEABLE_NOTIFICATION_STATUSES` lists the allowed statuses, and every backend implements `requeueNotification`.
+A refusal throws `NotificationActionError` before anything is written, with `reason` set to `NOT_FOUND`, `INVALID_STATUS`, `CHANGED` or `UNSUPPORTED`. Test for it with `isNotificationActionError`, which also recognises the error from another copy of the package. `REQUEUEABLE_NOTIFICATION_STATUSES` lists the allowed statuses, and every backend implements `requeueNotification`.
 
 </Ts>
 
@@ -267,17 +275,19 @@ A refusal throws `NotificationActionError` before anything is written, with `rea
 
 <Sw py="repin_notification" ts="repinNotification" /> changes which template version a record renders. Use it after publishing a fixed template, to move notifications that were not delivered onto the fix. An update keeps the pin unless the body template changes, so updating cannot do this.
 
-It works on `PENDING_SEND`, `FAILED` and `CANCELLED` records, whether they were pinned before or not. `SENT` and `READ` are refused, because a delivered record's pin records what it was asked to render. Without a version, the record is pinned to the version that the template renderer for its type reports as current. It changes nothing else: it neither sends nor changes the status, so repin a failed notification, then requeue it. Repinning to the version already pinned writes nothing.
+It works on `PENDING_SEND`, `FAILED` and `CANCELLED` records, whether they were pinned before or not. `SENT` and `READ` are refused, because a delivered record's pin records what it was asked to render. Without a version, the record is pinned to <Sw py="get_current_template_version" ts="getCurrentTemplateVersion" />: what the template renderer for its type reports as current, the same answer pinning on create records. It changes nothing else: it neither sends nor changes the status. Repinning to the version already pinned writes nothing.
+
+A backend that implements its own repin checks the status in the same write, so a worker sending the record in between is never overwritten. Otherwise the service writes through the generic update.
 
 <Py>
 
 ```python
 service.repin_notification(notification.id)                      # the current version
 service.repin_notification(notification.id, template_version=4)  # a version you name
-service.requeue_notification(notification.id, send_after=None)
+service.get_current_template_version("EMAIL", "welcome")          # what the first line pins
 ```
 
-A `template_version` that is not a non-negative `int` raises `InvalidTemplateVersionError`, a `ValueError`, before anything is read. A `bool` is refused too. Other refusals raise `NotificationActionError` with `reason` set to `NOT_FOUND`, `INVALID_STATUS`, or `NO_TEMPLATE_VERSION` when no version was given and the renderer reports none. A renderer that raises is logged and counts as reporting none. The write goes through `persist_notification_update` on every backend. `REPINNABLE_NOTIFICATION_STATUSES` lists the allowed statuses.
+A `template_version` that is not a non-negative `int` raises `InvalidTemplateVersionError`, a `ValueError`, before anything is read. A `bool` is refused too. Other refusals raise `NotificationActionError` with `reason` set to `NOT_FOUND`, `INVALID_STATUS`, `NO_TEMPLATE_VERSION` when no version was given and the renderer reports none, `CHANGED` or `UNSUPPORTED`. A renderer that raises is logged and counts as reporting none. `REPINNABLE_NOTIFICATION_STATUSES` lists the allowed statuses.
 
 </Py>
 
@@ -286,12 +296,64 @@ A `template_version` that is not a non-negative `int` raises `InvalidTemplateVer
 ```typescript
 await vintasend.repinNotification(notification.id);                         // the current version
 await vintasend.repinNotification(notification.id, { templateVersion: 4 }); // a version you name
-await vintasend.requeueNotification(notification.id, { sendAfter: null });
+await vintasend.getCurrentTemplateVersion('EMAIL', 'welcome');              // what the first line pins
 ```
 
-An invalid `templateVersion` throws a `RangeError`. Other refusals throw `NotificationActionError` with `reason` set to `NOT_FOUND`, `INVALID_STATUS` or `NO_TEMPLATE_VERSION`. `REPINNABLE_NOTIFICATION_STATUSES` lists the allowed statuses.
+An invalid `templateVersion` throws a `RangeError`. Other refusals throw `NotificationActionError` with `reason` set to `NOT_FOUND`, `INVALID_STATUS`, `NO_TEMPLATE_VERSION`, `CHANGED` or `UNSUPPORTED`. `REPINNABLE_NOTIFICATION_STATUSES` lists the allowed statuses.
 
 </Ts>
+
+## Moving notifications safely
+
+To move many records onto a fixed template, list them without reading them, then act on each only if nothing has changed since it was listed.
+
+<Sw py="filter_notification_versions" ts="filterNotificationVersions" /> takes the [composable filter](/vintasend/docs/filtering/) and returns the id and an opaque version token of each match, ordered by id, and nothing else: the backend reads no recipient, context, context parameters, rendered content or attachment to answer it. The token changes on every write to the record, by anyone; compare tokens for equality only. Pass it back as <Sw py="expected_version" ts="expectedVersion" /> to a repin or a requeue, and the move happens only if the record is still at that version. Otherwise the action is refused with `CHANGED` and nothing is written. Moving what you list changes what matches, so list again from the first page rather than moving on to the next one.
+
+<Py>
+
+```python
+stranded = {"and": [{"body_template": "welcome"}, {"status": NotificationStatus.FAILED}]}
+
+while page := service.filter_notification_versions(stranded, page=1, page_size=100):
+    for entry in page:
+        try:
+            service.requeue_notification(
+                entry.id, template_version=4, expected_version=entry.version
+            )
+        except NotificationActionError as error:
+            if error.reason != "CHANGED":
+                raise
+            # written since it was listed; the next listing carries its new version
+```
+
+</Py>
+
+<Ts>
+
+```typescript
+const stranded = { and: [{ bodyTemplate: 'welcome' }, { status: 'FAILED' }] } as const;
+
+let page = await vintasend.filterNotificationVersions(stranded, 0, 100);
+while (page.length > 0) {
+  for (const { id, version } of page) {
+    await vintasend.requeueNotification(id, { templateVersion: 4, expectedVersion: version });
+  }
+  page = await vintasend.filterNotificationVersions(stranded, 0, 100);
+}
+```
+
+</Ts>
+
+These are optional backend features. <Sw py="get_backend_supported_action_capabilities" ts="getBackendSupportedActionCapabilities" /> reports which ones the primary backend supports, every key false by default:
+
+| Key | True when |
+|---|---|
+| `repin.expectedVersion` | the backend's repin checks the expected version |
+| `requeue.expectedVersion` | the backend's requeue checks the expected version |
+| `requeue.templateVersion` | the backend's requeue pins in the same write |
+| `versions.filter` | the backend lists versions |
+
+An option the primary backend does not report is refused with `UNSUPPORTED` before anything is read or written, never passed to a backend that would ignore it. Additional backends take every write unconditionally, because a version token belongs to the primary; one that cannot pin in the same write as a requeue is repinned and then requeued. The fakes, `vintasend-django`, `vintasend-sqlalchemy`, `vintasend-prisma` and `vintasend-medplum` support all four.
 
 <Callout kind="note" title="In-app notifications and READ">
 `READ` only applies to notifications a user can open. <Sw py="mark_read" ts="markRead" /> moves a `SENT` record to `READ`; the backend refuses any other starting status. Listing, counting and bulk marking are covered in the [in-app notifications guide](/vintasend/docs/in-app-notifications/).

@@ -56,3 +56,27 @@ UNSET: Final = Unset.UNSET
 
 # The type of an argument that may be left out, given a value, or set to ``None``.
 UnsetType = Literal[Unset.UNSET]
+
+
+# Which optional notification actions a backend supports beyond the required ones. A backend
+# reports them from ``get_action_capabilities()`` and the service merges the report over this
+# default. Keys are camelCase dotted, byte-identical to the TypeScript library, like the filter
+# capability keys.
+#
+# Unlike the filter capabilities, every key defaults to ``False``. The service passes an option
+# only to a primary backend that reports it and refuses it otherwise, with
+# ``NotificationActionError`` reason ``UNSUPPORTED``, so a backend written before these options
+# existed is never handed one it would ignore.
+#
+# * ``repin.expectedVersion``: ``repin_notification`` is implemented and checks
+#   ``expected_version``.
+# * ``requeue.expectedVersion``: ``requeue_notification`` checks ``expected_version``.
+# * ``requeue.templateVersion``: ``requeue_notification`` pins ``template_version`` in the same
+#   write that re-queues.
+# * ``versions.filter``: ``filter_notification_versions`` is implemented.
+DEFAULT_BACKEND_ACTION_CAPABILITIES: Final[dict[str, bool]] = {
+    "repin.expectedVersion": False,
+    "requeue.expectedVersion": False,
+    "requeue.templateVersion": False,
+    "versions.filter": False,
+}

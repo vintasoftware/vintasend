@@ -4,7 +4,8 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable
 
-from vintasend.constants import UNSET, UnsetType
+from vintasend.constants import REPINNABLE_NOTIFICATION_STATUSES, UNSET, UnsetType
+from vintasend.exceptions import NotificationRepinError, UnsupportedNotificationActionError
 from vintasend.services.dataclasses import ApplyResult
 from vintasend.services.utils import get_class_path
 
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
         AnyNotificationAttachment,
         AttachmentFileRecord,
         Notification,
+        NotificationVersion,
         OneOffNotification,
         StoredAttachment,
         UpdateNotificationKwargs,
@@ -225,6 +227,25 @@ class AsyncIOBaseNotificationBackend(ABC):
         Return the full notification, attachments included, the same way ``get_notification``
         does. The service sends whatever this returns.
 
+        Two optional keyword-only arguments, added in 3.8.0, are deliberately not part of the
+        abstract signature above, so an override written for 3.7 still type-checks. A backend
+        that reports ``requeue.templateVersion`` or ``requeue.expectedVersion`` in
+        ``get_action_capabilities()`` must accept the matching argument as keyword-only
+        (widening the signature is a valid override). The service passes each one only to a
+        backend that reports it, so a backend that does not support them leaves them out of
+        its signature:
+
+        * ``template_version`` (``requeue.templateVersion``): set ``requested_template_version``
+          in the same write, so the notification is never left pinned but not pending, or
+          pending on the old pin.
+        * ``expected_version`` (``requeue.expectedVersion``): write only if the notification is
+          still at this version, the token ``filter_notification_versions`` returned for it, and
+          raise ``NotificationVersionChangedError`` otherwise, writing nothing. A SQL backend
+          adds the version column to the ``WHERE``; when nothing matched, it reads the row once
+          to say why.
+
+        A backend that reports neither must raise if it is handed one anyway, never ignore it.
+
         Required since 3.7.0. A backend written against an earlier version must add it.
         """
         ...
@@ -407,6 +428,67 @@ class AsyncIOBaseNotificationBackend(ABC):
         MUST report ``{'pagination.oneIndexed': False}``, because a caller that assumes the
         wrong base gets no error -- just the wrong rows. See
         ``DEFAULT_BACKEND_FILTER_CAPABILITIES``.
+
+        The presence filters (``fields.hasSendAfter``, ``negation.hasSendAfter``,
+        ``fields.hasRequestedTemplateVersion``, ``negation.hasRequestedTemplateVersion``) are
+        the exception: they default to ``False``, so a backend that evaluates them reports
+        ``True``.
+        """
+        return {}
+
+    async def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+        lock: asyncio.Lock | None = None,
+    ) -> "Notification | OneOffNotification":
+        """Pin a notification to a template version, in one conditional write where it can.
+
+        The AsyncIO twin of ``BaseNotificationBackend.repin_notification``; see it for the
+        contract. Optional, added in 3.8.0. This default reads the notification, checks its
+        status and writes through ``persist_notification_update``. It cannot check
+        ``expected_version``, so it raises ``UnsupportedNotificationActionError`` when given one.
+        """
+        if expected_version is not None:
+            raise UnsupportedNotificationActionError(
+                f"Cannot repin notification {notification_id}: this backend does not check "
+                "expected_version"
+            )
+        notification = await self.get_notification(notification_id)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            return notification
+        return await self.persist_notification_update(
+            notification_id, {"requested_template_version": template_version}, lock
+        )
+
+    async def filter_notification_versions(
+        self,
+        filter: "NotificationFilter",  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> "list[NotificationVersion]":
+        """The ID and version token of every notification matching ``filter``, a page at a time.
+
+        The AsyncIO twin of ``BaseNotificationBackend.filter_notification_versions``; see it for
+        the contract, including what an implementation must not read. Optional, added in 3.8.0.
+        This default raises ``UnsupportedNotificationActionError``.
+        """
+        raise UnsupportedNotificationActionError(
+            f"Backend {self.get_backend_identifier() or type(self).__name__} does not support "
+            "filter_notification_versions"
+        )
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        """Which optional notification actions this backend supports.
+
+        The AsyncIO twin of ``BaseNotificationBackend.get_action_capabilities``; see it for the
+        keys. Optional, added in 3.8.0. This default reports nothing.
         """
         return {}
 

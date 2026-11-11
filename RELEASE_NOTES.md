@@ -1,5 +1,196 @@
 # Release Notes
 
+## Version 3.8.0 (unreleased)
+
+Moving notifications onto a new template version safely, and previewing and publishing managed
+templates without building a fake notification. It matches the TypeScript VintaSend
+1.0.0-alpha11 and 1.0.0-alpha12 releases. Every new backend method is optional, so a backend
+written for 3.7.0 keeps working. **Four changes need action**: `requeue_notification` now returns
+the notification after its send, managed-template sends compose bases and fragments at their
+newest published version, and the Django and SQLAlchemy backends add a `notification_version`
+column that needs a migration and must be set by writes that bypass the model. See Backwards
+compatibility.
+
+### Features
+
+#### `vintasend`
+
+* **Conditional repin and requeue.** `repin_notification(id, expected_version=...)` and
+  `requeue_notification(id, expected_version=...)` write only if the notification is still at
+  that version, the opaque token `filter_notification_versions` returns. Otherwise they raise
+  `NotificationActionError` with the new reason **`CHANGED`** and write nothing. Without the
+  option nothing changes, except that a backend implementing `repin_notification` now checks
+  the status in the same write.
+* **Repin and requeue in one write.** `requeue_notification(id, template_version=4)` pins a
+  `FAILED` or `CANCELLED` notification and puts it back in `PENDING_SEND` in one backend write.
+  It takes `expected_version` too, keeps the send time unless `send_after` is given, and sends a
+  due notification as before. `repin_notification` then `requeue_notification` still works.
+* **Options a backend cannot honour are refused, never ignored.** `expected_version`, and
+  `template_version` on a requeue, are passed only to a primary backend that reports them in
+  the new `get_action_capabilities()`. Any other backend gets `NotificationActionError` with the
+  new reason **`UNSUPPORTED`** before anything is read or written.
+  `get_backend_supported_action_capabilities()` on both services returns the keys
+  `repin.expectedVersion`, `requeue.expectedVersion`, `requeue.templateVersion` and
+  `versions.filter`, all `False` by default (`vintasend.constants.DEFAULT_BACKEND_ACTION_CAPABILITIES`).
+  Additional backends take every write unconditionally; one that cannot pin in the same write is
+  repinned and then requeued.
+* **`requeue_notification(id, send=False)`** requeues without sending, even a due notification,
+  which then waits for `send_pending_notifications`. No adapter is used, so a process that only
+  requeues can be built with `notification_adapters=[]` and needs no delivery credentials.
+* **`filter_notification_versions(filter, page, page_size, backend_identifier=None)`** returns
+  `NotificationVersion(id, version)` entries only, ordered by id. A backend implementing it must
+  not read recipients, contexts, context parameters, rendered content or attachments. It raises
+  `UnsupportedNotificationActionError` on a backend without it.
+* **`has_send_after` and `has_requested_template_version` filters** match notifications with or
+  without a send time or a template pin. "Pinned, but not to V" is
+  `{"and": [{"has_requested_template_version": True}, {"not": {"requested_template_version": V}}]}`.
+  Their capability keys (`fields.*`, `negation.*`) default to `False`, unlike the rest of the
+  Python filter vocabulary, so a backend that predates them never claims them.
+* **`get_current_template_version(notification_type, template_key)`** is public on both services.
+  `repin_notification` without a version and `pin_template_versions` use the same lookup, so a
+  caller showing "the version new notifications get" agrees with them.
+* **New backend methods, all optional:** `repin_notification(id, template_version, *,
+  expected_version=None)` (the default reads, checks the status and writes through
+  `persist_notification_update`), `filter_notification_versions(filter, page, page_size)` and
+  `get_action_capabilities()`. A backend's `requeue_notification` may accept the keyword-only
+  `template_version` and `expected_version`, which it receives only when it reports them. The
+  abstract signature is unchanged from 3.7.0, so an existing override still type-checks.
+* **New exceptions:** `NotificationRepinError`, `NotificationVersionChangedError`,
+  `UnsupportedNotificationActionError` and `InvalidExpectedVersionError`. New exports:
+  `NotificationVersion`, `DEFAULT_BACKEND_ACTION_CAPABILITIES`,
+  `NOTIFICATION_ACTION_ERROR_REASONS` and `vintasend.utils.uuid_utils.uuid7`.
+* The fake backends implement every new method, and keep a per-notification version token.
+
+#### `vintasend-django` and `vintasend-sqlalchemy` move notifications conditionally
+
+* Both backends implement every optional action and report all four action capabilities, plus
+  the presence filters. `requeue_notification` and `repin_notification` are each one
+  conditional `UPDATE` with the statuses, `expected_version` and (for a repin) "not already on
+  this version" in its `WHERE`; when it matches nothing, the row is read once to say why.
+  `filter_notification_versions` selects the id and version columns only.
+* **New `notification_version` column**, a UUIDv7 that every write to the row replaces and
+  `filter_notification_versions` hands out as the token. `vintasend-django` sets it in
+  `Notification.save()` (with `update_fields` too) and in every write the backend makes, and
+  exports `new_notification_version()` for your own `QuerySet.update()` calls.
+  `vintasend-sqlalchemy` declares it on `NotificationMixin` with `default` and `onupdate`, and
+  sets it in every `UPDATE` the backends issue.
+* Migrations: `vintasend-django` `0008` (nullable column), `0009` (a backfill that reads
+  primary keys only and commits every 2,000 rows, so it can be re-run) and `0010` (backfills any
+  row still without a token, then sets `NOT NULL`). `vintasend-sqlalchemy`
+  `upgrade_notification_table_to_3_8(batch_size=1000, *, not_null=True)`,
+  `finish_notification_table_upgrade_to_3_8()` for the second half of a rolling deploy,
+  `downgrade_notification_table_from_3_8()` and reference revision `4d2e3f5a6b7c`. The SQLAlchemy
+  helper skips a column that already exists and refuses Alembic's offline mode. All of them
+  reverse.
+* An unknown id with a malformed `expected_version` is now reported as not found, then a
+  malformed token as changed, in the same order as the fake backend.
+
+#### `vintasend-managed-templates`: previews, published sends and checked publishing
+
+* **`render_standalone(template, context, *, parts)`** on `ManagedTemplateService` and on the
+  renderer renders a template with no notification. `parts` is required: `"latest"` resolves
+  unpinned bases and fragments to their newest version, drafts included, and `"published"` to
+  their newest `ACTIVE` one, which is what a send renders. `TemplateComposer.from_backend(...,
+  parts=...)`, `composition.part_resolver(backend, parts)`, `composer.with_resolver(resolver)`
+  and `standalone_notification(template)` are the pieces it is built from.
+* **Sends compose against published parts.** `ManagedTemplateRenderer` takes
+  `composer_parts="published"` by default. See Backwards compatibility.
+* **`activate(..., check_render=RenderCheck(context=...))`** and `set_status(key, ACTIVE, ...,
+  check_render=...)` render the version with its bases and fragments at their newest published
+  versions before publishing it. If that
+  fails, nothing is written and `ManagedTemplateRenderCheckError` (`template_key`, `version`,
+  the failure chained as `__cause__`) is raised. Its message and `RenderCheck`'s repr never
+  include the context. `check_render` with any status other than `ACTIVE` is a `ValueError`.
+* **`get_current_template_version(template_key)`** on the renderer and the service answers the
+  version new notifications get: the newest active version, or `None` when nothing is published
+  or that version is an abstract base. The renderer's `get_latest_template_version` returns the
+  same, so vintasend's pinning, `repin_notification` without a version and a dashboard agree.
+* `ManagedTemplateService.render` composes through the renderer, as TypeScript does, so it
+  renders what a send would (published parts by default). `render_template`,
+  `get_composed_template` and `validate_composition` keep the service's own composer, drafts
+  included.
+
+#### `vintasend-django-templates-manager`
+
+* No code change. New integration tests run previews, render checks and the current version
+  over the Django ORM backend, and the README covers them.
+
+#### `vintasend-api`: conditional requeue and repin, and a versions search
+
+* `POST /api/v1/notifications/{id}/requeue` takes `templateVersion`, `expectedVersion` and
+  `send`; `POST /api/v1/notifications/{id}/repin` takes `expectedVersion`.
+* **`POST /api/v1/notifications/versions`** answers `{ id, version }` for each notification
+  matching a composable `filter` (`and` / `or` / `not`, at most six levels, with the new
+  `hasSendAfter` and `hasRequestedTemplateVersion` fields), ordered by ID, 1-indexed pages.
+* Every refused requeue, repin or versions search carries `details.reason`: `NOT_FOUND` (404),
+  `INVALID_STATUS`, `NO_TEMPLATE_VERSION`, `CHANGED` or `UNSUPPORTED` (409).
+* `/api/v1/capabilities` carries `repin.expectedVersion`, `requeue.expectedVersion`,
+  `requeue.templateVersion` and `versions.filter`, always present. A key is `true` only when the
+  backend reports it and the configured service can be called with that option; otherwise the
+  option is refused with 409 `UNSUPPORTED`, never dropped.
+* A versions search naming `userId`, `bodyTemplate`, `subjectTemplate` or `contextName` is a 400
+  on a backend reporting `stringLookups.exact` or `stringLookups.caseSensitive` as `false`, since
+  it would select more notifications than were asked for.
+* `openapi.yaml` is byte-identical to `vintasend-ts-api` 1.0.0-alpha12. The
+  `vintasend-dashboard-core` client generated from it needs no change.
+
+### Bug Fixes
+
+#### `vintasend`
+
+* The template-version lookups at creation logged the template key and the renderer's exception
+  message when a renderer raised. They now log the renderer and the error class only, like
+  `repin_notification`, because a key is a field of the notifications using it and a renderer's
+  message can quote template content.
+
+### Backwards compatibility
+
+**No `@abstractmethod` was added.** Every new backend method has a working default, and a backend
+written for 3.7.0 keeps working: it reports no action capability, so the service refuses the new
+options for it with `UNSUPPORTED` rather than passing them on. What does change:
+
+* **Action: check code that reads the result of `requeue_notification`.** It now returns the
+  notification after the send it started, re-read from the primary backend: `SENT`, `FAILED`, or
+  `PENDING_SEND` when it is not due or went to a queue. In 3.7.0 it returned the row as written,
+  always `PENDING_SEND`. `vintasend-api`'s requeue response changes the same way. Pass
+  `send=False` to requeue without sending.
+* **Action: activate your managed bases and fragments.** A send through `ManagedTemplateRenderer`
+  now composes unpinned bases and fragments at their newest **`ACTIVE`** version, as it already
+  did for the notification's own template. A part with only drafts now fails the send with
+  `ManagedTemplateCompositionReferenceError`, and a draft edit to a base no longer reaches
+  recipients until it is activated. To keep the 3.7.0 behaviour, build the renderer with
+  `composer_parts="latest"`. A `composer=` you pass yourself is unaffected.
+* **Action: run the schema migration with the deploy.** `vintasend-django` needs migrations
+  `0008` to `0010`; `vintasend-sqlalchemy` needs `upgrade_notification_table_to_3_8()` in an
+  Alembic revision of yours. Both models gain a `NOT NULL` `notification_version` column that
+  code from 3.7.0 does not know. With every writer stopped, migrate and then deploy. In a rolling
+  deploy, migrate to `0009` (or call `upgrade_notification_table_to_3_8(not_null=False)`), deploy,
+  and run `0010` (or `finish_notification_table_upgrade_to_3_8()`) once no old instance is left.
+  Until then, a row an old instance inserted is listed with the version `""` and cannot be moved
+  conditionally.
+* `ManagedTemplateService.render` now renders published parts by default, like a send, where it
+  rendered drafts before. Use `render_standalone(..., parts="latest")` for a draft preview.
+* **Action: set the token in writes that bypass the model.** With `vintasend-django`, a
+  `QuerySet.update()` or `bulk_update()` of notifications in your own code must also set
+  `notification_version=new_notification_version()`. With either backend, raw SQL or another
+  service writing the table must set a fresh UUID. A write that does not cannot be seen by
+  `expected_version`.
+* `ManagedTemplateRenderer.get_latest_template_version` returns `None` when the newest active
+  version is an abstract base, where it returned that version before, so a notification is
+  never pinned to a base. It is created unpinned instead.
+* `repin_notification` on the service now writes through the backend's `repin_notification`
+  (the default reads, checks the status and calls `persist_notification_update`, as before).
+  A backend that overrides it gets the status check in the same write.
+* The Python filter capability keys default to `True`, except the new `fields.hasSendAfter`,
+  `fields.hasRequestedTemplateVersion` and their `negation.*` keys, which default to `False`. A
+  custom backend that evaluates them must report them.
+* The downstream packages use `vintasend.utils.uuid_utils` and the new exceptions, so they need
+  `vintasend` 3.8.0. Their `vintasend` and `vintasend-managed-templates` pins move to 3.8.0 when
+  this release is cut.
+* HTTP: `/capabilities` gains four keys, refusals gain `details.reason`, and the requeue body,
+  the repin body and a new route are additive. A client that sends none of the new fields sees
+  only the requeue response change described above.
+
 ## Version 3.7.0 (2026-11-10)
 
 Two notification actions, so nobody has to edit notification rows in the database to retry a

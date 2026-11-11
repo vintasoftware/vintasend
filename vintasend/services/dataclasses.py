@@ -400,6 +400,20 @@ class BackendMigrationResult(TypedDict):
 
 
 @dataclass(frozen=True)
+class NotificationVersion:
+    """A notification's ID and the opaque token for the version of it a backend holds.
+
+    The token changes whenever the notification is written, by anyone. Pass it back as
+    ``expected_version`` to ``requeue_notification`` or ``repin_notification`` to act on the
+    notification only if nothing has changed since it was listed. Compare tokens for equality
+    only: they are not ordered, and a backend may use any string.
+    """
+
+    id: int | str | uuid.UUID
+    version: str
+
+
+@dataclass(frozen=True)
 class ApplyResult:
     """Outcome of a backend's ``apply_replication_snapshot_if_newer`` call.
 

@@ -147,6 +147,15 @@ AsyncIOBaseNotificationBackend.get_attachments
 AsyncIOBaseNotificationBackend.delete_notification_attachment
 ```
 
+Optional, since vintasend 3.8.0: the conditional moves. Override `repin_notification` and
+`filter_notification_versions`, accept the keyword-only `template_version` and
+`expected_version` in `requeue_notification`, and report what you support from
+`get_action_capabilities()` (`repin.expectedVersion`, `requeue.expectedVersion`,
+`requeue.templateVersion`, `versions.filter`). The service passes an option only to a backend
+that reports it, so a backend without any of this keeps working. The fakes in
+`vintasend/services/notification_backends/stubs/fake_backend.py` implement all of it, and the
+backend docstrings in `vintasend/services/notification_backends/base.py` give the contract.
+
 Connected through the `NOTIFICATION_BACKEND` setting (a dotted import path to your class), read
 by `vintasend.app_settings.NotificationSettings` and passed into `NotificationService` /
 `AsyncIONotificationService`.

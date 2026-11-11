@@ -133,6 +133,19 @@ class NotificationFilterFields(TypedDict, total=False):
     # filter on either field and is included under negation.
     requested_template_version: int | list[int]
     used_template_version: int | list[int]
+    # Whether a notification has a send time: ``True`` matches one whose ``send_after`` is set,
+    # ``False`` one whose ``send_after`` is ``None``. ``send_after_range`` cannot say this: a
+    # range with no bounds is malformed here, and a negated range is unsupported on some
+    # backends. Negating it is the same as asking for the other value. Any value other than a
+    # ``bool`` matches nothing, like every other malformed leaf.
+    has_send_after: bool
+    # Whether a notification is pinned to a template version: ``True`` matches one whose
+    # ``requested_template_version`` is set, ``False`` one that renders whatever is current at
+    # send time. "Pinned, but not to V" is
+    # ``{"and": [{"has_requested_template_version": True},
+    #            {"not": {"requested_template_version": V}}]}``: a negated version alone also
+    # matches unpinned notifications, under the NULL semantics above.
+    has_requested_template_version: bool
 
 
 # ``and`` / ``or`` / ``not`` are Python keywords, so these single-key groups can only be
@@ -185,6 +198,15 @@ DEFAULT_BACKEND_FILTER_CAPABILITIES: dict[str, bool] = {
     "negation.createdAtRange": True,
     "negation.sentAtRange": True,
     "negation.readAtRange": True,
+    # The presence filters break the all-``True`` rule above, on purpose. They are vocabulary
+    # no backend had when they were added, so a ``True`` default would have every shipped and
+    # third-party backend claim a filter it would silently ignore -- and an ignored leaf in an
+    # ``and`` widens the result, which for a bulk re-pin means moving notifications nobody
+    # asked to move. A backend that evaluates them reports ``True``.
+    "fields.hasSendAfter": False,
+    "negation.hasSendAfter": False,
+    "fields.hasRequestedTemplateVersion": False,
+    "negation.hasRequestedTemplateVersion": False,
     "stringLookups.exact": True,
     "stringLookups.startsWith": True,
     "stringLookups.endsWith": True,
@@ -274,6 +296,12 @@ _RANGE_FIELDS: dict[str, str] = {
     "created_at_range": "created",
     "sent_at_range": "sent_at",
     "read_at_range": "read_at",
+}
+
+# Presence fields, mapped to the notification attribute whose presence they test.
+_PRESENCE_FIELDS: dict[str, str] = {
+    "has_send_after": "send_after",
+    "has_requested_template_version": "requested_template_version",
 }
 
 # Order-by field names, mapped to the dataclass attribute. ``updated_at`` maps to ``modified``
@@ -495,6 +523,12 @@ def _matches_field(
         return _matches_version(getattr(notification, _VERSION_FIELDS[field], None), value)
     if field in _MEMBERSHIP_FIELDS:
         return _matches_membership(getattr(notification, _MEMBERSHIP_FIELDS[field], None), value)
+    if field in _PRESENCE_FIELDS:
+        # Unlike the other fields, a presence filter matches ``None`` rows on purpose:
+        # ``False`` asks for exactly those.
+        if not isinstance(value, bool):
+            return False
+        return (getattr(notification, _PRESENCE_FIELDS[field], None) is not None) is value
     # Unknown field: treat as non-matching rather than raising, so an over-eager client cannot
     # crash the backend. Downstream ORM backends may choose to reject instead.
     return False

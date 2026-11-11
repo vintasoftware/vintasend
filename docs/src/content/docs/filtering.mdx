@@ -147,7 +147,45 @@ Both fields are opt-in per backend, with capability keys that default to `false`
 
 </Ts>
 
-Both are null on a notification whose renderer does not version templates, and the used version is null until the notification has been sent. The NULL rule below applies, so there is no positive way to ask for "the unpinned ones".
+Both are null on a notification whose renderer does not version templates, and the used version is null until the notification has been sent. The NULL rule below applies, so a negated version also matches the unpinned ones. To ask about the pin itself, use the presence filters next.
+
+### Whether a field is set
+
+<Sw py="has_send_after" ts="hasSendAfter" /> and <Sw py="has_requested_template_version" ts="hasRequestedTemplateVersion" /> ask whether a notification has a send time, or a template pin: `true` matches the ones where it is set, `false` the ones where it is null. A date range cannot say this: a range with no bounds means different things on different backends, and a negated range is unsupported on several. Combined with a negated version they ask for "pinned, but not to V".
+
+<Py>
+
+```python
+service.filter_notifications({"has_requested_template_version": False}, page=1, page_size=10)
+
+# pinned, but not to v4
+service.filter_notifications(
+    {"and": [{"has_requested_template_version": True}, {"not": {"requested_template_version": 4}}]},
+    page=1,
+    page_size=10,
+)
+```
+
+A value that is not a `bool` matches nothing, like every other malformed leaf.
+
+</Py>
+
+<Ts>
+
+```typescript
+await vintasend.filterNotifications({ hasRequestedTemplateVersion: false }, 0, 10);
+
+// pinned, but not to v4
+await vintasend.filterNotifications(
+  { and: [{ hasRequestedTemplateVersion: true }, { not: { requestedTemplateVersion: 4 } }] },
+  0,
+  10,
+);
+```
+
+</Ts>
+
+Both are newer than the rest of the vocabulary, so their capability keys (`fields.hasSendAfter`, `negation.hasSendAfter`, `fields.hasRequestedTemplateVersion`, `negation.hasRequestedTemplateVersion`) default to false in both libraries: a backend reports them when it evaluates them.
 
 ### `and`, `or` and `not` groups
 
@@ -352,7 +390,7 @@ caps["fields.tenant"]  # False
 caps["fields.status"]  # True: not declared, so supported
 ```
 
-Every default is `True` in Python, including `pagination.oneIndexed`, `fields.readAtRange`, `negation.readAtRange` and the two template-version fields.
+Every default is `True` in Python, including `pagination.oneIndexed`, `fields.readAtRange`, `negation.readAtRange` and the two template-version fields, with one exception: the four presence-filter keys (`fields.hasSendAfter`, `negation.hasSendAfter`, `fields.hasRequestedTemplateVersion`, `negation.hasRequestedTemplateVersion`) default to `False`. They were added after backends had shipped, and an ignored presence leaf inside an `and` widens the result, which for a bulk repin means moving notifications nobody asked to move.
 
 </Py>
 
@@ -360,19 +398,20 @@ Every default is `True` in Python, including `pagination.oneIndexed`, `fields.re
 
 A backend implements the optional `getFilterCapabilities()` and returns only the keys it sets to `false`; a backend without the method is treated as supporting everything. The merged map is the exported `DEFAULT_BACKEND_FILTER_CAPABILITIES` underneath the backend's report.
 
-Seven keys default to `false` rather than `true`, and they are always present in what you receive because the defaults are merged under the report:
+Eleven keys default to `false` rather than `true`, and they are always present in what you receive because the defaults are merged under the report:
 
 - `pagination.oneIndexed`, because every TypeScript backend pages from 0.
 - `fields.readAtRange` and `negation.readAtRange`.
 - `fields.requestedTemplateVersion`, `fields.usedTemplateVersion`, `negation.requestedTemplateVersion` and `negation.usedTemplateVersion`.
+- `fields.hasSendAfter`, `negation.hasSendAfter`, `fields.hasRequestedTemplateVersion` and `negation.hasRequestedTemplateVersion`.
 
-The last six are vocabulary no backend implemented when it was introduced. A `true` default would have made every shipped and third-party backend claim a filter it would ignore or throw on, which is the failure the report exists to prevent. A backend flips them to `true` when it implements the field. `vintasend-medplum` cannot search on `readAt` at all, and also reports `orderBy.readAt: false`.
+The last ten are vocabulary no backend implemented when it was introduced. A `true` default would have made every shipped and third-party backend claim a filter it would ignore or throw on, which is the failure the report exists to prevent. A backend flips them to `true` when it implements the field. `vintasend-medplum` cannot search on `readAt` at all, and also reports `orderBy.readAt: false`.
 
 </Ts>
 
 ### Reading the report across ecosystems
 
-`pagination.oneIndexed` is defined by both libraries, but the defaults differ because the backends do: `True` in Python, `false` in TypeScript. Never assume its value across ecosystems; read it. The other keys that default differently are the `readAtRange` and template-version keys listed above, `true` in Python and `false` in TypeScript. A client written against either map is safe in both directions as long as it reads the key rather than its memory of the default.
+`pagination.oneIndexed` is defined by both libraries, but the defaults differ because the backends do: `True` in Python, `false` in TypeScript. Never assume its value across ecosystems; read it. The other keys that default differently are the `readAtRange` and template-version keys listed above, `true` in Python and `false` in TypeScript. The presence-filter keys default to `false` in both. A client written against either map is safe in both directions as long as it reads the key rather than its memory of the default.
 
 ### Case sensitivity is two capabilities
 

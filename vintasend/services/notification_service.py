@@ -1,5 +1,4 @@
 import asyncio
-import dataclasses
 import datetime
 import logging
 import sys
@@ -22,6 +21,7 @@ else:
     from typing_extensions import Unpack
 
 from vintasend.constants import (
+    DEFAULT_BACKEND_ACTION_CAPABILITIES,
     REPINNABLE_NOTIFICATION_STATUSES,
     REQUEUEABLE_NOTIFICATION_STATUSES,
     UNSET,
@@ -35,6 +35,7 @@ from vintasend.exceptions import (
     DuplicateBackendIdentifierError,
     DuplicateNotificationAdapterError,
     GitCommitShaReassignmentError,
+    InvalidExpectedVersionError,
     InvalidTemplateVersionError,
     NotificationAction,
     NotificationActionError,
@@ -45,12 +46,15 @@ from vintasend.exceptions import (
     NotificationNotFoundError,
     NotificationQueueServiceMissingError,
     NotificationRenderError,
+    NotificationRepinError,
     NotificationRequeueError,
     NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
+    NotificationVersionChangedError,
     ReplicationError,
     TenantReassignmentError,
+    UnsupportedNotificationActionError,
     UsedTemplateVersionReassignmentError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
@@ -66,6 +70,7 @@ from vintasend.services.dataclasses import (
     NotificationContextDict,
     NotificationSyncFieldReport,
     NotificationSyncReport,
+    NotificationVersion,
     OneOffNotification,
     UpdateNotificationKwargs,
 )
@@ -334,7 +339,7 @@ def _requeue_status_error(
 
 
 def _repin_status_error(
-    notification_id: int | str | uuid.UUID, status: str
+    notification_id: int | str | uuid.UUID, status: str | None
 ) -> NotificationActionError:
     return NotificationActionError(
         f"Cannot repin notification {notification_id}: it has already been delivered, and "
@@ -356,8 +361,82 @@ def _no_template_version_error(notification_id: int | str | uuid.UUID) -> Notifi
     )
 
 
+def _changed_error(
+    action: NotificationAction, notification_id: int | str | uuid.UUID
+) -> NotificationActionError:
+    return NotificationActionError(
+        f"Cannot {action} notification {notification_id}: it changed since that version was "
+        "read. Read it again and decide afresh.",
+        action=action,
+        reason="CHANGED",
+        notification_id=notification_id,
+    )
+
+
+def _unsupported_error(
+    action: NotificationAction,
+    notification_id: int | str | uuid.UUID,
+    option: str,
+    capability: str,
+    backend_identifier: str,
+) -> NotificationActionError:
+    return NotificationActionError(
+        f"Cannot {action} notification {notification_id} with {option}: the primary backend "
+        f"{backend_identifier} does not report {capability}",
+        action=action,
+        reason="UNSUPPORTED",
+        notification_id=notification_id,
+    )
+
+
+def _backend_unsupported_error(
+    action: NotificationAction,
+    notification_id: int | str | uuid.UUID,
+    options: list[tuple[str, str]],
+    backend_identifier: str,
+) -> NotificationActionError:
+    """The primary backend raised ``UnsupportedNotificationActionError`` during the write.
+
+    ``options`` holds the ``(option, capability)`` pairs the caller actually passed. The error
+    names them when there are any, and otherwise names the action only, so an option the
+    caller never passed is never blamed.
+    """
+    if options:
+        return _unsupported_error(
+            action,
+            notification_id,
+            " and ".join(option for option, _ in options),
+            " or ".join(capability for _, capability in options),
+            backend_identifier,
+        )
+    return NotificationActionError(
+        f"Cannot {action} notification {notification_id}: the primary backend "
+        f"{backend_identifier} does not support it",
+        action=action,
+        reason="UNSUPPORTED",
+        notification_id=notification_id,
+    )
+
+
+def _requeue_options_passed(
+    template_version: int | None, expected_version: str | None
+) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    if expected_version is not None:
+        options.append(("expected_version", "requeue.expectedVersion"))
+    if template_version is not None:
+        options.append(("template_version", "requeue.templateVersion"))
+    return options
+
+
+def _repin_options_passed(expected_version: str | None) -> list[tuple[str, str]]:
+    if expected_version is None:
+        return []
+    return [("expected_version", "repin.expectedVersion")]
+
+
 def _validate_template_version(
-    notification_id: int | str | uuid.UUID, template_version: object
+    notification_id: int | str | uuid.UUID, template_version: object, action: NotificationAction
 ) -> None:
     """Refuse a template version that is not a non-negative ``int``.
 
@@ -372,8 +451,21 @@ def _validate_template_version(
         or template_version < 0
     ):
         raise InvalidTemplateVersionError(
-            f"Cannot repin notification {notification_id}: template_version must be a "
+            f"Cannot {action} notification {notification_id}: template_version must be a "
             "non-negative integer"
+        )
+
+
+def _validate_expected_version(
+    notification_id: int | str | uuid.UUID, expected_version: object, action: NotificationAction
+) -> None:
+    """Refuse an ``expected_version`` that is not a non-empty ``str``, the form tokens take."""
+    if expected_version is None:
+        return
+    if not isinstance(expected_version, str) or not expected_version:
+        raise InvalidExpectedVersionError(
+            f"Cannot {action} notification {notification_id}: expected_version must be a "
+            "non-empty string"
         )
 
 
@@ -384,33 +476,66 @@ def _is_due(notification: "Notification | OneOffNotification") -> bool:
     )
 
 
-def _current_template_version(
-    adapters: Iterable[Any], notification: "Notification | OneOffNotification"
-) -> int | None:
-    """The version the renderer for this notification's type reports as current, or None.
+def _notification_type_value(notification_type: "NotificationTypes | str") -> str:
+    return (
+        notification_type.value
+        if isinstance(notification_type, NotificationTypes)
+        else notification_type
+    )
 
-    A renderer that raises is logged and treated as reporting no version. The log line names
-    the notification by its ID and the error by its class only: a renderer's message can quote
-    template content.
+
+def _current_template_version(
+    adapters: Iterable[Any], notification_type: str, template_key: str
+) -> int | None:
+    """The version the renderers for ``notification_type`` report as current, or None.
+
+    Asks each adapter of that type in turn and returns the first version reported. A renderer
+    that raises is logged and treated as reporting no version. The log line names the renderer
+    and the error class only: the template key is a field of the notifications that use it,
+    and a renderer's message can quote template content.
     """
     for adapter in adapters:
-        if adapter.notification_type.value != notification.notification_type:
+        if adapter.notification_type.value != notification_type:
             continue
         try:
-            version = adapter.template_renderer.get_latest_template_version(
-                notification.body_template
-            )
+            version = adapter.template_renderer.get_latest_template_version(template_key)
         except Exception as error:  # noqa: BLE001
             logger.warning(
-                "Template renderer raised %s while resolving the current template version for "
-                "notification %s; treating it as no version",
+                "Template renderer %s raised %s while resolving the current version of a "
+                "template; treating it as no version",
+                getattr(adapter.template_renderer, "template_renderer_import_str", "unknown"),
                 type(error).__name__,
-                notification.id,
             )
             continue
         if version is not None:
             return version
     return None
+
+
+def _overrides(backend: object, method_name: str) -> bool:
+    """Whether ``backend`` implements ``method_name`` rather than inheriting the base default."""
+    implementation = getattr(type(backend), method_name, None)
+    return implementation is not None and implementation not in (
+        getattr(BaseNotificationBackend, method_name, None),
+        getattr(AsyncIOBaseNotificationBackend, method_name, None),
+    )
+
+
+def _merge_action_capabilities(backend: object, reported: dict[str, bool]) -> dict[str, bool]:
+    """A backend's action report merged over the all-``False`` default.
+
+    A key whose method the backend does not implement reads ``False`` whatever it reports, so
+    the service never routes an option to the base class's default, which cannot honour it.
+    """
+    capabilities = {
+        **DEFAULT_BACKEND_ACTION_CAPABILITIES,
+        **{key: value is True for key, value in reported.items()},
+    }
+    if not _overrides(backend, "repin_notification"):
+        capabilities["repin.expectedVersion"] = False
+    if not _overrides(backend, "filter_notification_versions"):
+        capabilities["versions.filter"] = False
+    return capabilities
 
 
 class Contexts(metaclass=SingletonMeta):
@@ -1353,23 +1478,11 @@ class NotificationService(Generic[A, B]):
             return requested_template_version
         if not self._should_pin(pin_template_versions):
             return None
-
-        for adapter in self.notification_adapters:
-            if adapter.notification_type.value != notification_type:
-                continue
-            try:
-                version = adapter.template_renderer.get_latest_template_version(body_template)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Template renderer %s raised while resolving the current version of "
-                    "template %r; leaving the notification unpinned",
-                    adapter.template_renderer.template_renderer_import_str,
-                    body_template,
-                )
-                continue
-            if version is not None:
-                return version
-        return None
+        # The same lookup as get_current_template_version, so "the version new notifications
+        # get" and what they are pinned to cannot disagree.
+        return _current_template_version(
+            self.notification_adapters, notification_type, body_template
+        )
 
     def _should_pin(self, pin_template_versions: bool | None) -> bool:
         """Whether this call pins, given what it asked for and what the service defaults to.
@@ -2420,6 +2533,85 @@ class NotificationService(Generic[A, B]):
             replication_notification_id=notification_id,
         )
 
+    def get_backend_supported_action_capabilities(
+        self, backend_identifier: str | None = None
+    ) -> dict[str, bool]:
+        """
+        Which optional notification actions the primary backend, or a named one, supports.
+
+        Keys are those of ``vintasend.constants.DEFAULT_BACKEND_ACTION_CAPABILITIES``, every one
+        ``False`` unless the backend reports it. A key whose method the backend does not
+        implement reads ``False`` whatever the backend reports.
+
+        ``requeue_notification`` and ``repin_notification`` read this to decide whether to pass
+        ``expected_version`` and ``template_version`` on, and refuse an option the primary
+        backend does not report with ``NotificationActionError`` reason ``UNSUPPORTED``.
+        """
+        backend = self._get_backend(backend_identifier)
+        return _merge_action_capabilities(backend, backend.get_action_capabilities())
+
+    def _assert_action_supported(
+        self,
+        notification_id: int | str | uuid.UUID,
+        action: NotificationAction,
+        capability: str,
+        option: str,
+    ) -> None:
+        """Refuse an option the primary backend would not honour, before anything is read."""
+        if self.get_backend_supported_action_capabilities().get(capability) is True:
+            return
+        raise _unsupported_error(
+            action, notification_id, option, capability, self._primary_backend_identifier
+        )
+
+    def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        backend_identifier: str | None = None,
+    ) -> list[NotificationVersion]:
+        """
+        The ID and version token of every notification matching ``filter``, a page at a time,
+        from the primary backend or a named one.
+
+        Reads nothing else: no recipient, context, context parameters, rendered content or
+        attachments, so it is the way to count or select notifications that must not be read.
+        Pass a returned ``version`` as ``expected_version`` to ``repin_notification`` or
+        ``requeue_notification`` to act only on a notification that has not changed since it
+        was listed.
+
+        Ordered by ID. A caller that repins or requeues what it lists may change which
+        notifications match, so it should list again from the first page instead of moving on
+        to the next one.
+
+        Raises UnsupportedNotificationActionError when the backend does not implement it
+        (``versions.filter`` is ``False`` in ``get_backend_supported_action_capabilities``).
+        """
+        return self._get_backend(backend_identifier).filter_notification_versions(
+            filter, page, page_size
+        )
+
+    def get_current_template_version(
+        self, notification_type: NotificationTypes | str, template_key: str
+    ) -> int | None:
+        """
+        The template version a notification of this type created now would be pinned to: what
+        its renderer reports as current. For ``vintasend-managed-templates`` that is the key's
+        newest active version, or ``None`` when nothing is published or that version is a base.
+
+        ``repin_notification`` without a version, and ``pin_template_versions`` at creation,
+        both use this, so a caller showing "the version new notifications get" agrees with
+        what they pin.
+
+        Asks each adapter of ``notification_type`` in turn and returns the first version
+        reported. Best-effort: a renderer that does not version templates answers ``None``, and
+        one that raises is logged, by renderer and error class only, and treated the same way.
+        """
+        return _current_template_version(
+            self.notification_adapters, _notification_type_value(notification_type), template_key
+        )
+
     def _get_notification_for_action(
         self, notification_id: int | str | uuid.UUID, action: NotificationAction
     ) -> Notification | OneOffNotification:
@@ -2439,6 +2631,10 @@ class NotificationService(Generic[A, B]):
         self,
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
+        send: bool = True,
     ) -> Notification | OneOffNotification:
         """
         Put a failed or cancelled notification back into ``PENDING_SEND``, so it is sent again.
@@ -2451,20 +2647,31 @@ class NotificationService(Generic[A, B]):
         Once the notification is pending again it is due when ``send_after`` is ``None`` or in
         the past, and then it is sent right away, the same as ``create_notification`` does. An
         adapter that delivers through the queue service puts it back on the queue. A future
-        ``send_after`` leaves it for ``send_pending_notifications``. A stored ``context_used``
-        is reused for that send rather than generated again.
+        ``send_after`` leaves it for ``send_pending_notifications``, and so does
+        ``send=False``, even for a due notification. A stored ``context_used`` is reused for
+        the send rather than generated again.
 
-        To change the template version as well, call ``repin_notification`` first. It leaves
-        the status alone, so that order is safe.
+        To change the template version as well, pass ``template_version``: the pin and the
+        status change in one backend write, so the notification is never left pinned but not
+        pending, or pending on the old pin. That needs a primary backend reporting
+        ``requeue.templateVersion``. Calling ``repin_notification`` first and then this still
+        works, in two writes.
 
         The write goes to the primary backend first, then to every additional backend, the
-        same way other writes are replicated. A replica that fails is logged and does not
-        change the result.
+        same way other writes are replicated. Replicas take it unconditionally: a version token
+        belongs to the primary backend. A replica that cannot pin in the same write is repinned
+        and then requeued. A replica that fails is logged and does not change the result.
 
         This method may raise the following exceptions:
-            * NotificationActionError if the notification is not found (``NOT_FOUND``) or is
-              not ``FAILED`` or ``CANCELLED`` (``INVALID_STATUS``). Nothing is written in
-              either case.
+            * InvalidTemplateVersionError if ``template_version`` is not a non-negative ``int``,
+              and InvalidExpectedVersionError if ``expected_version`` is not a non-empty
+              ``str``. Raised before anything is read.
+            * NotificationActionError if the primary backend cannot honour
+              ``expected_version`` or ``template_version`` (``UNSUPPORTED``, before anything is
+              read when it does not report the option, or when the backend refuses the write
+              itself), the notification is not found (``NOT_FOUND``), is not ``FAILED`` or
+              ``CANCELLED`` (``INVALID_STATUS``), or is no longer at ``expected_version``
+              (``CHANGED``). Nothing is written in any of these cases.
             * Whatever ``send`` raises for the send that follows, when the service was built
               with ``raise_on_failed_send=True``.
 
@@ -2472,44 +2679,117 @@ class NotificationService(Generic[A, B]):
             notification_id: int | str | uuid.UUID - the ID of the notification to requeue
             send_after: datetime.datetime | None - when to send it. Left out, the notification
                 keeps its own ``send_after``. ``None`` means "send it now".
+            template_version: int | None - pin this version in the same write. Not checked
+                against the renderer, as with ``repin_notification``.
+            expected_version: str | None - write only if the notification is still at this
+                version, the token ``filter_notification_versions`` returned for it. Needs a
+                primary backend reporting ``requeue.expectedVersion``.
+            send: bool - ``False`` requeues without sending, even a due notification, which
+                then waits for ``send_pending_notifications``. No adapter is used, so a service
+                built with no adapters, and so no delivery credentials, can do it.
 
         Returns:
-            Notification | OneOffNotification - the notification as it stands right after
-            being requeued, from before any send that follows.
+            Notification | OneOffNotification - the notification as it stands after any send
+            this call started, read again from the primary backend: ``SENT`` when it went out,
+            ``FAILED`` when the adapter failed, ``PENDING_SEND`` when it is waiting (scheduled,
+            ``send=False``, or handed to a queue). This holds with
+            ``raise_on_failed_send=False`` too.
         """
+        _validate_template_version(notification_id, template_version, "requeue")
+        _validate_expected_version(notification_id, expected_version, "requeue")
+        if expected_version is not None:
+            self._assert_action_supported(
+                notification_id, "requeue", "requeue.expectedVersion", "expected_version"
+            )
+        if template_version is not None:
+            self._assert_action_supported(
+                notification_id, "requeue", "requeue.templateVersion", "template_version"
+            )
+
         notification = self._get_notification_for_action(notification_id, "requeue")
         if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
             raise _requeue_status_error(notification_id, notification.status)
 
-        def _requeue(backend: B, *_: Any) -> Notification | OneOffNotification:
+        # Only the options the caller passed, so a backend that predates them never sees one.
+        primary_options: dict[str, Any] = {}
+        if template_version is not None:
+            primary_options["template_version"] = template_version
+        if expected_version is not None:
+            primary_options["expected_version"] = expected_version
+
+        def _requeue_primary(backend: B) -> Notification | OneOffNotification:
+            return backend.requeue_notification(
+                notification_id, send_after=send_after, **primary_options
+            )
+
+        def _requeue_replica(backend: B, *_: Any) -> Notification | OneOffNotification:
+            if template_version is None:
+                return backend.requeue_notification(notification_id, send_after=send_after)
+            replica_capabilities = _merge_action_capabilities(
+                backend, backend.get_action_capabilities()
+            )
+            if replica_capabilities["requeue.templateVersion"]:
+                # Through ``**``: the abstract signature keeps its 3.7.0 form, and only a
+                # backend reporting the capability accepts the keyword.
+                replica_options: dict[str, Any] = {"template_version": template_version}
+                return backend.requeue_notification(
+                    notification_id, send_after=send_after, **replica_options
+                )
+            backend.persist_notification_update(
+                notification_id, {"requested_template_version": template_version}
+            )
             return backend.requeue_notification(notification_id, send_after=send_after)
 
         try:
             requeued = self._execute_multi_backend_write(
-                _requeue, _requeue, replication_notification_id=notification_id
+                _requeue_primary, _requeue_replica, replication_notification_id=notification_id
             )
         except NotificationNotFoundError as error:
             # Removed after the read above. Nothing was written.
             raise _action_not_found_error("requeue", notification_id) from error
+        except NotificationVersionChangedError as error:
+            raise _changed_error("requeue", notification_id) from error
         except NotificationRequeueError as error:
             # Another caller changed the status after the read above, and the backend's
             # conditional write refused. Nothing was written.
             raise _requeue_status_error(notification_id, None) from error
-        logger.info("Notification %s requeued", notification_id)
-
-        # A copy, because a backend may hand back the object it holds, and the send below
-        # would then change what this method returns.
-        result = dataclasses.replace(requeued)
-        if _is_due(requeued):
-            self.send(
-                requeued, context=cast("NotificationContextDict | None", requeued.context_used)
+        except UnsupportedNotificationActionError as error:
+            raise _backend_unsupported_error(
+                "requeue",
+                notification_id,
+                _requeue_options_passed(template_version, expected_version),
+                self._primary_backend_identifier,
+            ) from error
+        if template_version is None:
+            logger.info("Notification %s requeued", notification_id)
+        else:
+            logger.info(
+                "Notification %s requeued on template version %s", notification_id, template_version
             )
-        return result
+
+        if not send:
+            logger.info(
+                "Notification %s left for the pending sender because send is False",
+                notification_id,
+            )
+            return requeued
+        if not _is_due(requeued):
+            return requeued
+
+        self.send(requeued, context=cast("NotificationContextDict | None", requeued.context_used))
+        # ``send`` reports nothing back, and with raise_on_failed_send=False it swallows
+        # failures, so the stored notification is the only record of the outcome.
+        try:
+            return self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError:
+            return requeued
 
     def repin_notification(
         self,
         notification_id: int | str | uuid.UUID,
         template_version: int | None = None,
+        *,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
         """
         Pin a notification to a template version, by default the one that is current now.
@@ -2520,31 +2800,50 @@ class NotificationService(Generic[A, B]):
 
         It works the same whether the notification was pinned before or not, and for one-off
         notifications too. It changes ``requested_template_version`` only. It sends nothing and
-        leaves the status alone, so repin a failed notification, then requeue it.
+        leaves the status alone. To repin a failed notification and send it again, pass
+        ``template_version`` to ``requeue_notification``, which does both in one write.
+
+        The primary backend writes through its ``repin_notification``. One that implements it
+        checks the status, and ``expected_version`` when given, in the same write, so a worker
+        sending the notification in between is never overwritten. The base class's default
+        writes through ``persist_notification_update``. Every additional backend then takes the
+        pin unconditionally.
 
         Repinning to the version already pinned writes nothing and returns the notification as
-        it is. Otherwise the write goes through ``persist_notification_update`` on the primary
-        backend, then on every additional backend.
+        it is, unless ``expected_version`` is given: the backend then checks it all the same.
 
         This method may raise the following exceptions:
             * InvalidTemplateVersionError if ``template_version`` is not a non-negative
-              ``int``. Raised before anything is read.
-            * NotificationActionError if the notification is not found (``NOT_FOUND``), was
-              already delivered (``INVALID_STATUS``), or no version was given and the renderer
-              reports none (``NO_TEMPLATE_VERSION``). Nothing is written in any of these cases.
+              ``int``, and InvalidExpectedVersionError if ``expected_version`` is not a
+              non-empty ``str``. Raised before anything is read.
+            * NotificationActionError if the primary backend cannot check
+              ``expected_version`` (``UNSUPPORTED``, before anything is read when it does not
+              report the option, or when the backend refuses the write itself), the notification
+              is not found (``NOT_FOUND``), was already delivered (``INVALID_STATUS``), no
+              version was given and the renderer reports none (``NO_TEMPLATE_VERSION``), or it
+              is no longer at ``expected_version`` (``CHANGED``). Nothing is written in any of
+              these cases.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to repin
             template_version: int | None - the version to pin. It is not checked against the
                 renderer: a version that does not exist fails when the notification is
-                rendered, as it does when passed to ``create_notification``. Left out, the
-                version the renderer for the notification's type reports as current is used.
-                A renderer that raises is logged and treated as reporting no version.
+                rendered, as it does when passed to ``create_notification``. Left out,
+                ``get_current_template_version`` for the notification's template is used.
+            expected_version: str | None - write only if the notification is still at this
+                version, the token ``filter_notification_versions`` returned for it. Needs a
+                primary backend reporting ``repin.expectedVersion``.
 
         Returns:
             Notification | OneOffNotification - the notification with its new pin.
         """
-        _validate_template_version(notification_id, template_version)
+        _validate_template_version(notification_id, template_version, "repin")
+        _validate_expected_version(notification_id, expected_version, "repin")
+        if expected_version is not None:
+            self._assert_action_supported(
+                notification_id, "repin", "repin.expectedVersion", "expected_version"
+            )
+
         notification = self._get_notification_for_action(notification_id, "repin")
         if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
             raise _repin_status_error(notification_id, notification.status)
@@ -2552,26 +2851,51 @@ class NotificationService(Generic[A, B]):
         version = (
             template_version
             if template_version is not None
-            else _current_template_version(self.notification_adapters, notification)
+            else self.get_current_template_version(
+                notification.notification_type, notification.body_template
+            )
         )
         if version is None:
             raise _no_template_version_error(notification_id)
 
-        if notification.requested_template_version == version:
+        # With expected_version the backend has to look: the notification may already carry
+        # the pin and still have changed since the caller listed it.
+        if expected_version is None and notification.requested_template_version == version:
             logger.info(
                 "Notification %s is already pinned to that template version", notification_id
             )
             return notification
 
-        def _repin(backend: B, *_: Any) -> Notification | OneOffNotification:
+        def _repin_primary(backend: B) -> Notification | OneOffNotification:
+            if expected_version is None:
+                return backend.repin_notification(notification_id, version)
+            return backend.repin_notification(
+                notification_id, version, expected_version=expected_version
+            )
+
+        def _repin_replica(backend: B, *_: Any) -> Notification | OneOffNotification:
             return backend.persist_notification_update(
                 notification_id, {"requested_template_version": version}
             )
 
-        repinned = self._execute_multi_backend_write(
-            _repin, _repin, replication_notification_id=notification_id
-        )
-        logger.info("Notification %s repinned", notification_id)
+        try:
+            repinned = self._execute_multi_backend_write(
+                _repin_primary, _repin_replica, replication_notification_id=notification_id
+            )
+        except NotificationNotFoundError as error:
+            raise _action_not_found_error("repin", notification_id) from error
+        except NotificationVersionChangedError as error:
+            raise _changed_error("repin", notification_id) from error
+        except NotificationRepinError as error:
+            raise _repin_status_error(notification_id, None) from error
+        except UnsupportedNotificationActionError as error:
+            raise _backend_unsupported_error(
+                "repin",
+                notification_id,
+                _repin_options_passed(expected_version),
+                self._primary_backend_identifier,
+            ) from error
+        logger.info("Notification %s repinned to template version %s", notification_id, version)
         return repinned
 
     def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
@@ -3653,23 +3977,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             return requested_template_version
         if not self._should_pin(pin_template_versions):
             return None
-
-        for adapter in self.notification_adapters:
-            if adapter.notification_type.value != notification_type:
-                continue
-            try:
-                version = adapter.template_renderer.get_latest_template_version(body_template)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Template renderer %s raised while resolving the current version of "
-                    "template %r; leaving the notification unpinned",
-                    adapter.template_renderer.template_renderer_import_str,
-                    body_template,
-                )
-                continue
-            if version is not None:
-                return version
-        return None
+        # The same lookup as get_current_template_version, so "the version new notifications
+        # get" and what they are pinned to cannot disagree.
+        return _current_template_version(
+            self.notification_adapters, notification_type, body_template
+        )
 
     def _should_pin(self, pin_template_versions: bool | None) -> bool:
         """Whether this call pins, given what it asked for and what the service defaults to.
@@ -4751,6 +5063,86 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             replication_notification_id=notification_id,
         )
 
+    async def get_backend_supported_action_capabilities(
+        self, backend_identifier: str | None = None
+    ) -> dict[str, bool]:
+        """
+        Which optional notification actions the primary backend, or a named one, supports.
+
+        Keys are those of ``vintasend.constants.DEFAULT_BACKEND_ACTION_CAPABILITIES``, every one
+        ``False`` unless the backend reports it. A key whose method the backend does not
+        implement reads ``False`` whatever the backend reports.
+
+        ``requeue_notification`` and ``repin_notification`` read this to decide whether to pass
+        ``expected_version`` and ``template_version`` on, and refuse an option the primary
+        backend does not report with ``NotificationActionError`` reason ``UNSUPPORTED``.
+        """
+        backend = self._get_backend(backend_identifier)
+        return _merge_action_capabilities(backend, await backend.get_action_capabilities())
+
+    async def _assert_action_supported(
+        self,
+        notification_id: int | str | uuid.UUID,
+        action: NotificationAction,
+        capability: str,
+        option: str,
+    ) -> None:
+        """Refuse an option the primary backend would not honour, before anything is read."""
+        capabilities = await self.get_backend_supported_action_capabilities()
+        if capabilities.get(capability) is True:
+            return
+        raise _unsupported_error(
+            action, notification_id, option, capability, self._primary_backend_identifier
+        )
+
+    async def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+        backend_identifier: str | None = None,
+    ) -> list[NotificationVersion]:
+        """
+        The ID and version token of every notification matching ``filter``, a page at a time,
+        from the primary backend or a named one.
+
+        Reads nothing else: no recipient, context, context parameters, rendered content or
+        attachments, so it is the way to count or select notifications that must not be read.
+        Pass a returned ``version`` as ``expected_version`` to ``repin_notification`` or
+        ``requeue_notification`` to act only on a notification that has not changed since it
+        was listed.
+
+        Ordered by ID. A caller that repins or requeues what it lists may change which
+        notifications match, so it should list again from the first page instead of moving on
+        to the next one.
+
+        Raises UnsupportedNotificationActionError when the backend does not implement it
+        (``versions.filter`` is ``False`` in ``get_backend_supported_action_capabilities``).
+        """
+        return await self._get_backend(backend_identifier).filter_notification_versions(
+            filter, page, page_size
+        )
+
+    async def get_current_template_version(
+        self, notification_type: NotificationTypes | str, template_key: str
+    ) -> int | None:
+        """
+        The template version a notification of this type created now would be pinned to: what
+        its renderer reports as current. For ``vintasend-managed-templates`` that is the key's
+        newest active version, or ``None`` when nothing is published or that version is a base.
+
+        ``repin_notification`` without a version, and ``pin_template_versions`` at creation,
+        both use this, so a caller showing "the version new notifications get" agrees with
+        what they pin.
+
+        Asks each adapter of ``notification_type`` in turn and returns the first version
+        reported. Best-effort: a renderer that does not version templates answers ``None``, and
+        one that raises is logged, by renderer and error class only, and treated the same way.
+        """
+        return _current_template_version(
+            self.notification_adapters, _notification_type_value(notification_type), template_key
+        )
+
     async def _get_notification_for_action(
         self, notification_id: int | str | uuid.UUID, action: NotificationAction
     ) -> Notification | OneOffNotification:
@@ -4770,6 +5162,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         self,
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
+        send: bool = True,
     ) -> Notification | OneOffNotification:
         """
         Put a failed or cancelled notification back into ``PENDING_SEND``, so it is sent again.
@@ -4782,20 +5178,31 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         Once the notification is pending again it is due when ``send_after`` is ``None`` or in
         the past, and then it is sent right away, the same as ``create_notification`` does. An
         adapter that delivers through the queue service puts it back on the queue. A future
-        ``send_after`` leaves it for ``send_pending_notifications``. A stored ``context_used``
-        is reused for that send rather than generated again.
+        ``send_after`` leaves it for ``send_pending_notifications``, and so does
+        ``send=False``, even for a due notification. A stored ``context_used`` is reused for
+        the send rather than generated again.
 
-        To change the template version as well, call ``repin_notification`` first. It leaves
-        the status alone, so that order is safe.
+        To change the template version as well, pass ``template_version``: the pin and the
+        status change in one backend write, so the notification is never left pinned but not
+        pending, or pending on the old pin. That needs a primary backend reporting
+        ``requeue.templateVersion``. Calling ``repin_notification`` first and then this still
+        works, in two writes.
 
         The write goes to the primary backend first, then to every additional backend, the
-        same way other writes are replicated. A replica that fails is logged and does not
-        change the result.
+        same way other writes are replicated. Replicas take it unconditionally: a version token
+        belongs to the primary backend. A replica that cannot pin in the same write is repinned
+        and then requeued. A replica that fails is logged and does not change the result.
 
         This method may raise the following exceptions:
-            * NotificationActionError if the notification is not found (``NOT_FOUND``) or is
-              not ``FAILED`` or ``CANCELLED`` (``INVALID_STATUS``). Nothing is written in
-              either case.
+            * InvalidTemplateVersionError if ``template_version`` is not a non-negative ``int``,
+              and InvalidExpectedVersionError if ``expected_version`` is not a non-empty
+              ``str``. Raised before anything is read.
+            * NotificationActionError if the primary backend cannot honour
+              ``expected_version`` or ``template_version`` (``UNSUPPORTED``, before anything is
+              read when it does not report the option, or when the backend refuses the write
+              itself), the notification is not found (``NOT_FOUND``), is not ``FAILED`` or
+              ``CANCELLED`` (``INVALID_STATUS``), or is no longer at ``expected_version``
+              (``CHANGED``). Nothing is written in any of these cases.
             * Whatever ``send`` raises for the send that follows, when the service was built
               with ``raise_on_failed_send=True``.
 
@@ -4803,44 +5210,119 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             notification_id: int | str | uuid.UUID - the ID of the notification to requeue
             send_after: datetime.datetime | None - when to send it. Left out, the notification
                 keeps its own ``send_after``. ``None`` means "send it now".
+            template_version: int | None - pin this version in the same write. Not checked
+                against the renderer, as with ``repin_notification``.
+            expected_version: str | None - write only if the notification is still at this
+                version, the token ``filter_notification_versions`` returned for it. Needs a
+                primary backend reporting ``requeue.expectedVersion``.
+            send: bool - ``False`` requeues without sending, even a due notification, which
+                then waits for ``send_pending_notifications``. No adapter is used, so a service
+                built with no adapters, and so no delivery credentials, can do it.
 
         Returns:
-            Notification | OneOffNotification - the notification as it stands right after
-            being requeued, from before any send that follows.
+            Notification | OneOffNotification - the notification as it stands after any send
+            this call started, read again from the primary backend: ``SENT`` when it went out,
+            ``FAILED`` when the adapter failed, ``PENDING_SEND`` when it is waiting (scheduled,
+            ``send=False``, or handed to a queue). This holds with
+            ``raise_on_failed_send=False`` too.
         """
+        _validate_template_version(notification_id, template_version, "requeue")
+        _validate_expected_version(notification_id, expected_version, "requeue")
+        if expected_version is not None:
+            await self._assert_action_supported(
+                notification_id, "requeue", "requeue.expectedVersion", "expected_version"
+            )
+        if template_version is not None:
+            await self._assert_action_supported(
+                notification_id, "requeue", "requeue.templateVersion", "template_version"
+            )
+
         notification = await self._get_notification_for_action(notification_id, "requeue")
         if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
             raise _requeue_status_error(notification_id, notification.status)
 
-        async def _requeue(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
+        # Only the options the caller passed, so a backend that predates them never sees one.
+        primary_options: dict[str, Any] = {}
+        if template_version is not None:
+            primary_options["template_version"] = template_version
+        if expected_version is not None:
+            primary_options["expected_version"] = expected_version
+
+        async def _requeue_primary(backend: BAIO) -> Notification | OneOffNotification:
+            return await backend.requeue_notification(
+                notification_id, send_after=send_after, **primary_options
+            )
+
+        async def _requeue_replica(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
+            if template_version is None:
+                return await backend.requeue_notification(notification_id, send_after=send_after)
+            replica_capabilities = _merge_action_capabilities(
+                backend, await backend.get_action_capabilities()
+            )
+            if replica_capabilities["requeue.templateVersion"]:
+                # Through ``**``: the abstract signature keeps its 3.7.0 form, and only a
+                # backend reporting the capability accepts the keyword.
+                replica_options: dict[str, Any] = {"template_version": template_version}
+                return await backend.requeue_notification(
+                    notification_id, send_after=send_after, **replica_options
+                )
+            await backend.persist_notification_update(
+                notification_id, {"requested_template_version": template_version}
+            )
             return await backend.requeue_notification(notification_id, send_after=send_after)
 
         try:
             requeued = await self._execute_multi_backend_write(
-                _requeue, _requeue, replication_notification_id=notification_id
+                _requeue_primary, _requeue_replica, replication_notification_id=notification_id
             )
         except NotificationNotFoundError as error:
             # Removed after the read above. Nothing was written.
             raise _action_not_found_error("requeue", notification_id) from error
+        except NotificationVersionChangedError as error:
+            raise _changed_error("requeue", notification_id) from error
         except NotificationRequeueError as error:
             # Another caller changed the status after the read above, and the backend's
             # conditional write refused. Nothing was written.
             raise _requeue_status_error(notification_id, None) from error
-        logger.info("Notification %s requeued", notification_id)
-
-        # A copy, because a backend may hand back the object it holds, and the send below
-        # would then change what this method returns.
-        result = dataclasses.replace(requeued)
-        if _is_due(requeued):
-            await self.send(
-                requeued, context=cast("NotificationContextDict | None", requeued.context_used)
+        except UnsupportedNotificationActionError as error:
+            raise _backend_unsupported_error(
+                "requeue",
+                notification_id,
+                _requeue_options_passed(template_version, expected_version),
+                self._primary_backend_identifier,
+            ) from error
+        if template_version is None:
+            logger.info("Notification %s requeued", notification_id)
+        else:
+            logger.info(
+                "Notification %s requeued on template version %s", notification_id, template_version
             )
-        return result
+
+        if not send:
+            logger.info(
+                "Notification %s left for the pending sender because send is False",
+                notification_id,
+            )
+            return requeued
+        if not _is_due(requeued):
+            return requeued
+
+        await self.send(
+            requeued, context=cast("NotificationContextDict | None", requeued.context_used)
+        )
+        # ``send`` reports nothing back, and with raise_on_failed_send=False it swallows
+        # failures, so the stored notification is the only record of the outcome.
+        try:
+            return await self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError:
+            return requeued
 
     async def repin_notification(
         self,
         notification_id: int | str | uuid.UUID,
         template_version: int | None = None,
+        *,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
         """
         Pin a notification to a template version, by default the one that is current now.
@@ -4851,31 +5333,50 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         It works the same whether the notification was pinned before or not, and for one-off
         notifications too. It changes ``requested_template_version`` only. It sends nothing and
-        leaves the status alone, so repin a failed notification, then requeue it.
+        leaves the status alone. To repin a failed notification and send it again, pass
+        ``template_version`` to ``requeue_notification``, which does both in one write.
+
+        The primary backend writes through its ``repin_notification``. One that implements it
+        checks the status, and ``expected_version`` when given, in the same write, so a worker
+        sending the notification in between is never overwritten. The base class's default
+        writes through ``persist_notification_update``. Every additional backend then takes the
+        pin unconditionally.
 
         Repinning to the version already pinned writes nothing and returns the notification as
-        it is. Otherwise the write goes through ``persist_notification_update`` on the primary
-        backend, then on every additional backend.
+        it is, unless ``expected_version`` is given: the backend then checks it all the same.
 
         This method may raise the following exceptions:
             * InvalidTemplateVersionError if ``template_version`` is not a non-negative
-              ``int``. Raised before anything is read.
-            * NotificationActionError if the notification is not found (``NOT_FOUND``), was
-              already delivered (``INVALID_STATUS``), or no version was given and the renderer
-              reports none (``NO_TEMPLATE_VERSION``). Nothing is written in any of these cases.
+              ``int``, and InvalidExpectedVersionError if ``expected_version`` is not a
+              non-empty ``str``. Raised before anything is read.
+            * NotificationActionError if the primary backend cannot check
+              ``expected_version`` (``UNSUPPORTED``, before anything is read when it does not
+              report the option, or when the backend refuses the write itself), the notification
+              is not found (``NOT_FOUND``), was already delivered (``INVALID_STATUS``), no
+              version was given and the renderer reports none (``NO_TEMPLATE_VERSION``), or it
+              is no longer at ``expected_version`` (``CHANGED``). Nothing is written in any of
+              these cases.
 
         Parameters:
             notification_id: int | str | uuid.UUID - the ID of the notification to repin
             template_version: int | None - the version to pin. It is not checked against the
                 renderer: a version that does not exist fails when the notification is
-                rendered, as it does when passed to ``create_notification``. Left out, the
-                version the renderer for the notification's type reports as current is used.
-                A renderer that raises is logged and treated as reporting no version.
+                rendered, as it does when passed to ``create_notification``. Left out,
+                ``get_current_template_version`` for the notification's template is used.
+            expected_version: str | None - write only if the notification is still at this
+                version, the token ``filter_notification_versions`` returned for it. Needs a
+                primary backend reporting ``repin.expectedVersion``.
 
         Returns:
             Notification | OneOffNotification - the notification with its new pin.
         """
-        _validate_template_version(notification_id, template_version)
+        _validate_template_version(notification_id, template_version, "repin")
+        _validate_expected_version(notification_id, expected_version, "repin")
+        if expected_version is not None:
+            await self._assert_action_supported(
+                notification_id, "repin", "repin.expectedVersion", "expected_version"
+            )
+
         notification = await self._get_notification_for_action(notification_id, "repin")
         if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
             raise _repin_status_error(notification_id, notification.status)
@@ -4883,26 +5384,51 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         version = (
             template_version
             if template_version is not None
-            else _current_template_version(self.notification_adapters, notification)
+            else await self.get_current_template_version(
+                notification.notification_type, notification.body_template
+            )
         )
         if version is None:
             raise _no_template_version_error(notification_id)
 
-        if notification.requested_template_version == version:
+        # With expected_version the backend has to look: the notification may already carry
+        # the pin and still have changed since the caller listed it.
+        if expected_version is None and notification.requested_template_version == version:
             logger.info(
                 "Notification %s is already pinned to that template version", notification_id
             )
             return notification
 
-        async def _repin(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
+        async def _repin_primary(backend: BAIO) -> Notification | OneOffNotification:
+            if expected_version is None:
+                return await backend.repin_notification(notification_id, version)
+            return await backend.repin_notification(
+                notification_id, version, expected_version=expected_version
+            )
+
+        async def _repin_replica(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
             return await backend.persist_notification_update(
                 notification_id, {"requested_template_version": version}
             )
 
-        repinned = await self._execute_multi_backend_write(
-            _repin, _repin, replication_notification_id=notification_id
-        )
-        logger.info("Notification %s repinned", notification_id)
+        try:
+            repinned = await self._execute_multi_backend_write(
+                _repin_primary, _repin_replica, replication_notification_id=notification_id
+            )
+        except NotificationNotFoundError as error:
+            raise _action_not_found_error("repin", notification_id) from error
+        except NotificationVersionChangedError as error:
+            raise _changed_error("repin", notification_id) from error
+        except NotificationRepinError as error:
+            raise _repin_status_error(notification_id, None) from error
+        except UnsupportedNotificationActionError as error:
+            raise _backend_unsupported_error(
+                "repin",
+                notification_id,
+                _repin_options_passed(expected_version),
+                self._primary_backend_identifier,
+            ) from error
+        logger.info("Notification %s repinned to template version %s", notification_id, version)
         return repinned
 
     async def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:

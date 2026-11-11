@@ -7,9 +7,10 @@ import os
 import uuid
 from collections.abc import Iterable
 from decimal import Decimal
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 from vintasend.constants import (
+    REPINNABLE_NOTIFICATION_STATUSES,
     REQUEUEABLE_NOTIFICATION_STATUSES,
     UNSET,
     NotificationStatus,
@@ -20,7 +21,9 @@ from vintasend.exceptions import (
     AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
+    NotificationRepinError,
     NotificationRequeueError,
+    NotificationVersionChangedError,
 )
 from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
     FakeAsyncIOAttachmentManager,
@@ -33,6 +36,7 @@ from vintasend.services.dataclasses import (
     AttachmentFileRecord,
     Notification,
     NotificationAttachment,
+    NotificationVersion,
     OneOffNotification,
     StoredAttachment,
     UpdateNotificationKwargs,
@@ -46,6 +50,7 @@ from vintasend.services.notification_backends.filters import (
     matches_filter,
     sort_notifications,
 )
+from vintasend.utils.uuid_utils import uuid7
 
 
 class FakeFileAttachmentFile(AttachmentFile):
@@ -76,13 +81,125 @@ class FakeFileAttachmentFile(AttachmentFile):
         self.file_data = b""
 
 
-class FakeFileBackend(BaseNotificationBackend):
+class _NotificationVersionTokens:
+    """Version tokens for the fakes: a fresh UUIDv7 whenever a notification's stored form changes.
+
+    A real backend keeps the token in a column that every write sets (``vintasend-django`` and
+    ``vintasend-sqlalchemy`` use a ``notification_version`` UUID). The fakes have no columns, so
+    they compare each notification's serialized form with the one they last stored, at every
+    store, and issue a new token for any that changed. That catches every write path, including
+    ones added later, without each method having to remember to bump the token.
+
+    The comparison reads whole records, but only here, at write time.
+    ``filter_notification_versions`` reads the ID and the token and nothing else.
+    """
+
+    notifications: list[Notification | OneOffNotification]
+    _version_tokens: dict[str, str]
+    _version_forms: dict[str, str]
+
+    def _reset_version_tokens(self) -> None:
+        self._version_tokens = {}
+        self._version_forms = {}
+
+    @staticmethod
+    def _version_form(notification: Notification | OneOffNotification) -> str:
+        # Built from the dataclass fields rather than the persisted JSON, so every field --
+        # including any added later -- is covered. An attachment's ``file`` is a handle to the
+        # bytes, not part of the record, so it is left out; the rest of each attachment is kept.
+        form: dict[str, object] = {
+            field.name: getattr(notification, field.name)
+            for field in dataclasses.fields(notification)
+            if field.name != "attachments"
+        }
+        form["is_one_off"] = isinstance(notification, OneOffNotification)
+        form["attachments"] = [
+            {
+                field.name: getattr(attachment, field.name)
+                for field in dataclasses.fields(attachment)
+                if field.name != "file"
+            }
+            for attachment in notification.attachments
+        ]
+        return json.dumps(form, sort_keys=True, default=str)
+
+    def _refresh_version_tokens(self) -> None:
+        forms: dict[str, str] = {}
+        for notification in self.notifications:
+            key = str(notification.id)
+            form = self._version_form(notification)
+            forms[key] = form
+            if self._version_forms.get(key) != form:
+                self._version_tokens[key] = str(uuid7())
+        self._version_forms = forms
+        self._version_tokens = {
+            key: token for key, token in self._version_tokens.items() if key in forms
+        }
+
+    def _version_token(self, notification_id: int | str | uuid.UUID) -> str:
+        self._refresh_version_tokens()
+        return self._version_tokens[str(notification_id)]
+
+    def _check_expected_version(
+        self,
+        action: str,
+        notification_id: int | str | uuid.UUID,
+        expected_version: str | None,
+    ) -> None:
+        if expected_version is not None and expected_version != self._version_token(
+            notification_id
+        ):
+            raise NotificationVersionChangedError(
+                f"Cannot {action} notification {notification_id}: it changed since that "
+                "version was read"
+            )
+
+    def _versions_page(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        self._refresh_version_tokens()
+        matched = [n for n in self.notifications if matches_filter(n, filter)]
+        if len({type(n.id) for n in matched}) <= 1:
+            # Native order: ints numerically (2 before 10), UUIDs by value.
+            matched.sort(key=lambda n: cast(Any, n.id))
+        else:
+            # Mixed id types (str ids from create, UUID ids from one-offs) do not compare with
+            # each other, so group by type and order by text within each group.
+            matched.sort(key=lambda n: (type(n.id).__name__, str(n.id)))
+        start = (page - 1) * page_size
+        return [
+            NotificationVersion(id=n.id, version=self._version_tokens[str(n.id)])
+            for n in matched[start : start + page_size]
+        ]
+
+
+# Every action and presence filter the fakes implement, reported so the service passes the
+# options through.
+_FAKE_ACTION_CAPABILITIES: dict[str, bool] = {
+    "repin.expectedVersion": True,
+    "requeue.expectedVersion": True,
+    "requeue.templateVersion": True,
+    "versions.filter": True,
+}
+_FAKE_FILTER_CAPABILITIES: dict[str, bool] = {
+    "fields.hasSendAfter": True,
+    "negation.hasSendAfter": True,
+    "fields.hasRequestedTemplateVersion": True,
+    "negation.hasRequestedTemplateVersion": True,
+}
+
+
+class FakeFileBackend(_NotificationVersionTokens, BaseNotificationBackend):
     notifications: list[Notification | OneOffNotification]
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
         super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
+        self._reset_version_tokens()
         # In-memory file records (keyed by id) and notification->file join rows. The bytes
         # they describe live in the attachment manager, not here.
         self._attachment_file_records: dict[str, AttachmentFileRecord] = {}
@@ -108,6 +225,7 @@ class FakeFileBackend(BaseNotificationBackend):
         self.notifications = []
         self._attachment_file_records = {}
         self._attachment_join_rows = []
+        self._reset_version_tokens()
         try:
             os.remove(self.database_file_name)
         except FileNotFoundError:
@@ -318,6 +436,7 @@ class FakeFileBackend(BaseNotificationBackend):
             )
 
     def _store_notifications(self):
+        self._refresh_version_tokens()
         json_output_file = open(self.database_file_name, "w", encoding="utf-8")
         json.dump(
             [self._convert_notification_to_json(n) for n in self.notifications],
@@ -662,10 +781,16 @@ class FakeFileBackend(BaseNotificationBackend):
         self,
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        # The status check and the write have nothing in between, and this backend lives in
-        # one process, so no other caller can change the status while this runs.
+        # The checks and the write have nothing in between, and this backend lives in one
+        # process, so no other caller can change the notification while this runs. The order
+        # of the checks is what a SQL backend reports after its conditional UPDATE matched
+        # nothing: not found, then changed, then the wrong status.
         notification = self.get_notification(notification_id)
+        self._check_expected_version("requeue", notification_id, expected_version)
         if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
             raise NotificationRequeueError(
                 f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
@@ -674,9 +799,42 @@ class FakeFileBackend(BaseNotificationBackend):
         notification.sent_at = None
         if send_after is not UNSET:
             notification.send_after = send_after
+        if template_version is not None:
+            notification.requested_template_version = template_version
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         self._store_notifications()
         return notification
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+    ) -> Notification | OneOffNotification:
+        notification = self.get_notification(notification_id)
+        self._check_expected_version("repin", notification_id, expected_version)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            return notification
+        notification.requested_template_version = template_version
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._store_notifications()
+        return notification
+
+    def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        return self._versions_page(filter, page, page_size)
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        return dict(_FAKE_ACTION_CAPABILITIES)
 
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
@@ -760,9 +918,9 @@ class FakeFileBackend(BaseNotificationBackend):
         return sum(1 for n in self.notifications if matches_filter(n, filter))
 
     def get_filter_capabilities(self) -> dict[str, bool]:
-        # This fake supports the full vocabulary, so it declines nothing: an empty report means
-        # every capability is supported once merged over the all-``True`` default.
-        return {}
+        # This fake supports the full vocabulary, so it declines nothing, and it reports the
+        # presence filters, the only keys that default to ``False``.
+        return dict(_FAKE_FILTER_CAPABILITIES)
 
     def mark_sent_as_read_bulk(
         self,
@@ -890,13 +1048,14 @@ class InvalidBackend:
         pass
 
 
-class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
+class FakeAsyncIOFileBackend(_NotificationVersionTokens, AsyncIOBaseNotificationBackend):
     notifications: list[Notification | OneOffNotification]
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
         super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
+        self._reset_version_tokens()
         # In-memory file records (keyed by id) and notification->file join rows. The bytes
         # they describe live in the attachment manager, not here.
         self._attachment_file_records: dict[str, AttachmentFileRecord] = {}
@@ -922,6 +1081,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         self.notifications = []
         self._attachment_file_records = {}
         self._attachment_join_rows = []
+        self._reset_version_tokens()
         try:
             os.remove(self.database_file_name)
         except FileNotFoundError:
@@ -1294,6 +1454,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     async def _store_notifications(self, lock: asyncio.Lock | None = None):
         if lock is not None:
             await lock.acquire()
+        self._refresh_version_tokens()
         json_output_file = open(self.database_file_name, "w", encoding="utf-8")
         json.dump(
             [self._convert_notification_to_json(n) for n in self.notifications],
@@ -1476,10 +1637,15 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
         lock: asyncio.Lock | None = None,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        # Nothing is awaited between the status check and the write, so no other coroutine
-        # can change the status while this runs.
+        # Nothing is awaited between the checks and the write, so no other coroutine can
+        # change the notification while this runs. The checks run in the order a SQL backend
+        # reports after its conditional UPDATE matched nothing: not found, changed, status.
         notification = await self.get_notification(notification_id)
+        self._check_expected_version("requeue", notification_id, expected_version)
         if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
             raise NotificationRequeueError(
                 f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
@@ -1488,9 +1654,43 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification.sent_at = None
         if send_after is not UNSET:
             notification.send_after = send_after
+        if template_version is not None:
+            notification.requested_template_version = template_version
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         await self._store_notifications(lock)
         return notification
+
+    async def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+        lock: asyncio.Lock | None = None,
+    ) -> Notification | OneOffNotification:
+        notification = await self.get_notification(notification_id)
+        self._check_expected_version("repin", notification_id, expected_version)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            return notification
+        notification.requested_template_version = template_version
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        await self._store_notifications(lock)
+        return notification
+
+    async def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        return self._versions_page(filter, page, page_size)
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        return dict(_FAKE_ACTION_CAPABILITIES)
 
     async def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
@@ -1571,9 +1771,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         return sum(1 for n in self.notifications if matches_filter(n, filter))
 
     async def get_filter_capabilities(self) -> dict[str, bool]:
-        # This fake supports the full vocabulary, so it declines nothing: an empty report means
-        # every capability is supported once merged over the all-``True`` default.
-        return {}
+        # This fake supports the full vocabulary, so it declines nothing, and it reports the
+        # presence filters, the only keys that default to ``False``.
+        return dict(_FAKE_FILTER_CAPABILITIES)
 
     async def mark_sent_as_read_bulk(
         self,

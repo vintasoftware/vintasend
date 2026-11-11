@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from vintasend.constants import UNSET, UnsetType
+from vintasend.constants import REPINNABLE_NOTIFICATION_STATUSES, UNSET, UnsetType
+from vintasend.exceptions import NotificationRepinError, UnsupportedNotificationActionError
 from vintasend.services.dataclasses import ApplyResult
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
         AnyNotificationAttachment,
         AttachmentFileRecord,
         Notification,
+        NotificationVersion,
         OneOffNotification,
         StoredAttachment,
         UpdateNotificationKwargs,
@@ -267,6 +269,25 @@ class BaseNotificationBackend(ABC):
         Return the full notification, attachments included, the same way ``get_notification``
         does. The service sends whatever this returns.
 
+        Two optional keyword-only arguments, added in 3.8.0, are deliberately not part of the
+        abstract signature above, so an override written for 3.7 still type-checks. A backend
+        that reports ``requeue.templateVersion`` or ``requeue.expectedVersion`` in
+        ``get_action_capabilities()`` must accept the matching argument as keyword-only
+        (widening the signature is a valid override). The service passes each one only to a
+        backend that reports it, so a backend that does not support them leaves them out of
+        its signature:
+
+        * ``template_version`` (``requeue.templateVersion``): set ``requested_template_version``
+          in the same write, so the notification is never left pinned but not pending, or
+          pending on the old pin.
+        * ``expected_version`` (``requeue.expectedVersion``): write only if the notification is
+          still at this version, the token ``filter_notification_versions`` returned for it, and
+          raise ``NotificationVersionChangedError`` otherwise, writing nothing. A SQL backend
+          adds the version column to the ``WHERE``; when nothing matched, it reads the row once
+          to say why.
+
+        A backend that reports neither must raise if it is handed one anyway, never ignore it.
+
         Required since 3.7.0. A backend written against an earlier version must add it.
         """
         ...
@@ -444,6 +465,105 @@ class BaseNotificationBackend(ABC):
         MUST report ``{'pagination.oneIndexed': False}``, because a caller that assumes the
         wrong base gets no error -- just the wrong rows. See
         ``DEFAULT_BACKEND_FILTER_CAPABILITIES``.
+
+        The presence filters (``fields.hasSendAfter``, ``negation.hasSendAfter``,
+        ``fields.hasRequestedTemplateVersion``, ``negation.hasRequestedTemplateVersion``) are
+        the exception: they default to ``False``, so a backend that evaluates them reports
+        ``True``.
+        """
+        return {}
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+    ) -> "Notification | OneOffNotification":
+        """Pin a notification to a template version, in one conditional write where it can.
+
+        An implementation must:
+
+        * only move a notification whose status is one of
+          ``vintasend.constants.REPINNABLE_NOTIFICATION_STATUSES``, and raise
+          ``NotificationRepinError`` for any other. A SQL backend puts the statuses in the
+          ``UPDATE``'s ``WHERE``, so a worker sending the notification in between is never
+          overwritten;
+        * raise ``NotificationVersionChangedError`` when ``expected_version`` is given and the
+          notification is at another version, or when it changes between the read and the
+          write;
+        * raise ``NotificationNotFoundError`` when no notification has that ID;
+        * write nothing in any of those cases, nor when the notification is already pinned to
+          ``template_version``, which it then returns as it is;
+        * change ``requested_template_version`` only.
+
+        Report ``repin.expectedVersion`` in ``get_action_capabilities()`` once it does all of
+        that.
+
+        Optional, added in 3.8.0. This default reads the notification, checks its status and
+        writes through ``persist_notification_update``. It cannot check ``expected_version``,
+        so it raises ``UnsupportedNotificationActionError`` when given one.
+        """
+        if expected_version is not None:
+            raise UnsupportedNotificationActionError(
+                f"Cannot repin notification {notification_id}: this backend does not check "
+                "expected_version"
+            )
+        notification = self.get_notification(notification_id)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            return notification
+        return self.persist_notification_update(
+            notification_id, {"requested_template_version": template_version}
+        )
+
+    def filter_notification_versions(
+        self,
+        filter: "NotificationFilter",  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> "list[NotificationVersion]":
+        """The ID and version token of every notification matching ``filter``, a page at a time.
+
+        For counting and selecting notifications without reading them. An implementation must
+        not read recipients, contexts, context parameters, rendered content or attachments to
+        answer it, and must return nothing but ``NotificationVersion(id, version)``. A SQL
+        backend selects the ID and version columns only.
+
+        The version is an opaque string that changes on every write to the notification, by
+        anyone. ``requeue_notification`` and ``repin_notification`` take it back as
+        ``expected_version``.
+
+        Results are ordered by ID, so pages are stable while nothing is written. A caller that
+        changes what it lists as it goes should list again from page 1 rather than move on to
+        the next page. Pages follow the backend's ``pagination.oneIndexed`` convention.
+
+        Optional, added in 3.8.0. Report ``versions.filter`` in ``get_action_capabilities()``
+        when it is implemented. This default raises ``UnsupportedNotificationActionError``.
+        """
+        raise UnsupportedNotificationActionError(
+            f"Backend {self.get_backend_identifier() or type(self).__name__} does not support "
+            "filter_notification_versions"
+        )
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        """Which optional notification actions this backend supports.
+
+        Keys are those of ``vintasend.constants.DEFAULT_BACKEND_ACTION_CAPABILITIES``, all
+        ``False`` by default, and a missing key reads as ``False``. A backend reports ``True``
+        for what it implements:
+
+        * ``repin.expectedVersion``: ``repin_notification`` is overridden and checks
+          ``expected_version``;
+        * ``requeue.expectedVersion``: ``requeue_notification`` checks ``expected_version``;
+        * ``requeue.templateVersion``: ``requeue_notification`` pins ``template_version`` in the
+          same write;
+        * ``versions.filter``: ``filter_notification_versions`` is implemented.
+
+        Optional, added in 3.8.0. This default reports nothing.
         """
         return {}
 

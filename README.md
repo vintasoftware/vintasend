@@ -334,8 +334,32 @@ notification_service.filter_notifications(
 
 Both are `None` on a notification whose renderer has no versions, and `used_template_version`
 is `None` until it has been sent. The NULL rule above applies unchanged, so those rows never
-match a positive version filter and are included under negation -- which also means there is
-no positive way to ask for "the unpinned ones".
+match a positive version filter and are included under negation.
+
+**Whether a field is set.** `has_send_after` and `has_requested_template_version` ask whether a
+notification has a send time, or a template pin: `True` matches the ones where it is set, `False`
+the ones where it is `None`. They are how you ask for "the unpinned ones", and, combined with a
+negated version, for "pinned, but not to V" -- a negated version alone also matches the unpinned
+ones, under the NULL rule above:
+
+```python
+# pinned, but not to v4
+notification_service.filter_notifications(
+    {
+        "and": [
+            {"has_requested_template_version": True},
+            {"not": {"requested_template_version": 4}},
+        ]
+    },
+    page=1,
+    page_size=10,
+)
+```
+
+A value that is not a `bool` matches nothing. These two are newer than the rest of the vocabulary,
+so their capability keys (`fields.hasSendAfter`, `negation.hasSendAfter`,
+`fields.hasRequestedTemplateVersion`, `negation.hasRequestedTemplateVersion`) default to `False`:
+a backend that evaluates them reports them, and one that predates them is never assumed to.
 
 **`and` / `or` / `not`** compose and nest arbitrarily -- each takes the same `NotificationFilter`
 shape, so a group can hold field filters or further groups:
@@ -556,13 +580,27 @@ template pin, stored context, adapter used, git commit SHA and attachments stay 
 notification_service.requeue_notification(notification_id)                   # keep its send_after
 notification_service.requeue_notification(notification_id, send_after=None)  # send it now
 notification_service.requeue_notification(notification_id, send_after=tomorrow)
+notification_service.requeue_notification(notification_id, template_version=4)  # pin it too
+notification_service.requeue_notification(notification_id, send=False)       # don't send it here
 ```
 
 Leaving `send_after` out keeps the notification's own schedule, and `None` means "send it now".
 When the requeued notification is due, it is sent right away, as `create_notification` does: an
 adapter that uses the queue service puts it back on the queue. A stored `context_used` is reused
-for that send rather than generated again. The method returns the notification as it stands right
-after being requeued, from before that send.
+for that send rather than generated again.
+
+It returns the notification as it stands after that send, read again from the primary backend:
+`SENT` when it went out, `FAILED` when the adapter failed, `PENDING_SEND` when it is waiting
+(scheduled, handed to a queue, or `send=False`). That holds with `raise_on_failed_send=False` too,
+where the failure is logged rather than raised, so read `status` to know what happened.
+
+`template_version` pins that version in the same backend write that requeues, so the notification
+is never left pinned but not pending, or pending on the old pin. Calling `repin_notification` and
+then `requeue_notification` still works, in two writes.
+
+`send=False` requeues without sending, even a due notification, which then waits for
+`send_pending_notifications` (typically a scheduled job). No adapter is used, so a process that
+only requeues can be built with `notification_adapters=[]` and needs no delivery credentials.
 
 `PENDING_SEND` is refused because it is already queued. `SENT` and `READ` are refused, because
 requeueing would deliver the notification twice under one record; use `resend_notification` for
@@ -580,10 +618,15 @@ notification_service.repin_notification(notification_id, template_version=4)  # 
 notification_service.requeue_notification(notification_id, send_after=None)   # then retry it
 ```
 
-Without a version, it pins the version that the template renderer for the notification's type
-reports as current (`get_latest_template_version`). It sends nothing and leaves the status alone,
-so repin a failed notification and then requeue it. Repinning to the version already pinned
-writes nothing.
+Without a version, it pins `get_current_template_version(notification_type, body_template)`:
+what the template renderer for the notification's type reports as current. That is the same
+answer `pin_template_versions` pins at creation, so a screen showing "the version new
+notifications get" agrees with both. It sends nothing and leaves the status alone. Repinning to
+the version already pinned writes nothing.
+
+A backend that implements `repin_notification` checks the status in the same write, so a worker
+sending the notification in between is never overwritten. Otherwise the service writes through
+`persist_notification_update`.
 
 Both methods refuse with `NotificationActionError` before anything is written. Branch on its
 `reason`, not its message:
@@ -593,15 +636,86 @@ Both methods refuse with `NotificationActionError` before anything is written. B
 | `NOT_FOUND` | No notification has that id in the primary backend |
 | `INVALID_STATUS` | The status does not allow the action. `error.status` says which, when known |
 | `NO_TEMPLATE_VERSION` | Repin only: no version was given, and the renderer reports none (or raised) |
+| `CHANGED` | The notification is no longer at `expected_version`, or changed between the backend's read and its write |
+| `UNSUPPORTED` | The primary backend cannot honour `expected_version` or `template_version` (see below) |
 
 The error also carries `action` (`"requeue"` or `"repin"`) and `notification_id`. Its message
 names the notification by id only, so it is safe to log and to return to a client. A
 `template_version` that is not a non-negative `int` (a `bool` included) raises
-`InvalidTemplateVersionError`, a `ValueError`, before anything is read.
+`InvalidTemplateVersionError`, and an `expected_version` that is not a non-empty `str` raises
+`InvalidExpectedVersionError`, both `ValueError`s, before anything is read.
 
 Both actions write to the primary backend and then to every additional backend, like other
-writes. `REQUEUEABLE_NOTIFICATION_STATUSES` and `REPINNABLE_NOTIFICATION_STATUSES` in
+writes. Additional backends take the write unconditionally: a version token belongs to the
+primary. One that cannot pin and requeue in one write is repinned and then requeued.
+`REQUEUEABLE_NOTIFICATION_STATUSES` and `REPINNABLE_NOTIFICATION_STATUSES` in
 `vintasend.constants` list the allowed statuses.
+
+#### Moving notifications safely
+
+To move many notifications onto a fixed template -- the scheduled ones still pinned to the broken
+version, and the failed ones -- list them without reading them, then act on each only if it has
+not changed since it was listed:
+
+```python
+from vintasend.exceptions import NotificationActionError
+
+scheduled_on_old_pin = {
+    "and": [
+        {"body_template": "welcome"},
+        {"status": NotificationStatus.PENDING_SEND},
+        {"has_send_after": True},
+        {"has_requested_template_version": True},
+        {"not": {"requested_template_version": 4}},
+    ]
+}
+failed = {"and": [{"body_template": "welcome"}, {"status": NotificationStatus.FAILED}]}
+
+
+def move(listing, act):
+    # Each move takes the notification out of the listing, so always read page 1 again.
+    while page := notification_service.filter_notification_versions(listing, 1, 100):
+        for entry in page:
+            try:
+                act(entry)
+            except NotificationActionError as error:
+                if error.reason != "CHANGED":
+                    raise
+                # Written since it was listed: the next listing carries its new version, and
+                # the filter decides again whether it still needs moving.
+
+
+move(scheduled_on_old_pin, lambda e: notification_service.repin_notification(
+    e.id, 4, expected_version=e.version))
+move(failed, lambda e: notification_service.requeue_notification(
+    e.id, template_version=4, expected_version=e.version))
+```
+
+`filter_notification_versions(filter, page, page_size)` returns `NotificationVersion(id, version)`
+entries and nothing else, ordered by id: the backend reads no recipient, context, context
+parameters, rendered content or attachment to answer it, so it is the way to count or select
+notifications that must not be read. The `version` is an opaque token that changes on every
+write to the notification, by anyone; compare tokens for equality only. Moving what you list
+changes what matches, so list again from page 1 rather than moving on to page 2.
+
+`expected_version` makes the move conditional: if the notification was written since it was
+listed, the call raises `NotificationActionError` with reason `CHANGED` and writes nothing.
+
+These options are optional backend features. `get_backend_supported_action_capabilities()`
+reports which ones the primary backend supports, all `False` by default:
+
+| Key | `True` when |
+|---|---|
+| `repin.expectedVersion` | the backend's `repin_notification` checks `expected_version` |
+| `requeue.expectedVersion` | the backend's `requeue_notification` checks `expected_version` |
+| `requeue.templateVersion` | the backend's `requeue_notification` pins in the same write |
+| `versions.filter` | the backend implements `filter_notification_versions` |
+
+An option the primary backend does not report is refused with reason `UNSUPPORTED` before
+anything is read or written, never passed to a backend that would ignore it.
+`filter_notification_versions` on a backend without it raises
+`UnsupportedNotificationActionError`. The fakes, `vintasend-django` and `vintasend-sqlalchemy`
+support all four.
 
 Requeueing a cancelled notification needs a backend that keeps cancelled rows. The Django and
 SQLAlchemy backends and the in-repo fake keep them with status `CANCELLED`, and `get_notification`
@@ -1029,6 +1143,11 @@ service = NotificationService(
 
 service.create_notification(..., pin_template_versions=False)   # not this one
 ```
+
+`get_current_template_version(notification_type, template_key)` returns the version pinning
+would record right now, or `None` when the renderer has none. Use it to show "the version new
+notifications get": `pin_template_versions` and `repin_notification` without a version pin
+exactly that.
 
 The default is **off**, because turning it on changes what an existing deployment sends: unpinned, a notification scheduled for next week renders whatever the template says next week, which is sometimes exactly what a team wants. The flag is never stored -- it decides what `requested_template_version` is set to at that moment, and nothing afterwards consults it.
 
