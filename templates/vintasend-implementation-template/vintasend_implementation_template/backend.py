@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
+from vintasend.constants import UNSET, UnsetType
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 
@@ -184,6 +185,17 @@ class ImplementationTemplateBackend(BaseNotificationBackend):
         """TODO: implement cancel_notification — see vintasend/services/notification_backends/base.py for the contract."""
         raise NotImplementedError(
             "TODO: implement cancel_notification — see "
+            "vintasend/services/notification_backends/base.py for the contract"
+        )
+
+    def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> "Notification | OneOffNotification":
+        """TODO: implement requeue_notification — see vintasend/services/notification_backends/base.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement requeue_notification — see "
             "vintasend/services/notification_backends/base.py for the contract"
         )
 
@@ -493,6 +505,18 @@ class ImplementationTemplateAsyncIOBackend(AsyncIOBaseNotificationBackend):
         """TODO: implement cancel_notification — see vintasend/services/notification_backends/asyncio_base.py for the contract."""
         raise NotImplementedError(
             "TODO: implement cancel_notification — see "
+            "vintasend/services/notification_backends/asyncio_base.py for the contract"
+        )
+
+    async def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+        lock: "asyncio.Lock | None" = None,
+    ) -> "Notification | OneOffNotification":
+        """TODO: implement requeue_notification — see vintasend/services/notification_backends/asyncio_base.py for the contract."""
+        raise NotImplementedError(
+            "TODO: implement requeue_notification — see "
             "vintasend/services/notification_backends/asyncio_base.py for the contract"
         )
 

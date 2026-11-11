@@ -9,8 +9,19 @@ from collections.abc import Iterable
 from decimal import Decimal
 from typing import BinaryIO, cast
 
-from vintasend.constants import NotificationStatus, NotificationTypes
-from vintasend.exceptions import AttachmentFileNotFoundError, NotificationNotFoundError
+from vintasend.constants import (
+    REQUEUEABLE_NOTIFICATION_STATUSES,
+    UNSET,
+    NotificationStatus,
+    NotificationTypes,
+    UnsetType,
+)
+from vintasend.exceptions import (
+    AttachmentFileNotFoundError,
+    NotificationCancelError,
+    NotificationNotFoundError,
+    NotificationRequeueError,
+)
 from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
     FakeAsyncIOAttachmentManager,
     FakeAttachmentManager,
@@ -626,7 +637,11 @@ class FakeFileBackend(BaseNotificationBackend):
         return notification
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
-        """Cancel a notification.
+        """Cancel a pending notification by setting its status to ``CANCELLED``.
+
+        The row is kept, as the Django and SQLAlchemy backends keep it, so a cancelled
+        notification can still be read and requeued. Only a ``PENDING_SEND`` notification
+        can be cancelled.
 
         Deliberately no attachment hook: cancelling a notification does not delete its
         attachment files or their join rows. Cascade, if any, is the schema's job (e.g. a
@@ -635,8 +650,33 @@ class FakeFileBackend(BaseNotificationBackend):
         method does implicitly.
         """
         notification = self.get_notification(notification_id)
-        self.notifications.remove(notification)
+        if notification.status != NotificationStatus.PENDING_SEND.value:
+            raise NotificationCancelError(
+                f"Cannot cancel notification {notification_id}: it is not PENDING_SEND"
+            )
+        notification.status = NotificationStatus.CANCELLED.value
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         self._store_notifications()
+
+    def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> Notification | OneOffNotification:
+        # The status check and the write have nothing in between, and this backend lives in
+        # one process, so no other caller can change the status while this runs.
+        notification = self.get_notification(notification_id)
+        if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
+            raise NotificationRequeueError(
+                f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
+            )
+        notification.status = NotificationStatus.PENDING_SEND.value
+        notification.sent_at = None
+        if send_after is not UNSET:
+            notification.send_after = send_after
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._store_notifications()
+        return notification
 
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
@@ -1410,7 +1450,11 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     async def cancel_notification(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
     ) -> None:
-        """Cancel a notification.
+        """Cancel a pending notification by setting its status to ``CANCELLED``.
+
+        The row is kept, as the Django and SQLAlchemy backends keep it, so a cancelled
+        notification can still be read and requeued. Only a ``PENDING_SEND`` notification
+        can be cancelled.
 
         Deliberately no attachment hook: cancelling a notification does not delete its
         attachment files or their join rows. Cascade, if any, is the schema's job (e.g. a
@@ -1419,8 +1463,34 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         method does implicitly.
         """
         notification = await self.get_notification(notification_id)
-        self.notifications.remove(notification)
+        if notification.status != NotificationStatus.PENDING_SEND.value:
+            raise NotificationCancelError(
+                f"Cannot cancel notification {notification_id}: it is not PENDING_SEND"
+            )
+        notification.status = NotificationStatus.CANCELLED.value
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
         await self._store_notifications(lock)
+
+    async def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+        lock: asyncio.Lock | None = None,
+    ) -> Notification | OneOffNotification:
+        # Nothing is awaited between the status check and the write, so no other coroutine
+        # can change the status while this runs.
+        notification = await self.get_notification(notification_id)
+        if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
+            raise NotificationRequeueError(
+                f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
+            )
+        notification.status = NotificationStatus.PENDING_SEND.value
+        notification.sent_at = None
+        if send_after is not UNSET:
+            notification.send_after = send_after
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        await self._store_notifications(lock)
+        return notification
 
     async def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False

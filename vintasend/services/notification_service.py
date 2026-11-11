@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import datetime
 import logging
 import sys
@@ -20,13 +21,23 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import Unpack
 
-from vintasend.constants import NotificationStatus, NotificationTypes
+from vintasend.constants import (
+    REPINNABLE_NOTIFICATION_STATUSES,
+    REQUEUEABLE_NOTIFICATION_STATUSES,
+    UNSET,
+    NotificationStatus,
+    NotificationTypes,
+    UnsetType,
+)
 from vintasend.exceptions import (
     BackendMigrationError,
     BackendNotFoundError,
     DuplicateBackendIdentifierError,
     DuplicateNotificationAdapterError,
     GitCommitShaReassignmentError,
+    InvalidTemplateVersionError,
+    NotificationAction,
+    NotificationActionError,
     NotificationContextGenerationError,
     NotificationError,
     NotificationMarkFailedError,
@@ -34,6 +45,7 @@ from vintasend.exceptions import (
     NotificationNotFoundError,
     NotificationQueueServiceMissingError,
     NotificationRenderError,
+    NotificationRequeueError,
     NotificationResendError,
     NotificationSendError,
     NotificationUpdateError,
@@ -286,6 +298,119 @@ def validate_unique_adapter_notification_types(
             "Duplicate adapter notification types are not allowed. Found duplicates for: "
             + ", ".join(duplicates)
         )
+
+
+# --- requeue and repin -------------------------------------------------------------------
+#
+# Shared by NotificationService and AsyncIONotificationService, so the two refuse the same
+# inputs with the same errors. Every message names the notification by its ID and nothing else:
+# these messages are logged and returned to HTTP clients, and the applications using this
+# library can handle health data.
+
+
+def _action_not_found_error(
+    action: NotificationAction, notification_id: int | str | uuid.UUID
+) -> NotificationActionError:
+    return NotificationActionError(
+        f"Notification {notification_id} not found",
+        action=action,
+        reason="NOT_FOUND",
+        notification_id=notification_id,
+    )
+
+
+def _requeue_status_error(
+    notification_id: int | str | uuid.UUID, status: str | None
+) -> NotificationActionError:
+    return NotificationActionError(
+        f"Cannot requeue notification {notification_id}: only FAILED and CANCELLED "
+        "notifications can be requeued. Use resend_notification to send a delivered "
+        "notification again.",
+        action="requeue",
+        reason="INVALID_STATUS",
+        notification_id=notification_id,
+        status=status,
+    )
+
+
+def _repin_status_error(
+    notification_id: int | str | uuid.UUID, status: str
+) -> NotificationActionError:
+    return NotificationActionError(
+        f"Cannot repin notification {notification_id}: it has already been delivered, and "
+        "its pin records what it was asked to render.",
+        action="repin",
+        reason="INVALID_STATUS",
+        notification_id=notification_id,
+        status=status,
+    )
+
+
+def _no_template_version_error(notification_id: int | str | uuid.UUID) -> NotificationActionError:
+    return NotificationActionError(
+        f"Cannot repin notification {notification_id}: no template renderer for its "
+        "notification type reports a version for its template.",
+        action="repin",
+        reason="NO_TEMPLATE_VERSION",
+        notification_id=notification_id,
+    )
+
+
+def _validate_template_version(
+    notification_id: int | str | uuid.UUID, template_version: object
+) -> None:
+    """Refuse a template version that is not a non-negative ``int``.
+
+    ``bool`` is refused although it is an ``int`` subclass: ``True`` is not a version anyone
+    means to pin.
+    """
+    if template_version is None:
+        return
+    if (
+        isinstance(template_version, bool)
+        or not isinstance(template_version, int)
+        or template_version < 0
+    ):
+        raise InvalidTemplateVersionError(
+            f"Cannot repin notification {notification_id}: template_version must be a "
+            "non-negative integer"
+        )
+
+
+def _is_due(notification: "Notification | OneOffNotification") -> bool:
+    """Whether a pending notification should be sent now rather than left for later."""
+    return notification.send_after is None or notification.send_after <= datetime.datetime.now(
+        tz=datetime.timezone.utc
+    )
+
+
+def _current_template_version(
+    adapters: Iterable[Any], notification: "Notification | OneOffNotification"
+) -> int | None:
+    """The version the renderer for this notification's type reports as current, or None.
+
+    A renderer that raises is logged and treated as reporting no version. The log line names
+    the notification by its ID and the error by its class only: a renderer's message can quote
+    template content.
+    """
+    for adapter in adapters:
+        if adapter.notification_type.value != notification.notification_type:
+            continue
+        try:
+            version = adapter.template_renderer.get_latest_template_version(
+                notification.body_template
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "Template renderer raised %s while resolving the current template version for "
+                "notification %s; treating it as no version",
+                type(error).__name__,
+                notification.id,
+            )
+            continue
+        if version is not None:
+            return version
+    return None
 
 
 class Contexts(metaclass=SingletonMeta):
@@ -896,7 +1021,7 @@ class NotificationService(Generic[A, B]):
             "preheader_template": snapshot.preheader_template,
             "adapter_extra_parameters": snapshot.adapter_extra_parameters,
         }
-        replica.persist_notification_update(notification_id=snapshot.id, update_data=update_data)
+        replica.persist_notification_update(snapshot.id, update_data)
         if snapshot.context_used is not None:
             replica.store_context_used(
                 snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
@@ -1730,16 +1855,13 @@ class NotificationService(Generic[A, B]):
             )
         self._pin_template_version_on_update(notification_id, kwargs, pin_template_versions)
         notification = self._execute_multi_backend_write(
-            lambda backend: backend.persist_notification_update(
-                notification_id=notification_id,
-                update_data=kwargs,
-            ),
+            lambda backend: backend.persist_notification_update(notification_id, kwargs),
             self._replicate_snapshot_fallback,
             replication_notification_id=notification_id,
         )
-        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        # Only a pending notification is sent. A failed or cancelled one can be updated too
+        # (``repin_notification`` relies on it), and stays where it is until it is requeued.
+        if notification.status == NotificationStatus.PENDING_SEND.value and _is_due(notification):
             self.send(notification)
         return notification
 
@@ -2206,8 +2328,7 @@ class NotificationService(Generic[A, B]):
                 Notification,
                 self._execute_multi_backend_write(
                     lambda backend: backend.persist_notification_update(
-                        notification_id=clone.id,
-                        update_data={"attachments": list(source.attachments)},
+                        clone.id, {"attachments": list(source.attachments)}
                     ),
                     self._replicate_snapshot_fallback,
                     replication_notification_id=clone.id,
@@ -2284,9 +2405,10 @@ class NotificationService(Generic[A, B]):
         def _cancel_on_replica(
             backend: B, snapshot: "Notification | OneOffNotification | None"
         ) -> None:
-            # A cancel deletes the row, so there is no snapshot to apply -- mirror the delete on
-            # the replica. A replica that never held the row is already in the desired (absent)
-            # state, so a not-found is success, not a failure.
+            # Reached when the replica declines the snapshot, or when there is none because the
+            # primary deletes cancelled rows rather than keeping them as CANCELLED. Mirror the
+            # cancel on the replica. A replica that never held the row is already in the desired
+            # (absent) state, so a not-found is success, not a failure.
             try:
                 backend.cancel_notification(notification_id)
             except NotificationNotFoundError:
@@ -2297,6 +2419,160 @@ class NotificationService(Generic[A, B]):
             _cancel_on_replica,
             replication_notification_id=notification_id,
         )
+
+    def _get_notification_for_action(
+        self, notification_id: int | str | uuid.UUID, action: NotificationAction
+    ) -> Notification | OneOffNotification:
+        """The notification an action is about, regular or one-off, read from the primary backend.
+
+        The backend seam has a single lookup, ``get_notification``, and it returns either kind
+        of notification, so there is no separate one-off lookup to fall back to.
+
+        Raises NotificationActionError (``NOT_FOUND``) when no notification has that ID.
+        """
+        try:
+            return self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError as error:
+            raise _action_not_found_error(action, notification_id) from error
+
+    def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> Notification | OneOffNotification:
+        """
+        Put a failed or cancelled notification back into ``PENDING_SEND``, so it is sent again.
+
+        The notification keeps its ID, content and template pin, so this retries the same
+        notification, where ``resend_notification`` creates a new one from a notification that
+        was delivered. The stored ``context_used``, ``adapter_used``, git commit SHA and
+        attachments are left as they are.
+
+        Once the notification is pending again it is due when ``send_after`` is ``None`` or in
+        the past, and then it is sent right away, the same as ``create_notification`` does. An
+        adapter that delivers through the queue service puts it back on the queue. A future
+        ``send_after`` leaves it for ``send_pending_notifications``. A stored ``context_used``
+        is reused for that send rather than generated again.
+
+        To change the template version as well, call ``repin_notification`` first. It leaves
+        the status alone, so that order is safe.
+
+        The write goes to the primary backend first, then to every additional backend, the
+        same way other writes are replicated. A replica that fails is logged and does not
+        change the result.
+
+        This method may raise the following exceptions:
+            * NotificationActionError if the notification is not found (``NOT_FOUND``) or is
+              not ``FAILED`` or ``CANCELLED`` (``INVALID_STATUS``). Nothing is written in
+              either case.
+            * Whatever ``send`` raises for the send that follows, when the service was built
+              with ``raise_on_failed_send=True``.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the ID of the notification to requeue
+            send_after: datetime.datetime | None - when to send it. Left out, the notification
+                keeps its own ``send_after``. ``None`` means "send it now".
+
+        Returns:
+            Notification | OneOffNotification - the notification as it stands right after
+            being requeued, from before any send that follows.
+        """
+        notification = self._get_notification_for_action(notification_id, "requeue")
+        if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
+            raise _requeue_status_error(notification_id, notification.status)
+
+        def _requeue(backend: B, *_: Any) -> Notification | OneOffNotification:
+            return backend.requeue_notification(notification_id, send_after=send_after)
+
+        try:
+            requeued = self._execute_multi_backend_write(
+                _requeue, _requeue, replication_notification_id=notification_id
+            )
+        except NotificationNotFoundError as error:
+            # Removed after the read above. Nothing was written.
+            raise _action_not_found_error("requeue", notification_id) from error
+        except NotificationRequeueError as error:
+            # Another caller changed the status after the read above, and the backend's
+            # conditional write refused. Nothing was written.
+            raise _requeue_status_error(notification_id, None) from error
+        logger.info("Notification %s requeued", notification_id)
+
+        # A copy, because a backend may hand back the object it holds, and the send below
+        # would then change what this method returns.
+        result = dataclasses.replace(requeued)
+        if _is_due(requeued):
+            self.send(
+                requeued, context=cast("NotificationContextDict | None", requeued.context_used)
+            )
+        return result
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int | None = None,
+    ) -> Notification | OneOffNotification:
+        """
+        Pin a notification to a template version, by default the one that is current now.
+
+        Use it after publishing a fixed template, to move notifications that are pending,
+        failed or cancelled onto the fix. ``update_notification`` keeps an existing pin unless
+        ``body_template`` changes, so it cannot do this.
+
+        It works the same whether the notification was pinned before or not, and for one-off
+        notifications too. It changes ``requested_template_version`` only. It sends nothing and
+        leaves the status alone, so repin a failed notification, then requeue it.
+
+        Repinning to the version already pinned writes nothing and returns the notification as
+        it is. Otherwise the write goes through ``persist_notification_update`` on the primary
+        backend, then on every additional backend.
+
+        This method may raise the following exceptions:
+            * InvalidTemplateVersionError if ``template_version`` is not a non-negative
+              ``int``. Raised before anything is read.
+            * NotificationActionError if the notification is not found (``NOT_FOUND``), was
+              already delivered (``INVALID_STATUS``), or no version was given and the renderer
+              reports none (``NO_TEMPLATE_VERSION``). Nothing is written in any of these cases.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the ID of the notification to repin
+            template_version: int | None - the version to pin. It is not checked against the
+                renderer: a version that does not exist fails when the notification is
+                rendered, as it does when passed to ``create_notification``. Left out, the
+                version the renderer for the notification's type reports as current is used.
+                A renderer that raises is logged and treated as reporting no version.
+
+        Returns:
+            Notification | OneOffNotification - the notification with its new pin.
+        """
+        _validate_template_version(notification_id, template_version)
+        notification = self._get_notification_for_action(notification_id, "repin")
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise _repin_status_error(notification_id, notification.status)
+
+        version = (
+            template_version
+            if template_version is not None
+            else _current_template_version(self.notification_adapters, notification)
+        )
+        if version is None:
+            raise _no_template_version_error(notification_id)
+
+        if notification.requested_template_version == version:
+            logger.info(
+                "Notification %s is already pinned to that template version", notification_id
+            )
+            return notification
+
+        def _repin(backend: B, *_: Any) -> Notification | OneOffNotification:
+            return backend.persist_notification_update(
+                notification_id, {"requested_template_version": version}
+            )
+
+        repinned = self._execute_multi_backend_write(
+            _repin, _repin, replication_notification_id=notification_id
+        )
+        logger.info("Notification %s repinned", notification_id)
+        return repinned
 
     def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """
@@ -3044,9 +3320,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             "preheader_template": snapshot.preheader_template,
             "adapter_extra_parameters": snapshot.adapter_extra_parameters,
         }
-        await replica.persist_notification_update(
-            notification_id=snapshot.id, update_data=update_data
-        )
+        await replica.persist_notification_update(snapshot.id, update_data)
         if snapshot.context_used is not None:
             await replica.store_context_used(
                 snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
@@ -3890,16 +4164,13 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             )
         await self._pin_template_version_on_update(notification_id, kwargs, pin_template_versions)
         notification = await self._execute_multi_backend_write(
-            lambda backend: backend.persist_notification_update(
-                notification_id=notification_id,
-                update_data=kwargs,
-            ),
+            lambda backend: backend.persist_notification_update(notification_id, kwargs),
             self._replicate_snapshot_fallback,
             replication_notification_id=notification_id,
         )
-        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        # Only a pending notification is sent. A failed or cancelled one can be updated too
+        # (``repin_notification`` relies on it), and stays where it is until it is requeued.
+        if notification.status == NotificationStatus.PENDING_SEND.value and _is_due(notification):
             await self.send(notification)
         return notification
 
@@ -4388,8 +4659,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 Notification,
                 await self._execute_multi_backend_write(
                     lambda backend: backend.persist_notification_update(
-                        notification_id=clone.id,
-                        update_data={"attachments": list(source.attachments)},
+                        clone.id, {"attachments": list(source.attachments)}
                     ),
                     self._replicate_snapshot_fallback,
                     replication_notification_id=clone.id,
@@ -4466,9 +4736,10 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         async def _cancel_on_replica(
             backend: BAIO, snapshot: "Notification | OneOffNotification | None"
         ) -> None:
-            # A cancel deletes the row, so there is no snapshot to apply -- mirror the delete on
-            # the replica. A replica that never held the row is already in the desired (absent)
-            # state, so a not-found is success, not a failure.
+            # Reached when the replica declines the snapshot, or when there is none because the
+            # primary deletes cancelled rows rather than keeping them as CANCELLED. Mirror the
+            # cancel on the replica. A replica that never held the row is already in the desired
+            # (absent) state, so a not-found is success, not a failure.
             try:
                 await backend.cancel_notification(notification_id)
             except NotificationNotFoundError:
@@ -4479,6 +4750,160 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             _cancel_on_replica,
             replication_notification_id=notification_id,
         )
+
+    async def _get_notification_for_action(
+        self, notification_id: int | str | uuid.UUID, action: NotificationAction
+    ) -> Notification | OneOffNotification:
+        """The notification an action is about, regular or one-off, read from the primary backend.
+
+        The backend seam has a single lookup, ``get_notification``, and it returns either kind
+        of notification, so there is no separate one-off lookup to fall back to.
+
+        Raises NotificationActionError (``NOT_FOUND``) when no notification has that ID.
+        """
+        try:
+            return await self.notification_backend.get_notification(notification_id)
+        except NotificationNotFoundError as error:
+            raise _action_not_found_error(action, notification_id) from error
+
+    async def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> Notification | OneOffNotification:
+        """
+        Put a failed or cancelled notification back into ``PENDING_SEND``, so it is sent again.
+
+        The notification keeps its ID, content and template pin, so this retries the same
+        notification, where ``resend_notification`` creates a new one from a notification that
+        was delivered. The stored ``context_used``, ``adapter_used``, git commit SHA and
+        attachments are left as they are.
+
+        Once the notification is pending again it is due when ``send_after`` is ``None`` or in
+        the past, and then it is sent right away, the same as ``create_notification`` does. An
+        adapter that delivers through the queue service puts it back on the queue. A future
+        ``send_after`` leaves it for ``send_pending_notifications``. A stored ``context_used``
+        is reused for that send rather than generated again.
+
+        To change the template version as well, call ``repin_notification`` first. It leaves
+        the status alone, so that order is safe.
+
+        The write goes to the primary backend first, then to every additional backend, the
+        same way other writes are replicated. A replica that fails is logged and does not
+        change the result.
+
+        This method may raise the following exceptions:
+            * NotificationActionError if the notification is not found (``NOT_FOUND``) or is
+              not ``FAILED`` or ``CANCELLED`` (``INVALID_STATUS``). Nothing is written in
+              either case.
+            * Whatever ``send`` raises for the send that follows, when the service was built
+              with ``raise_on_failed_send=True``.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the ID of the notification to requeue
+            send_after: datetime.datetime | None - when to send it. Left out, the notification
+                keeps its own ``send_after``. ``None`` means "send it now".
+
+        Returns:
+            Notification | OneOffNotification - the notification as it stands right after
+            being requeued, from before any send that follows.
+        """
+        notification = await self._get_notification_for_action(notification_id, "requeue")
+        if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
+            raise _requeue_status_error(notification_id, notification.status)
+
+        async def _requeue(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
+            return await backend.requeue_notification(notification_id, send_after=send_after)
+
+        try:
+            requeued = await self._execute_multi_backend_write(
+                _requeue, _requeue, replication_notification_id=notification_id
+            )
+        except NotificationNotFoundError as error:
+            # Removed after the read above. Nothing was written.
+            raise _action_not_found_error("requeue", notification_id) from error
+        except NotificationRequeueError as error:
+            # Another caller changed the status after the read above, and the backend's
+            # conditional write refused. Nothing was written.
+            raise _requeue_status_error(notification_id, None) from error
+        logger.info("Notification %s requeued", notification_id)
+
+        # A copy, because a backend may hand back the object it holds, and the send below
+        # would then change what this method returns.
+        result = dataclasses.replace(requeued)
+        if _is_due(requeued):
+            await self.send(
+                requeued, context=cast("NotificationContextDict | None", requeued.context_used)
+            )
+        return result
+
+    async def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int | None = None,
+    ) -> Notification | OneOffNotification:
+        """
+        Pin a notification to a template version, by default the one that is current now.
+
+        Use it after publishing a fixed template, to move notifications that are pending,
+        failed or cancelled onto the fix. ``update_notification`` keeps an existing pin unless
+        ``body_template`` changes, so it cannot do this.
+
+        It works the same whether the notification was pinned before or not, and for one-off
+        notifications too. It changes ``requested_template_version`` only. It sends nothing and
+        leaves the status alone, so repin a failed notification, then requeue it.
+
+        Repinning to the version already pinned writes nothing and returns the notification as
+        it is. Otherwise the write goes through ``persist_notification_update`` on the primary
+        backend, then on every additional backend.
+
+        This method may raise the following exceptions:
+            * InvalidTemplateVersionError if ``template_version`` is not a non-negative
+              ``int``. Raised before anything is read.
+            * NotificationActionError if the notification is not found (``NOT_FOUND``), was
+              already delivered (``INVALID_STATUS``), or no version was given and the renderer
+              reports none (``NO_TEMPLATE_VERSION``). Nothing is written in any of these cases.
+
+        Parameters:
+            notification_id: int | str | uuid.UUID - the ID of the notification to repin
+            template_version: int | None - the version to pin. It is not checked against the
+                renderer: a version that does not exist fails when the notification is
+                rendered, as it does when passed to ``create_notification``. Left out, the
+                version the renderer for the notification's type reports as current is used.
+                A renderer that raises is logged and treated as reporting no version.
+
+        Returns:
+            Notification | OneOffNotification - the notification with its new pin.
+        """
+        _validate_template_version(notification_id, template_version)
+        notification = await self._get_notification_for_action(notification_id, "repin")
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise _repin_status_error(notification_id, notification.status)
+
+        version = (
+            template_version
+            if template_version is not None
+            else _current_template_version(self.notification_adapters, notification)
+        )
+        if version is None:
+            raise _no_template_version_error(notification_id)
+
+        if notification.requested_template_version == version:
+            logger.info(
+                "Notification %s is already pinned to that template version", notification_id
+            )
+            return notification
+
+        async def _repin(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
+            return await backend.persist_notification_update(
+                notification_id, {"requested_template_version": version}
+            )
+
+        repinned = await self._execute_multi_backend_write(
+            _repin, _repin, replication_notification_id=notification_id
+        )
+        logger.info("Notification %s repinned", notification_id)
+        return repinned
 
     async def delayed_send(self, notification_id: int | str | uuid.UUID) -> None:
         """

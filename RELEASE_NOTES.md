@@ -1,6 +1,107 @@
 # Release Notes
 
-## Version 3.6.0 (2026-10-29)
+## Version 3.7.0 (unreleased)
+
+Two notification actions, so nobody has to edit notification rows in the database to retry a
+failed send or to move a notification onto a fixed template. They match the TypeScript
+VintaSend 1.0.0-alpha10 release: `requeue_notification` and `repin_notification` on both
+services, a new required backend method, and two `vintasend-api` endpoints that follow the
+shared `openapi.yaml`. **Custom backends must implement `requeue_notification`**; see
+Backwards compatibility.
+
+### Features
+
+#### `requeue_notification` and `repin_notification`
+
+* **`requeue_notification(notification_id, send_after=UNSET)`** on `NotificationService` and
+  `AsyncIONotificationService` puts a `FAILED` or `CANCELLED` notification back into
+  `PENDING_SEND` and clears `sent_at`. It keeps the ID, content, template pin, stored context,
+  adapter used, git commit SHA and attachments, so it retries the same notification, where
+  `resend_notification` creates a new one. Leaving `send_after` out keeps the notification's
+  own schedule, and `None` means "send it now". When it is due, it is sent right away, as on
+  create, and a queue adapter puts it back on the queue. A stored `context_used` is reused for
+  that send. It returns the notification as it stands from before the send.
+* **`repin_notification(notification_id, template_version=None)`** sets
+  `requested_template_version` on a `PENDING_SEND`, `FAILED` or `CANCELLED` notification. Left
+  out, the version is the one the renderer for the notification's type reports as current. It
+  sends nothing and leaves the status alone. Repinning to the version already pinned writes
+  nothing. A renderer that raises is logged and counts as reporting no version.
+* Both look the notification up in the primary backend and write to the primary, then to every
+  additional backend, like other writes. A replica that fails is logged and does not change the
+  result.
+* Refusals raise the new **`NotificationActionError`** before anything is written. It carries
+  `action` (`"requeue"` / `"repin"`), `reason` (`NOT_FOUND`, `INVALID_STATUS` or
+  `NO_TEMPLATE_VERSION`), `notification_id` and, for a status refusal, `status`. Its message
+  names the notification by ID only. An invalid `template_version` (not a non-negative `int`,
+  `bool` included) raises **`InvalidTemplateVersionError`**, a `ValueError`, before anything is
+  read.
+* New exports in `vintasend.constants`: `REQUEUEABLE_NOTIFICATION_STATUSES` (`FAILED`,
+  `CANCELLED`), `REPINNABLE_NOTIFICATION_STATUSES` (`PENDING_SEND`, `FAILED`, `CANCELLED`), and
+  the `UNSET` sentinel with its `Unset` / `UnsetType` types. New in `vintasend.exceptions`:
+  `NotificationActionError`, `InvalidTemplateVersionError` and `NotificationRequeueError`.
+
+#### `vintasend-django` and `vintasend-sqlalchemy` implement `requeue_notification`
+
+* Each backend (both halves of `vintasend-sqlalchemy`) checks the status and writes in one
+  conditional `UPDATE ... WHERE id = ? AND status IN ('FAILED', 'CANCELLED')`, so two callers
+  racing cannot both succeed. It returns the notification with its attachments.
+
+#### `vintasend-api`: `POST /api/v1/notifications/{id}/requeue` and `/repin`
+
+* Both follow `openapi.yaml`, which is byte-identical again to `vintasend-ts-api`'s at
+  `v1.0.0-alpha10`. `requeue` takes an optional `{ "sendAfter"?: string | null }`, and `repin`
+  an optional `{ "templateVersion"?: integer }` that must be a JSON integer `>= 0`. Both answer
+  `{ "data": Notification }` serialized like a list row, 404 for an unknown ID and 409 for a
+  refusal, with the core library's message. Any other failure is the generic 500.
+
+### Bug Fixes
+
+#### `update_notification` and `resend_notification` work with the Django and SQLAlchemy backends again
+
+* The service called `persist_notification_update(notification_id=..., update_data=...)` by
+  keyword. `vintasend-django` and `vintasend-sqlalchemy` name the second parameter
+  `updated_data`, so `update_notification`, a `resend_notification` of a notification with
+  attachments, and replication to a replica that declines snapshots all raised `TypeError` on
+  them. The service now passes both arguments positionally, which works with every released
+  backend.
+* `vintasend-django` and `vintasend-sqlalchemy` now name the parameter `update_data`, as the seam
+  does. Code that calls their `persist_notification_update` directly with `updated_data=` must
+  switch to `update_data=` or pass it positionally.
+
+### Backwards compatibility
+
+**Custom backends must change.** `requeue_notification` is a new `@abstractmethod` on both
+`BaseNotificationBackend` and `AsyncIOBaseNotificationBackend`. A backend subclass without it
+raises `TypeError` when it is constructed. This ships as a minor release, following the
+precedent set by 1.2.0, and this note is the warning.
+
+* **MUST implement:** `requeue_notification(notification_id, send_after=UNSET)` (the AsyncIO
+  one also takes `lock=None`). Move only a `FAILED` or `CANCELLED` notification, in one step
+  where the store allows it. Raise `NotificationNotFoundError` for an unknown ID and
+  `NotificationRequeueError` for any other status. Set `PENDING_SEND`, clear `sent_at`, apply
+  `send_after` only when it is passed (`None` included), and return the full notification with
+  its attachments. `vintasend-django` and `vintasend-sqlalchemy` implement it in this release.
+  The implementation template has a stub for it and now pins `vintasend ^3.7.0`.
+* **SHOULD accept:** `persist_notification_update` on a `FAILED` or `CANCELLED` notification,
+  not only a pending one. `repin_notification` writes through it. `vintasend-django` and
+  `vintasend-sqlalchemy` now accept both; a `SENT` or `READ` notification still raises
+  `NotificationUpdateError`.
+
+Behaviour that changed for everyone:
+
+* **Cancelled notifications stay readable.** `get_notification` in `vintasend-django` and
+  `vintasend-sqlalchemy` now returns a cancelled notification with status `CANCELLED`, instead
+  of raising `NotificationNotFoundError`. That matches `filter_notifications`, which already
+  listed them, and the TypeScript backends. As a result, `vintasend-api` shows a cancelled
+  notification's detail, cancelling one twice is a 409 instead of a 404, and
+  `resend_notification` can clone a cancelled notification.
+* **The in-repo fakes keep cancelled rows.** `FakeFileBackend.cancel_notification` and its
+  AsyncIO twin set `CANCELLED` instead of deleting the row, and refuse a notification that is
+  not `PENDING_SEND` with `NotificationCancelError`, as the real backends do.
+* **`update_notification` sends only a pending notification.** After the write it sends the
+  notification when it is due and `PENDING_SEND`. A `FAILED` or `CANCELLED` one stays where it
+  is until it is requeued.
+* `openapi.yaml` gains the two operations. Nothing existing changed in the HTTP contract.
 
 A dependency refresh across the family. Every package now allows the latest release of each of its
 dependencies. The two HTTP APIs gain Django 6.0 and 6.1, and `vintasend-fastapi-mail` fixes the

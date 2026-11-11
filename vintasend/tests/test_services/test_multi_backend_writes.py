@@ -265,10 +265,13 @@ class MultiBackendWriteFanoutTestCase(TestCase):
                 NotificationStatus.READ.value
             )
 
-        service.cancel_notification(notification.id)
+        # Only a pending notification can be cancelled, and the row is kept as CANCELLED.
+        pending = self._create(service, send_after=_future())
+        service.cancel_notification(pending.id)
         for replica in (self.replica_one, self.replica_two):
-            with self.assertRaises(NotificationNotFoundError):
-                replica.get_notification(notification.id)
+            assert replica.get_notification(pending.id).status == (
+                NotificationStatus.CANCELLED.value
+            )
 
     def test_mark_read_bulk_fans_out_to_all_backends(self):
         service = self.build_service(additional_backends=[self.replica_one, self.replica_two])
@@ -484,10 +487,13 @@ class AsyncIOMultiBackendWriteFanoutTestCase(IsolatedAsyncioTestCase):
                 NotificationStatus.READ.value
             )
 
-        await service.cancel_notification(notification.id)
+        # Only a pending notification can be cancelled, and the row is kept as CANCELLED.
+        pending = await self._create(service, send_after=_future())
+        await service.cancel_notification(pending.id)
         for replica in (self.replica_one, self.replica_two):
-            with self.assertRaises(NotificationNotFoundError):
-                await replica.get_notification(notification.id)
+            assert (await replica.get_notification(pending.id)).status == (
+                NotificationStatus.CANCELLED.value
+            )
 
     async def test_mark_read_bulk_fans_out_to_all_backends(self):
         service = self.build_service(additional_backends=[self.replica_one, self.replica_two])

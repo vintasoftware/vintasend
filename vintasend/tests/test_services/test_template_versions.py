@@ -252,7 +252,7 @@ class TemplateVersionPinningTestCase(TestCase):
             )
 
         # It decides how the update behaves; it is not one of the fields being updated.
-        assert "pin_template_versions" not in persist.call_args.kwargs["update_data"]
+        assert "pin_template_versions" not in persist.call_args.args[1]
 
     # -- updating -------------------------------------------------------
 

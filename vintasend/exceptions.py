@@ -1,3 +1,7 @@
+import uuid
+from typing import Literal
+
+
 class NotificationError(ValueError):
     pass
 
@@ -163,3 +167,58 @@ class NotificationRenderError(NotificationError):
 
     Distinct from NotificationTemplateRenderingError, which covers a renderer failing while
     actually rendering a template it was handed."""
+
+
+NotificationAction = Literal["requeue", "repin"]
+
+# Why ``requeue_notification`` or ``repin_notification`` refused:
+#
+# * ``NOT_FOUND``: no notification has that ID in the primary backend.
+# * ``INVALID_STATUS``: the notification's status does not allow the action. The error's
+#   ``status`` says which status it was, when the service knows it.
+# * ``NO_TEMPLATE_VERSION``: a repin to the current version found none. Either no renderer for
+#   the notification's type versions its templates, or the renderer failed to answer.
+NotificationActionErrorReason = Literal["NOT_FOUND", "INVALID_STATUS", "NO_TEMPLATE_VERSION"]
+
+
+class NotificationActionError(NotificationError):
+    """Raised when ``requeue_notification`` or ``repin_notification`` refuses, before anything
+    is written.
+
+    Callers branch on ``reason``, not on the message. An HTTP API maps ``NOT_FOUND`` to 404 and
+    every other reason to 409.
+
+    The message names the notification by its ID and nothing else, so it is safe to log and to
+    return to a client.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        action: NotificationAction,
+        reason: NotificationActionErrorReason,
+        notification_id: "int | str | uuid.UUID",
+        status: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.action: NotificationAction = action
+        self.reason: NotificationActionErrorReason = reason
+        self.notification_id = notification_id
+        self.status = status
+
+
+class InvalidTemplateVersionError(NotificationError):
+    """Raised when a template version passed to ``repin_notification`` is not a non-negative
+    ``int``. ``bool`` is refused too, although it is an ``int`` subclass. Raised before anything
+    is read."""
+
+
+class NotificationRequeueError(NotificationUpdateError):
+    """Raised by a backend's ``requeue_notification`` when the notification exists but its
+    status is not one of ``REQUEUEABLE_NOTIFICATION_STATUSES``, so nothing was written.
+
+    The service checks the status first, so a backend raises this only when another caller
+    changed the status in between. For example, a worker sent the notification, or a second
+    caller requeued it first."""
