@@ -74,9 +74,17 @@ UnsetType = Literal[Unset.UNSET]
 # * ``requeue.templateVersion``: ``requeue_notification`` pins ``template_version`` in the same
 #   write that re-queues.
 # * ``versions.filter``: ``filter_notification_versions`` is implemented.
+# * ``writes.notificationVersion``: every write method that changes a single notification
+#   accepts a keyword-only ``notification_version``, the token the row must hold afterwards, and
+#   ``mark_sent_as_read_bulk`` a keyword-only ``notification_versions`` mapping per row. The
+#   service passes them only to a replica that reports this, so the replica holds the primary's
+#   tokens even when it replays writes instead of applying snapshots. Never sent to the primary.
+#
+# More keys may be added in later releases; read them by name rather than assuming this set.
 DEFAULT_BACKEND_ACTION_CAPABILITIES: Final[dict[str, bool]] = {
     "repin.expectedVersion": False,
     "requeue.expectedVersion": False,
     "requeue.templateVersion": False,
     "versions.filter": False,
+    "writes.notificationVersion": False,
 }

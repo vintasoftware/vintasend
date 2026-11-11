@@ -60,6 +60,47 @@ compatibility.
   `NotificationVersion`, `DEFAULT_BACKEND_ACTION_CAPABILITIES`,
   `NOTIFICATION_ACTION_ERROR_REASONS` and `vintasend.utils.uuid_utils.uuid7`.
 * The fake backends implement every new method, and keep a per-notification version token.
+* **Version tokens replicate.** The primary backend issues the token and replication carries it
+  to additional backends, so a version listed from a read replica
+  (`filter_notification_versions(..., backend_identifier="replica")`) is one the primary accepts
+  as `expected_version`. A replica that has not caught up yet gives a token the primary
+  refuses, usually with `CHANGED` (a requeue checks the status first, so a notification that has
+  moved on can be refused with `INVALID_STATUS`); list again. A replica gets the primary's token
+  either by applying the primary's snapshot (`apply_replication_snapshot_if_newer` now stores
+  `snapshot.notification_version`) or, when it replays writes instead, by reporting the new
+  `writes.notificationVersion` capability. Such a replica holds the primary's token only once
+  its row verifiably matches the primary's: the service replays each write there without a
+  token, converges the row (now including `CANCELLED`, and `FAILED` / `CANCELLED` back to
+  `PENDING_SEND`), re-reads it, and stamps the token in one token-only write when every
+  converged field matches. A replay that fails part-way, or a row that does not match, leaves
+  the replica a token of its own, so a move listed from it is refused. Bulk read-marking now
+  replicates per row the same way, applying the primary's rows to a replica that takes
+  snapshots instead of replaying the bulk write there, and stamping a token-taking replica row
+  by row.
+* **`ApplyResult.superseded`**, a new last field defaulting to `False`. A backend's
+  `apply_replication_snapshot_if_newer` returns `ApplyResult(applied=False, superseded=True)`
+  when its row is newer than the snapshot; the service then skips the fallback for it, so a
+  snapshot arriving out of order no longer replays older state (or an older token) onto a newer
+  row. The fakes report it.
+* **`Notification.notification_version` and `OneOffNotification.notification_version`**, a new
+  last field defaulting to `None`: the backend's current token for the notification, the value
+  `filter_notification_versions` returns. Pass `get_notification(id).notification_version` as
+  `expected_version` without listing. `verify_notification_sync` does not compare it.
+* **`writes.notificationVersion` action capability.** A backend reporting it accepts a
+  keyword-only `notification_version` on every write that changes a single notification, and
+  a `notification_versions` mapping on `mark_sent_as_read_bulk`: the token the row must hold
+  after the write. The keyword stays part of the contract on every write, but the service
+  uses it for one write only, the stamp described above, and never passes it to the primary
+  (including `migrate_to_backend` with the primary as destination) or passes the bulk mapping.
+  The keyword is not in the abstract signatures, so 3.7.0-era overrides still type-check. The
+  fakes support it.
+* **Capabilities follow where each action runs.**
+  `get_backend_supported_action_capabilities(backend_identifier)` for an additional backend
+  now reports `requeue.templateVersion`, `requeue.expectedVersion` and `repin.expectedVersion`
+  from the primary, since moves always run there, and `versions.filter` only when the named
+  backend reports it and either applies snapshots or reports `writes.notificationVersion`.
+  `filter_notification_versions(..., backend_identifier=...)` raises
+  `UnsupportedNotificationActionError` for an additional backend where that is `False`.
 
 #### `vintasend-django` and `vintasend-sqlalchemy` move notifications conditionally
 
@@ -84,6 +125,30 @@ compatibility.
   reverse.
 * An unknown id with a malformed `expected_version` is now reported as not found, then a
   malformed token as changed, in the same order as the fake backend.
+
+#### `vintasend-django` and `vintasend-sqlalchemy` carry the primary's token as replicas
+
+* Both backends implement `apply_replication_snapshot_if_newer`: an upsert keyed by the
+  primary's id that applies only a snapshot at least as new as the row, stores the primary's
+  `created`, `modified` and `notification_version`, and reconciles attachment links by
+  `(checksum, size)` without reading or copying file bytes (both backends must share the
+  attachment storage). It declines, writing nothing, an id the replica's id column cannot hold or
+  a user missing from the replica, and returns `superseded=True` when the replica's row is newer.
+* Both report `writes.notificationVersion`: every write accepts the keyword-only
+  `notification_version` (and `notification_versions` on bulk read-marking), and
+  `persist_notification_update(id, {}, notification_version=...)` is a token-only write in any
+  status that leaves the last-modified column alone. Serialized notifications carry
+  `notification_version`.
+* `vintasend-django`: `DjangoDbNotificationBackend(database="default", backend_identifier=None)`,
+  so a backend can live on another database alias, every query and transaction routed there.
+  `reset_notification_id_sequence(database)` resets the id sequence after rows were inserted with
+  the primary's ids; run it before promoting a replica to primary on PostgreSQL. Every update now
+  moves `modified` (`QuerySet.update()` skipped `auto_now` before).
+* `vintasend-sqlalchemy`: both backends take a `backend_identifier` keyword. Snapshot datetimes
+  are stored and compared as naive UTC, two snapshots racing to insert the same id resolve through
+  a savepoint, and a database error while applying a snapshot is raised as
+  `SnapshotApplyDatabaseError`, naming the id only, so SQLAlchemy's bound parameters never reach a
+  log. Set `create_engine(..., hide_parameters=True)` to keep them out of every other error too.
 
 #### `vintasend-managed-templates`: previews, published sends and checked publishing
 
@@ -131,6 +196,11 @@ compatibility.
 * A versions search naming `userId`, `bodyTemplate`, `subjectTemplate` or `contextName` is a 400
   on a backend reporting `stringLookups.exact` or `stringLookups.caseSensitive` as `false`, since
   it would select more notifications than were asked for.
+* With `VINTASEND_BACKEND_IDENTIFIER` naming a replica, the versions search reads the replica
+  and requeue and repin run on the primary, and a version listed from a replica that carries the
+  primary's tokens is accepted. `/capabilities` reports the `requeue.*` and `repin.*` keys from
+  the primary, and `versions.filter` as `false` for a replica that keeps tokens of its own.
+  `vintasend-ts` and `vintasend-ts-api` do not carry tokens to replicas yet.
 * `openapi.yaml` is byte-identical to `vintasend-ts-api` 1.0.0-alpha12. The
   `vintasend-dashboard-core` client generated from it needs no change.
 
@@ -138,10 +208,20 @@ compatibility.
 
 #### `vintasend`
 
+* Creating, updating or resending a notification whose `send_after` came back from the
+  database without a time zone (SQLite, and PostgreSQL `timestamp` columns) raised `TypeError`
+  when the service compared it with the current time. A naive send time is now read as UTC,
+  as `vintasend-api` already did.
 * The template-version lookups at creation logged the template key and the renderer's exception
   message when a renderer raised. They now log the renderer and the error class only, like
   `repin_notification`, because a key is a field of the notifications using it and a renderer's
   message can quote template content.
+
+#### `vintasend-django`
+
+* `backfill_attachment_checksums` printed attachment filenames and storage error messages for
+  the records it skipped. It now names them by id only, since a filename can carry patient
+  details. It also takes `--database`.
 
 ### Backwards compatibility
 
@@ -187,6 +267,36 @@ options for it with `UNSUPPORTED` rather than passing them on. What does change:
 * The downstream packages use `vintasend.utils.uuid_utils` and the new exceptions, so they need
   `vintasend` 3.8.0. Their `vintasend` and `vintasend-managed-templates` pins move to 3.8.0 when
   this release is cut.
+* **New dataclass field.** `Notification` and `OneOffNotification` gain
+  `notification_version: str | None = None` as their last field. Construction by keyword or by
+  position is unaffected, but `==`, `dataclasses.asdict()` and `repr()` now include it, so two
+  records of the same row read from different backends may compare unequal. Backend
+  serializers should fill it with the row's token; until they do it reads `None`.
+* **Snapshot-apply contract.** A backend's `apply_replication_snapshot_if_newer` must now store
+  `snapshot.notification_version` as the row's token (issuing one only when it is `None`). A
+  backend that reports `versions.filter` and serves as a replica must do this, or report
+  `writes.notificationVersion`, or its tokens stay its own and the primary refuses them.
+  `vintasend-django` and `vintasend-sqlalchemy` implement both in this release. One that
+  declines a snapshot because its row is newer should return `superseded=True`, or the service
+  replays the older snapshot through its write methods as before.
+* **Stamp contract for `writes.notificationVersion`.** A backend reporting it must accept
+  `persist_notification_update(id, {}, notification_version=<primary token>)`, an empty update with a token, in any status, `SENT` and `READ` included, as
+  a token-only write that changes nothing else. A backend that refuses content updates on
+  delivered rows must let this one through. The fakes do.
+* **Fakes used as replicas take the token keyword.** `FakeFileBackend` and
+  `FakeAsyncIOFileBackend` now report `writes.notificationVersion`. A subclass of either that
+  overrides a write method with its pre-3.8 signature and serves as a replica must accept the
+  keyword-only `notification_version` (at least on `persist_notification_update`, for the
+  stamp), or report `writes.notificationVersion` as `False` from `get_action_capabilities()`.
+* **Capability routing for named backends.** `get_backend_supported_action_capabilities()`
+  with an additional backend's identifier now answers the move options from the primary and
+  narrows `versions.filter` as described under Features, and
+  `filter_notification_versions(..., backend_identifier=...)` refuses such a backend that cannot
+  hold the primary's tokens. Calls without an identifier, or naming the primary, are unchanged.
+* `DEFAULT_BACKEND_ACTION_CAPABILITIES` gains a fifth key, `writes.notificationVersion`. Code
+  that iterates the dict or assumes exactly four keys should read keys by name.
+  `vintasend-api` forwards only the four contract keys to `/capabilities`.
+* `mark_read_bulk` returns a `list` (still typed `Iterable[Notification]`).
 * HTTP: `/capabilities` gains four keys, refusals gain `details.reason`, and the requeue body,
   the repin body and a new route are additive. A client that sends none of the new fields sees
   only the requeue response change described above.

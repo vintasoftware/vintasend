@@ -7,7 +7,7 @@ and compared, version token included, with what it was before the call.
 import dataclasses
 from typing import Any
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from freezegun import freeze_time
 
@@ -21,10 +21,19 @@ from vintasend.exceptions import (
     InvalidTemplateVersionError,
     NotificationActionError,
     NotificationRepinError,
+    NotificationUpdateError,
     NotificationVersionChangedError,
     UnsupportedNotificationActionError,
 )
-from vintasend.services.dataclasses import ApplyResult, NotificationVersion
+from vintasend.services.dataclasses import (
+    ApplyResult,
+    NotificationAttachment,
+    NotificationVersion,
+)
+from vintasend.services.git_commit_sha_providers.stubs.fake_git_commit_sha_provider import (
+    FakeAsyncIOGitCommitShaProvider,
+    FakeGitCommitShaProvider,
+)
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_backends.filters import NotificationFilter, matches_filter
@@ -36,6 +45,10 @@ from vintasend.services.notification_queue_services.stubs.fake_queue_service imp
     FakeAsyncIOQueueService,
     FakeQueueService,
 )
+from vintasend.services.notification_queue_services.stubs.fake_replication_queue_service import (
+    FakeAsyncIOReplicationQueueService,
+    FakeReplicationQueueService,
+)
 from vintasend.services.notification_service import (
     AsyncIONotificationService,
     NotificationService,
@@ -45,6 +58,7 @@ from vintasend.tests.test_services.test_requeue_and_repin import (
     ASYNCIO_BACKGROUND_ADAPTER,
     PLAIN_RENDERER,
     RAISING_RENDERER,
+    SERVICE_LOGGER,
     SYNC_ADAPTER,
     SYNC_BACKGROUND_ADAPTER,
     VERSIONED_RENDERER,
@@ -65,6 +79,11 @@ PENDING = NotificationStatus.PENDING_SEND.value
 SENT = NotificationStatus.SENT.value
 FAILED = NotificationStatus.FAILED.value
 CANCELLED = NotificationStatus.CANCELLED.value
+READ = NotificationStatus.READ.value
+
+# The capability keys describing an option of a move, which a named backend reads from the
+# primary.
+_MOVE_OPTION_KEYS = ("repin.expectedVersion", "requeue.expectedVersion", "requeue.templateVersion")
 
 FROZEN_AT = "2026-01-15 12:00:00"
 
@@ -149,6 +168,190 @@ class _AsyncIOPinningReplica(FakeAsyncIOFileBackend):
 
     async def apply_replication_snapshot_if_newer(self, snapshot: Any) -> ApplyResult:
         return ApplyResult(applied=False, reason="declined for test")
+
+
+class _AsyncIOStrictReplica(_AsyncIODecliningReplica):
+    """The AsyncIO twin of ``_StrictReplica``."""
+
+    async def persist_notification_update(  # type: ignore[override]
+        self, notification_id: Any, update_data: Any, lock: Any = None
+    ) -> Any:
+        return await super().persist_notification_update(notification_id, update_data, lock)
+
+    async def mark_pending_as_sent(self, notification_id: Any, lock: Any = None) -> Any:  # type: ignore[override]
+        return await super().mark_pending_as_sent(notification_id, lock)
+
+    async def mark_pending_as_failed(self, notification_id: Any, lock: Any = None) -> Any:  # type: ignore[override]
+        return await super().mark_pending_as_failed(notification_id, lock)
+
+    async def mark_sent_as_read(self, notification_id: Any, lock: Any = None) -> Any:  # type: ignore[override]
+        return await super().mark_sent_as_read(notification_id, lock)
+
+    async def mark_sent_as_read_bulk(  # type: ignore[override]
+        self, notification_ids: Any, user_id: Any = None, lock: Any = None
+    ) -> Any:
+        return await super().mark_sent_as_read_bulk(notification_ids, user_id, lock)
+
+    async def cancel_notification(self, notification_id: Any, lock: Any = None) -> None:  # type: ignore[override]
+        await super().cancel_notification(notification_id, lock)
+
+    async def store_context_used(  # type: ignore[override]
+        self, notification_id: Any, context: Any, adapter: Any, lock: Any = None
+    ) -> None:
+        await super().store_context_used(notification_id, context, adapter, lock)
+
+    async def store_git_commit_sha(  # type: ignore[override]
+        self, notification_id: Any, git_commit_sha: Any, lock: Any = None
+    ) -> None:
+        await super().store_git_commit_sha(notification_id, git_commit_sha, lock)
+
+    async def store_template_version(  # type: ignore[override]
+        self, notification_id: Any, template_version: Any, lock: Any = None
+    ) -> None:
+        await super().store_template_version(notification_id, template_version, lock)
+
+
+class _TokenTakingReplica(FakeFileBackend):
+    """A replica without snapshot application that takes the primary's token on its writes."""
+
+    apply_replication_snapshot_if_newer = (
+        BaseNotificationBackend.apply_replication_snapshot_if_newer
+    )
+
+
+class _AsyncIOTokenTakingReplica(FakeAsyncIOFileBackend):
+    """The AsyncIO twin of ``_TokenTakingReplica``."""
+
+    apply_replication_snapshot_if_newer = (
+        AsyncIOBaseNotificationBackend.apply_replication_snapshot_if_newer
+    )
+
+
+_DELIVERED = (NotificationStatus.SENT.value, NotificationStatus.READ.value)
+
+
+class _DeliveryStrictReplica(_TokenTakingReplica):
+    """Refuses a content update on a delivered notification, as the Django and SQLAlchemy
+    backends do. The fakes accept it, which would hide a replay that sends one. The empty,
+    token-only stamp is accepted in any status, as the ``writes.notificationVersion`` contract
+    requires."""
+
+    def persist_notification_update(  # type: ignore[override]
+        self, notification_id: Any, update_data: Any, *, notification_version: Any = None
+    ) -> Any:
+        if update_data and self.get_notification(notification_id).status in _DELIVERED:
+            raise NotificationUpdateError(f"Notification {notification_id} was delivered")
+        return super().persist_notification_update(
+            notification_id, update_data, notification_version=notification_version
+        )
+
+
+class _AsyncIODeliveryStrictReplica(_AsyncIOTokenTakingReplica):
+    """The AsyncIO twin of ``_DeliveryStrictReplica``."""
+
+    async def persist_notification_update(  # type: ignore[override]
+        self, notification_id: Any, update_data: Any, *, notification_version: Any = None
+    ) -> Any:
+        if update_data and (await self.get_notification(notification_id)).status in _DELIVERED:
+            raise NotificationUpdateError(f"Notification {notification_id} was delivered")
+        return await super().persist_notification_update(
+            notification_id, update_data, notification_version=notification_version
+        )
+
+
+def _without_token_writes(capabilities: dict[str, bool]) -> dict[str, bool]:
+    return {**capabilities, "writes.notificationVersion": False}
+
+
+class _ReplayingReplica(_TokenTakingReplica):
+    """Neither applies snapshots nor takes tokens: it replays writes and issues its own."""
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        return _without_token_writes(super().get_action_capabilities())
+
+
+class _AsyncIOReplayingReplica(_AsyncIOTokenTakingReplica):
+    """The AsyncIO twin of ``_ReplayingReplica``."""
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        return _without_token_writes(await super().get_action_capabilities())
+
+
+class _SnapshotOnlyReplica(FakeFileBackend):
+    """Applies snapshots but takes no token on the writes it replays when it declines one."""
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        return _without_token_writes(super().get_action_capabilities())
+
+
+class _AsyncIOSnapshotOnlyReplica(FakeAsyncIOFileBackend):
+    """The AsyncIO twin of ``_SnapshotOnlyReplica``."""
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        return _without_token_writes(await super().get_action_capabilities())
+
+
+class _StrictReplica(_DecliningReplica):
+    """Declines snapshots, reports no actions, and its writes take no ``notification_version``.
+
+    Like a backend written before 3.8.0: any keyword it does not declare raises ``TypeError``.
+    The ignores are against FakeFileBackend's widened signatures.
+    """
+
+    def persist_notification_update(self, notification_id: Any, update_data: Any) -> Any:  # type: ignore[override]
+        return super().persist_notification_update(notification_id, update_data)
+
+    def mark_pending_as_sent(self, notification_id: Any) -> Any:  # type: ignore[override]
+        return super().mark_pending_as_sent(notification_id)
+
+    def mark_pending_as_failed(self, notification_id: Any) -> Any:  # type: ignore[override]
+        return super().mark_pending_as_failed(notification_id)
+
+    def mark_sent_as_read(self, notification_id: Any) -> Any:  # type: ignore[override]
+        return super().mark_sent_as_read(notification_id)
+
+    def mark_sent_as_read_bulk(self, notification_ids: Any, user_id: Any = None) -> Any:  # type: ignore[override]
+        return super().mark_sent_as_read_bulk(notification_ids, user_id)
+
+    def cancel_notification(self, notification_id: Any) -> None:  # type: ignore[override]
+        super().cancel_notification(notification_id)
+
+    def store_context_used(self, notification_id: Any, context: Any, adapter: Any) -> None:  # type: ignore[override]
+        super().store_context_used(notification_id, context, adapter)
+
+    def store_git_commit_sha(self, notification_id: Any, git_commit_sha: Any) -> None:  # type: ignore[override]
+        super().store_git_commit_sha(notification_id, git_commit_sha)
+
+    def store_template_version(self, notification_id: Any, template_version: Any) -> None:  # type: ignore[override]
+        super().store_template_version(notification_id, template_version)
+
+
+class _VersionlessTokenTakingReplica(_TokenTakingReplica):
+    """Takes the primary's token but inherits the base ``store_template_version``, which has
+    nowhere to keep the value and takes no ``notification_version``."""
+
+    store_template_version = BaseNotificationBackend.store_template_version  # type: ignore[assignment]
+
+
+class _AsyncIOVersionlessTokenTakingReplica(_AsyncIOTokenTakingReplica):
+    """The AsyncIO twin of ``_VersionlessTokenTakingReplica``."""
+
+    store_template_version = AsyncIOBaseNotificationBackend.store_template_version  # type: ignore[assignment]
+
+
+class _TokenClaimingStrictBackend(_StrictReplica):
+    """Reports ``writes.notificationVersion`` while no write of it takes the keyword, so any
+    write handed a token raises ``TypeError``."""
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        return {"writes.notificationVersion": True}
+
+
+class _AsyncIOTokenClaimingStrictBackend(_AsyncIOStrictReplica):
+    """The AsyncIO twin of ``_TokenClaimingStrictBackend``."""
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        return {"writes.notificationVersion": True}
 
 
 def _stored(backend: FakeFileBackend, notification_id: Any) -> tuple[Any, str]:
@@ -248,11 +451,17 @@ class ActionCapabilitiesTestCase(_SyncCase):
         assert capabilities["requeue.expectedVersion"] is True
 
     def test_reads_a_named_backend(self):
+        # The move options are the primary's, since moves run there; version listing is the
+        # named backend's own.
         replica = _new_backend(_NoActionsBackend)
         self._backends.append(replica)
         service = self.build_service(additional_backends=[replica])
         assert service.get_backend_supported_action_capabilities("backend-1") == {
-            key: False for key in DEFAULT_BACKEND_ACTION_CAPABILITIES
+            "repin.expectedVersion": True,
+            "requeue.expectedVersion": True,
+            "requeue.templateVersion": True,
+            "versions.filter": False,
+            "writes.notificationVersion": False,
         }
 
 
@@ -517,14 +726,27 @@ class RequeueReplicationTestCase(_SyncCase):
         for backend in (self.backend, replica):
             _move_to(backend, created.id, FAILED)
 
-        with patch.object(
-            replica, "persist_notification_update", wraps=replica.persist_notification_update
-        ) as updates:
+        writes = Mock()
+        with (
+            patch.object(
+                replica, "persist_notification_update", wraps=replica.persist_notification_update
+            ) as updates,
+            patch.object(
+                replica, "requeue_notification", wraps=replica.requeue_notification
+            ) as requeues,
+        ):
+            writes.attach_mock(updates, "update")
+            writes.attach_mock(requeues, "requeue")
             service.requeue_notification(created.id, template_version=4, send=False)
 
-        updates.assert_not_called()
+        # The pin travels on the requeue itself. The updates after it are the convergence and
+        # the token-only stamp a replica taking the primary's token gets.
+        first_write = writes.mock_calls[0]
+        assert first_write[0] == "requeue"
+        assert first_write.kwargs["template_version"] == 4
         stored = replica.get_notification(created.id)
         assert (stored.status, stored.requested_template_version) == (PENDING, 4)
+        assert stored.notification_version == self.token(created.id)
 
     def test_replicas_never_receive_the_expected_version(self):
         replica = _new_backend(_PinningReplica)
@@ -954,6 +1176,700 @@ class FakeBackendMovesTestCase(_SyncCase):
             self.backend.repin_notification(notification.id, 4, expected_version="v")
 
 
+class _ReplicatedSyncCase(_SyncCase):
+    def build_replicated(
+        self, replica_cls: type = FakeFileBackend, **kwargs: Any
+    ) -> tuple[NotificationService, Any]:
+        replica = _new_backend(replica_cls)
+        self._backends.append(replica)
+        return self.build_service(additional_backends=[replica], **kwargs), replica
+
+    def listed(self, service: NotificationService, backend_identifier: str | None = None) -> Any:
+        return {
+            str(entry.id): entry.version
+            for entry in service.filter_notification_versions({}, 1, 1000, backend_identifier)
+        }
+
+    def assert_replica_on_primary_token(
+        self, service: NotificationService, replica: Any, notification_id: Any
+    ) -> str:
+        primary_token = self.listed(service)[str(notification_id)]
+        assert self.listed(service, "backend-1")[str(notification_id)] == primary_token
+        assert replica.get_notification(notification_id).notification_version == primary_token
+        return primary_token
+
+
+class ReplicatedVersionTokenTestCase(_ReplicatedSyncCase):
+    def test_a_version_listed_from_the_replica_moves_the_primary(self):
+        service, replica = self.build_replicated()
+        created = service.create_notification(**_create_kwargs())
+        _move_to(self.backend, created.id, FAILED)
+        service.replicate_notification(created.id)
+        listed = self.listed(service, "backend-1")[str(created.id)]
+
+        requeued = service.requeue_notification(
+            created.id, template_version=4, expected_version=listed, send=False
+        )
+
+        assert (requeued.status, requeued.requested_template_version) == (PENDING, 4)
+        after_requeue = self.assert_replica_on_primary_token(service, replica, created.id)
+        assert after_requeue != listed
+
+        repinned = service.repin_notification(created.id, 5, expected_version=after_requeue)
+
+        assert repinned.requested_template_version == 5
+        after_repin = self.assert_replica_on_primary_token(service, replica, created.id)
+        assert after_repin != after_requeue
+        assert replica.get_notification(created.id).requested_template_version == 5
+
+    def test_each_replicated_write_leaves_the_replica_on_the_primary_token(self):
+        service, replica = self.build_replicated(
+            renderer=VERSIONED_RENDERER, git_commit_sha_provider=FakeGitCommitShaProvider()
+        )
+        adapter = next(iter(service.notification_adapters))
+
+        def failed_send(notification_id: Any) -> None:
+            with patch.object(adapter, "send", side_effect=RuntimeError("smtp down")):
+                service.send(self.backend.get_notification(notification_id))
+
+        def cancel_then_requeue(notification_id: Any) -> None:
+            service.cancel_notification(notification_id)
+            service.requeue_notification(notification_id, send=False)
+
+        writes = {
+            "update": lambda id_: service.update_notification(id_, title="Changed"),
+            # Marks sent, stores the context, the git commit SHA and the template version used.
+            "send": lambda id_: service.send(self.backend.get_notification(id_)),
+            "failed send": failed_send,
+            "cancel": service.cancel_notification,
+            "requeue": cancel_then_requeue,
+            "repin": lambda id_: service.repin_notification(id_, 4),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                created = service.create_notification(**_create_kwargs())
+                after_create = self.assert_replica_on_primary_token(service, replica, created.id)
+
+                write(created.id)
+
+                after_write = self.assert_replica_on_primary_token(service, replica, created.id)
+                assert after_write != after_create
+
+        sent = replica.get_notification(
+            next(n.id for n in self.backend.notifications if n.status == SENT)
+        )
+        assert sent.used_template_version == 7
+        assert sent.git_commit_sha is not None
+
+    def test_creates_and_read_marking_leave_the_replica_on_the_primary_token(self):
+        service, replica = self.build_replicated()
+        one_off = service.create_one_off_notification(**_one_off_kwargs())
+        sent = [service.create_notification(**_create_kwargs(send_after=None)) for _ in range(3)]
+        for notification in (one_off, *sent):
+            self.assert_replica_on_primary_token(service, replica, notification.id)
+
+        service.mark_read(sent[0].id)
+        read = service.mark_read_bulk([sent[1].id, sent[2].id], user_id=1)
+
+        assert {str(n.id) for n in read} == {str(sent[1].id), str(sent[2].id)}
+        for notification in sent:
+            self.assert_replica_on_primary_token(service, replica, notification.id)
+            assert replica.get_notification(notification.id).status == READ
+
+    def test_bulk_read_marking_falls_back_for_a_declined_snapshot(self):
+        service, replica = self.build_replicated()
+        first, second = (
+            service.create_notification(**_create_kwargs(send_after=None)) for _ in range(2)
+        )
+        declined_id = str(second.id)
+        apply = replica.apply_replication_snapshot_if_newer
+
+        def decline_second(snapshot: Any) -> ApplyResult:
+            if str(snapshot.id) == declined_id:
+                return ApplyResult(applied=False, reason="declined for test")
+            return apply(snapshot)
+
+        with (
+            patch.object(replica, "apply_replication_snapshot_if_newer", decline_second),
+            patch.object(
+                replica, "mark_sent_as_read_bulk", wraps=replica.mark_sent_as_read_bulk
+            ) as bulk,
+        ):
+            service.mark_read_bulk([first.id, second.id], user_id=1)
+
+        assert [str(i) for i in bulk.call_args.args[0]] == [declined_id]
+        self.assert_replica_on_primary_token(service, replica, first.id)
+        assert replica.get_notification(second.id).status == READ
+
+    def test_bulk_read_marking_is_replayed_on_a_replica_without_snapshot_apply(self):
+        service, replica = self.build_replicated(_ReplayingReplica)
+        sent = [service.create_notification(**_create_kwargs(send_after=None)) for _ in range(2)]
+        for notification in sent:
+            FakeFileBackend.apply_replication_snapshot_if_newer(
+                replica, self.backend.get_notification(notification.id)
+            )
+        ids = [n.id for n in sent]
+
+        with patch.object(
+            replica, "mark_sent_as_read_bulk", wraps=replica.mark_sent_as_read_bulk
+        ) as bulk:
+            service.mark_read_bulk(ids, user_id=1)
+
+        bulk.assert_called_once_with(ids, user_id=1)
+        assert {replica.get_notification(i).status for i in ids} == {READ}
+
+    def test_a_lagging_replica_gives_a_version_the_primary_refuses(self):
+        service, replica = self.build_replicated(
+            replication_mode="queued", replication_queue_service=FakeReplicationQueueService()
+        )
+        created = service.create_notification(**_create_kwargs())
+        _move_to(self.backend, created.id, FAILED)
+        service.replicate_notification(created.id)
+        self.assert_replica_on_primary_token(service, replica, created.id)
+
+        # Enqueued, not yet applied: the replica still holds the previous version.
+        service.repin_notification(created.id, 3)
+        stale = self.listed(service, "backend-1")[str(created.id)]
+        assert stale != self.listed(service)[str(created.id)]
+        before = _stored(self.backend, created.id)
+
+        with self.assertRaises(NotificationActionError) as raised:
+            service.requeue_notification(created.id, expected_version=stale, send=False)
+
+        assert raised.exception.reason == "CHANGED"
+        self.assert_unchanged(created.id, before)
+
+        # Once the worker drains the queue, a fresh listing from the replica moves it.
+        service.replicate_notification(created.id)
+        fresh = self.assert_replica_on_primary_token(service, replica, created.id)
+        requeued = service.requeue_notification(created.id, expected_version=fresh, send=False)
+        assert requeued.status == PENDING
+
+    def test_a_replica_that_declines_a_snapshot_holds_a_token_of_its_own(self):
+        service, replica = self.build_replicated(_SnapshotOnlyReplica)
+        created = service.create_notification(**_create_kwargs())
+        _move_to(self.backend, created.id, FAILED)
+        service.replicate_notification(created.id)
+
+        with patch.object(
+            replica,
+            "apply_replication_snapshot_if_newer",
+            return_value=ApplyResult(applied=False, reason="declined for test"),
+        ):
+            service.repin_notification(created.id, 3)
+
+        replayed = self.listed(service, "backend-1")[str(created.id)]
+        assert replica.get_notification(created.id).requested_template_version == 3
+        assert replayed != self.listed(service)[str(created.id)]
+        before = _stored(self.backend, created.id)
+
+        with self.assertRaises(NotificationActionError) as raised:
+            service.repin_notification(created.id, 4, expected_version=replayed)
+
+        assert raised.exception.reason == "CHANGED"
+        self.assert_unchanged(created.id, before)
+
+
+class NamedBackendCapabilitiesTestCase(_ReplicatedSyncCase):
+    def test_a_replica_without_snapshot_apply_cannot_list_versions(self):
+        service, _ = self.build_replicated(_ReplayingReplica)
+
+        assert service.get_backend_supported_action_capabilities("backend-1") == {
+            key: True for key in _MOVE_OPTION_KEYS
+        } | {"versions.filter": False, "writes.notificationVersion": False}
+        with self.assertRaises(UnsupportedNotificationActionError) as raised:
+            service.filter_notification_versions({}, 1, 10, "backend-1")
+        assert str(raised.exception) == (
+            "Backend backend-1 cannot list version tokens the primary backend accepts"
+        )
+
+    def test_move_options_for_a_named_replica_mirror_the_primary(self):
+        self.use_backend(_NoActionsBackend)
+        service, _ = self.build_replicated()
+
+        assert service.get_backend_supported_action_capabilities("backend-1") == {
+            key: False for key in _MOVE_OPTION_KEYS
+        } | {"versions.filter": True, "writes.notificationVersion": True}
+        assert service.filter_notification_versions({}, 1, 10, "backend-1") == []
+
+    def test_the_primary_named_explicitly_reads_as_omitted(self):
+        self.use_backend(_OverclaimingBackend)
+        service, _ = self.build_replicated()
+        primary = service.get_primary_backend_identifier()
+
+        assert (
+            service.get_backend_supported_action_capabilities(primary)
+            == service.get_backend_supported_action_capabilities()
+        )
+        with self.assertRaises(UnsupportedNotificationActionError) as raised:
+            service.filter_notification_versions({}, 1, 10, primary)
+        assert "cannot list version tokens" not in str(raised.exception)
+
+
+class NotificationVersionFieldTestCase(_ReplicatedSyncCase):
+    def test_notifications_carry_their_current_token(self):
+        service = self.build_service()
+        created = service.create_notification(**_create_kwargs())
+        first = self.token(created.id)
+        assert created.notification_version == first
+
+        updated = service.update_notification(created.id, title="Changed")
+
+        assert updated.notification_version == self.token(created.id) != first
+        assert [n.notification_version for n in self.backend.filter_notifications({}, 1, 10)] == [
+            self.token(created.id)
+        ]
+
+    def test_it_can_be_passed_as_the_expected_version(self):
+        service = self.build_service()
+        notification = self.make(service, FAILED)
+
+        repinned = service.repin_notification(
+            notification.id,
+            4,
+            expected_version=service.get_notification(notification.id).notification_version,
+        )
+
+        assert repinned.requested_template_version == 4
+
+    def test_a_snapshot_without_a_token_gets_one_minted(self):
+        service = self.build_service()
+        created = service.create_notification(**_create_kwargs())
+        replica = _new_backend(FakeFileBackend)
+        self._backends.append(replica)
+
+        replica.apply_replication_snapshot_if_newer(
+            dataclasses.replace(created, notification_version=None)
+        )
+
+        minted = replica.get_notification(created.id).notification_version
+        assert minted is not None and minted != created.notification_version
+        assert replica._version_token(created.id) == minted
+
+    def test_the_sync_check_ignores_the_token_of_a_replaying_replica(self):
+        service, replica = self.build_replicated(_ReplayingReplica)
+        created = service.create_notification(**_create_kwargs())
+        FakeFileBackend.apply_replication_snapshot_if_newer(replica, created)
+
+        service.update_notification(created.id, title="Changed")
+
+        assert (
+            replica.get_notification(created.id).notification_version
+            != self.backend.get_notification(created.id).notification_version
+        )
+        report = service.verify_notification_sync(created.id)
+        assert report["in_sync"] is True
+        assert "notification_version" not in {entry["field"] for entry in report["fields"]}
+
+
+class TokenTakingReplicaTestCase(_ReplicatedSyncCase):
+    """A replica that declines snapshots but reports ``writes.notificationVersion``."""
+
+    def seed(self, replica: Any, notification_id: Any) -> None:
+        # The fallback cannot create a row with the primary's id, so the row is seeded, with no
+        # token so the replica starts on one of its own.
+        FakeFileBackend.apply_replication_snapshot_if_newer(
+            replica,
+            dataclasses.replace(
+                self.backend.get_notification(notification_id), notification_version=None
+            ),
+        )
+
+    def test_a_created_row_it_holds_is_converged_to_the_primary_token(self):
+        service, replica = self.build_replicated(_TokenTakingReplica)
+        created = service.create_notification(**_create_kwargs())
+        self.seed(replica, created.id)
+        assert replica.get_notification(created.id).notification_version != self.token(created.id)
+
+        service.replicate_notification(created.id)
+
+        self.assert_replica_on_primary_token(service, replica, created.id)
+
+    def test_each_replicated_write_leaves_it_on_the_primary_token(self):
+        self.check_each_replicated_write(_TokenTakingReplica)
+
+    def test_a_replica_refusing_updates_on_delivered_rows_still_converges(self):
+        self.check_each_replicated_write(_DeliveryStrictReplica)
+
+    def check_each_replicated_write(self, replica_cls: Any) -> None:
+        service, replica = self.build_replicated(
+            replica_cls,
+            renderer=VERSIONED_RENDERER,
+            git_commit_sha_provider=FakeGitCommitShaProvider(),
+        )
+        adapter = next(iter(service.notification_adapters))
+
+        def failed_send(notification_id: Any) -> None:
+            with patch.object(adapter, "send", side_effect=RuntimeError("smtp down")):
+                service.send(self.backend.get_notification(notification_id))
+
+        def cancel_then_requeue(notification_id: Any) -> None:
+            service.cancel_notification(notification_id)
+            service.requeue_notification(notification_id, template_version=4, send=False)
+
+        def send_then_read(notification_id: Any) -> None:
+            service.send(self.backend.get_notification(notification_id))
+            service.mark_read(notification_id)
+
+        def send_then_bulk_read(notification_id: Any) -> None:
+            service.send(self.backend.get_notification(notification_id))
+            service.mark_read_bulk([notification_id], user_id=1)
+
+        writes = {
+            "update": lambda id_: service.update_notification(id_, title="Changed"),
+            # Marks sent, stores the context, the git commit SHA and the template version used.
+            "send": lambda id_: service.send(self.backend.get_notification(id_)),
+            "failed send": failed_send,
+            "cancel": service.cancel_notification,
+            "requeue": cancel_then_requeue,
+            "repin": lambda id_: service.repin_notification(id_, 4),
+            "read": send_then_read,
+            "bulk read": send_then_bulk_read,
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                created = service.create_notification(**_create_kwargs())
+                self.seed(replica, created.id)
+
+                write(created.id)
+
+                self.assert_replica_on_primary_token(service, replica, created.id)
+                primary_row = self.backend.get_notification(created.id)
+                replica_row = replica.get_notification(created.id)
+                for field in ("status", "title", "requested_template_version"):
+                    assert getattr(replica_row, field) == getattr(primary_row, field)
+                assert replica_row.used_template_version == primary_row.used_template_version
+                assert replica_row.git_commit_sha == primary_row.git_commit_sha
+
+    def test_a_version_listed_from_it_moves_the_primary(self):
+        service, replica = self.build_replicated(_TokenTakingReplica)
+        created = service.create_notification(**_create_kwargs())
+        self.seed(replica, created.id)
+        service.cancel_notification(created.id)
+        listed = self.listed(service, "backend-1")[str(created.id)]
+
+        requeued = service.requeue_notification(
+            created.id, template_version=4, expected_version=listed, send=False
+        )
+
+        assert requeued.status == PENDING
+        self.assert_replica_on_primary_token(service, replica, created.id)
+
+    def test_a_replica_reporting_neither_gets_tokens_of_its_own(self):
+        service, replica = self.build_replicated(_ReplayingReplica)
+        created = service.create_notification(**_create_kwargs())
+        self.seed(replica, created.id)
+
+        service.update_notification(created.id, title="Changed")
+
+        assert replica.get_notification(created.id).title == "Changed"
+        assert replica._version_token(created.id) != self.token(created.id)
+        assert (
+            service.get_backend_supported_action_capabilities("backend-1")["versions.filter"]
+            is False
+        )
+
+    def test_a_replica_not_reporting_it_is_never_passed_the_keyword(self):
+        service, replica = self.build_replicated(
+            _StrictReplica, git_commit_sha_provider=FakeGitCommitShaProvider()
+        )
+        adapter = next(iter(service.notification_adapters))
+        created = [service.create_notification(**_create_kwargs()) for _ in range(5)]
+        for notification in created:
+            FakeFileBackend.apply_replication_snapshot_if_newer(
+                replica, self.backend.get_notification(notification.id)
+            )
+        first, second, third, fourth, fifth = (n.id for n in created)
+
+        # Any TypeError from a replica write is logged at ERROR and swallowed. The failed send
+        # below is the only ERROR line expected, so every replica write took its arguments.
+        with self.assertLogs(SERVICE_LOGGER, level="ERROR") as logs:
+            service.update_notification(first, title="Changed")
+            service.repin_notification(first, 4)
+            service.send(self.backend.get_notification(first))
+            service.mark_read(first)
+            service.send(self.backend.get_notification(second))
+            service.mark_read_bulk([second], user_id=1)
+            service.cancel_notification(third)
+            service.requeue_notification(third, template_version=5, send=False)
+            with patch.object(adapter, "send", side_effect=RuntimeError("smtp down")):
+                service.send(self.backend.get_notification(fourth))
+            service.replicate_notification(fifth)
+
+        assert [record.getMessage() for record in logs.records] == [
+            f"Failed to send notification {fourth}"
+        ]
+        statuses = {
+            str(id_): replica.get_notification(id_).status for id_ in (first, second, third, fourth)
+        }
+        assert statuses == {
+            str(first): READ,
+            str(second): READ,
+            str(third): PENDING,
+            str(fourth): FAILED,
+        }
+        assert replica.get_notification(first).title == "Changed"
+        assert replica.get_notification(third).requested_template_version == 5
+
+
+class ReplicaTokenStampTestCase(_ReplicatedSyncCase):
+    """A replica holds the primary's token only once its row verifiably matches the primary's."""
+
+    def seed(self, replica: Any, notification_id: Any) -> None:
+        # With no token, so the replica starts on one of its own.
+        FakeFileBackend.apply_replication_snapshot_if_newer(
+            replica,
+            dataclasses.replace(
+                self.backend.get_notification(notification_id), notification_version=None
+            ),
+        )
+
+    def build_queued(
+        self, replica_cls: type = _TokenTakingReplica, **kwargs: Any
+    ) -> tuple[NotificationService, Any]:
+        return self.build_replicated(
+            replica_cls,
+            replication_mode="queued",
+            replication_queue_service=FakeReplicationQueueService(),
+            **kwargs,
+        )
+
+    def assert_replica_version_refused(
+        self, service: NotificationService, notification_id: Any
+    ) -> None:
+        listed = self.listed(service, "backend-1")[str(notification_id)]
+        assert listed != self.listed(service)[str(notification_id)]
+        before = _stored(self.backend, notification_id)
+
+        with self.assertRaises(NotificationActionError) as raised:
+            service.requeue_notification(notification_id, expected_version=listed, send=False)
+
+        assert raised.exception.reason == "CHANGED"
+        self.assert_unchanged(notification_id, before)
+
+    def test_a_queued_cancel_takes_the_replica_to_cancelled_before_stamping(self):
+        service, replica = self.build_queued()
+        created = service.create_notification(**_create_kwargs())
+        self.seed(replica, created.id)
+        service.cancel_notification(created.id)
+        assert replica.get_notification(created.id).status == PENDING
+
+        result = service.process_replication(created.id)
+
+        assert result == {"successes": ["backend-1"], "failures": []}
+        assert replica.get_notification(created.id).status == CANCELLED
+        listed = self.assert_replica_on_primary_token(service, replica, created.id)
+        requeued = service.requeue_notification(created.id, expected_version=listed, send=False)
+        assert requeued.status == PENDING
+
+    def test_a_queued_requeue_takes_the_replica_back_to_pending_before_stamping(self):
+        service, replica = self.build_queued()
+        for status in (FAILED, CANCELLED):
+            with self.subTest(status=status):
+                created = service.create_notification(**_create_kwargs())
+                _move_to(self.backend, created.id, status)
+                self.seed(replica, created.id)
+                service.requeue_notification(created.id, template_version=4, send=False)
+
+                service.process_replication(created.id)
+
+                stored = replica.get_notification(created.id)
+                assert (stored.status, stored.requested_template_version) == (PENDING, 4)
+                self.assert_replica_on_primary_token(service, replica, created.id)
+
+    def test_a_replay_that_fails_part_way_leaves_the_replica_a_token_of_its_own(self):
+        service, replica = self.build_queued()
+        created = service.create_notification(**_create_kwargs())
+        self.seed(replica, created.id)
+        service.process_replication(created.id)
+        self.assert_replica_on_primary_token(service, replica, created.id)
+        service.update_notification(created.id, title="Changed")
+        service.cancel_notification(created.id)
+
+        with (
+            patch.object(replica, "cancel_notification", side_effect=RuntimeError("down")),
+            self.assertLogs(SERVICE_LOGGER, level="ERROR"),
+        ):
+            result = service.process_replication(created.id)
+
+        assert [failure["backend_identifier"] for failure in result["failures"]] == ["backend-1"]
+        stored = replica.get_notification(created.id)
+        # The content update landed and the cancel did not.
+        assert (stored.status, stored.title) == (PENDING, "Changed")
+        self.assert_replica_version_refused(service, created.id)
+
+    def test_a_replica_whose_update_did_not_land_is_not_stamped_on_a_cancel(self):
+        service, replica = self.build_replicated(_TokenTakingReplica)
+        created = service.create_notification(**_create_kwargs())
+        original_title = created.title
+        self.seed(replica, created.id)
+        service.replicate_notification(created.id)
+        self.assert_replica_on_primary_token(service, replica, created.id)
+        with (
+            patch.object(
+                replica,
+                "persist_notification_update",
+                side_effect=NotificationUpdateError("refused"),
+            ),
+            self.assertLogs(SERVICE_LOGGER, level="ERROR"),
+        ):
+            service.update_notification(created.id, title="Changed")
+        update = replica.persist_notification_update
+
+        def drop_content(notification_id: Any, update_data: Any, **kwargs: Any) -> Any:
+            # Reports success without writing the content: only the token-only stamp lands.
+            return update(notification_id, {}, **kwargs)
+
+        with (
+            patch.object(replica, "persist_notification_update", drop_content),
+            self.assertLogs(SERVICE_LOGGER, level="WARNING") as logs,
+        ):
+            service.cancel_notification(created.id)
+
+        stored = replica.get_notification(created.id)
+        assert (stored.status, stored.title) == (CANCELLED, original_title)
+        messages = [record.getMessage() for record in logs.records]
+        assert len(messages) == 1
+        assert str(created.id) in messages[0]
+        assert "Changed" not in messages[0] and original_title not in messages[0]
+        self.assert_replica_version_refused(service, created.id)
+
+    def test_a_replica_inheriting_store_template_version_is_converged_and_stamped(self):
+        service, replica = self.build_replicated(
+            _VersionlessTokenTakingReplica,
+            renderer=VERSIONED_RENDERER,
+            git_commit_sha_provider=FakeGitCommitShaProvider(),
+        )
+        created = service.create_notification(**_create_kwargs())
+        self.seed(replica, created.id)
+
+        with self.assertNoLogs(SERVICE_LOGGER, level="WARNING"):
+            service.send(self.backend.get_notification(created.id))
+
+        self.assert_replica_on_primary_token(service, replica, created.id)
+        stored = replica.get_notification(created.id)
+        assert stored.status == SENT
+        assert stored.used_template_version is None
+        assert self.backend.get_notification(created.id).used_template_version == 7
+
+    def test_migrating_onto_the_primary_passes_it_no_token(self):
+        self.use_backend(_TokenClaimingStrictBackend)
+        service, replica = self.build_replicated()
+        created = [service.create_notification(**_create_kwargs()) for _ in range(3)]
+        for notification in created:
+            replica.get_notification(notification.id)
+
+        result = service.migrate_to_backend(
+            service.get_primary_backend_identifier(), 2, source_backend_identifier="backend-1"
+        )
+
+        assert result == {"migrated": 3, "failures": []}
+
+    def test_an_older_snapshot_arriving_late_leaves_the_newer_row(self):
+        with freeze_time(FROZEN_AT) as frozen:
+            service, replica = self.build_replicated(
+                git_commit_sha_provider=FakeGitCommitShaProvider()
+            )
+            created = service.create_notification(**_create_kwargs())
+            replicate = service._replicate_inline_one
+            late: list[tuple[Any, ...]] = []
+
+            def hold_back(identifier: Any, snapshot: Any, write: Any) -> None:
+                # A copy, as a backend reading the row returns a fresh record.
+                late.append((identifier, dataclasses.replace(snapshot), write))
+
+            frozen.tick(1)
+            with patch.object(service, "_replicate_inline_one", hold_back):
+                service.send(self.backend.get_notification(created.id))
+            frozen.tick(1)
+            service.mark_read(created.id)
+            newer = self.assert_replica_on_primary_token(service, replica, created.id)
+
+            assert replica.apply_replication_snapshot_if_newer(late[0][1]) == ApplyResult(
+                applied=False, reason="local row is newer than the snapshot", superseded=True
+            )
+            with patch.object(
+                replica, "store_context_used", wraps=replica.store_context_used
+            ) as stores:
+                for identifier, snapshot, write in late:
+                    replicate(identifier, snapshot, write)
+
+        stores.assert_not_called()
+        assert replica.get_notification(created.id).status == READ
+        assert self.assert_replica_on_primary_token(service, replica, created.id) == newer
+
+
+class FakeBackendTokenKeywordTestCase(_SyncCase):
+    """Every fake write takes ``notification_version`` and leaves the row holding it."""
+
+    def test_each_write_holds_the_given_token(self):
+        backend = self.backend
+        assert backend.get_action_capabilities()["writes.notificationVersion"] is True
+        created = backend.persist_notification(**_create_kwargs(), notification_version="t-0")
+        one_off = backend.persist_one_off_notification(
+            **_one_off_kwargs(), notification_version="t-1"
+        )
+        assert (backend._version_token(created.id), backend._version_token(one_off.id)) == (
+            "t-0",
+            "t-1",
+        )
+        id_ = created.id
+        attached = backend.persist_notification(
+            **_create_kwargs(),
+            attachments=[NotificationAttachment(file=b"x", filename="a.txt")],
+        )
+        writes = {
+            "update": lambda v: backend.persist_notification_update(
+                id_, {"title": "Changed"}, notification_version=v
+            ),
+            "store context": lambda v: backend.store_context_used(
+                id_, {}, "adapter", notification_version=v
+            ),
+            "store sha": lambda v: backend.store_git_commit_sha(
+                id_, "a" * 40, notification_version=v
+            ),
+            "store template version": lambda v: backend.store_template_version(
+                id_, 3, notification_version=v
+            ),
+            "repin": lambda v: backend.repin_notification(id_, 4, notification_version=v),
+            "repin to the same version": lambda v: backend.repin_notification(
+                id_, 4, notification_version=v
+            ),
+            "fail": lambda v: backend.mark_pending_as_failed(id_, notification_version=v),
+            "requeue": lambda v: backend.requeue_notification(id_, notification_version=v),
+            "cancel": lambda v: backend.cancel_notification(id_, notification_version=v),
+            "requeue again": lambda v: backend.requeue_notification(id_, notification_version=v),
+            "send": lambda v: backend.mark_pending_as_sent(id_, notification_version=v),
+            "read": lambda v: backend.mark_sent_as_read(id_, notification_version=v),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                write(f"t-{name}")
+                assert backend._version_token(id_) == f"t-{name}"
+                assert backend.get_notification(id_).notification_version == f"t-{name}"
+
+        attachment_id = backend.get_attachments(attached.id)[0].id
+        backend.delete_notification_attachment(attachment_id, notification_version="t-detach")
+        assert backend._version_token(attached.id) == "t-detach"
+
+    def test_bulk_read_holds_each_given_token(self):
+        backend = self.backend
+        rows = [backend.persist_notification(**_create_kwargs()) for _ in range(3)]
+        for row in rows:
+            backend.mark_pending_as_sent(row.id)
+        held, minted, untouched = rows
+
+        backend.mark_sent_as_read_bulk(
+            [held.id, minted.id],
+            user_id=1,
+            notification_versions={held.id: "t-held", untouched.id: "t-ignored"},
+        )
+
+        assert backend._version_token(held.id) == "t-held"
+        assert backend._version_token(minted.id) not in ("t-held", "t-ignored")
+        assert backend._version_token(untouched.id) != "t-ignored"
+
+
 # --- AsyncIO ------------------------------------------------------------------------------
 
 
@@ -1284,14 +2200,26 @@ class AsyncIORequeueReplicationTestCase(_AsyncCase):
     async def test_a_replica_that_can_pin_takes_it_in_the_same_write(self):
         service, replica, created = await self._replicated_failed(_AsyncIOPinningReplica)
 
-        with patch.object(
-            replica, "persist_notification_update", wraps=replica.persist_notification_update
-        ) as updates:
+        writes = Mock()
+        with (
+            patch.object(
+                replica, "persist_notification_update", wraps=replica.persist_notification_update
+            ) as updates,
+            patch.object(
+                replica, "requeue_notification", wraps=replica.requeue_notification
+            ) as requeues,
+        ):
+            writes.attach_mock(updates, "update")
+            writes.attach_mock(requeues, "requeue")
             await service.requeue_notification(created.id, template_version=4, send=False)
 
-        updates.assert_not_called()
+        # See the sync twin: the pin travels on the requeue, then convergence and the stamp.
+        first_write = writes.mock_calls[0]
+        assert first_write[0] == "requeue"
+        assert first_write.kwargs["template_version"] == 4
         stored = await replica.get_notification(created.id)
         assert (stored.status, stored.requested_template_version) == (PENDING, 4)
+        assert stored.notification_version == await self.token(created.id)
 
     async def test_replicas_never_receive_the_expected_version(self):
         service, replica, created = await self._replicated_failed(_AsyncIOPinningReplica)
@@ -1455,3 +2383,725 @@ class AsyncIOFakeBackendMovesTestCase(_AsyncCase):
         notification = await self.make(service, FAILED)
         with self.assertRaises(UnsupportedNotificationActionError):
             await self.backend.repin_notification(notification.id, 4, expected_version="v")
+
+
+class _ReplicatedAsyncCase(_AsyncCase):
+    def build_replicated(
+        self, replica_cls: type = FakeAsyncIOFileBackend, **kwargs: Any
+    ) -> tuple[AsyncIONotificationService, Any]:
+        replica = _new_backend(replica_cls)
+        self._backends.append(replica)
+        return self.build_service(additional_backends=[replica], **kwargs), replica
+
+    async def listed(
+        self, service: AsyncIONotificationService, backend_identifier: str | None = None
+    ) -> Any:
+        versions = await service.filter_notification_versions({}, 1, 1000, backend_identifier)
+        return {str(entry.id): entry.version for entry in versions}
+
+    async def assert_replica_on_primary_token(
+        self, service: AsyncIONotificationService, replica: Any, notification_id: Any
+    ) -> str:
+        primary_token = (await self.listed(service))[str(notification_id)]
+        assert (await self.listed(service, "backend-1"))[str(notification_id)] == primary_token
+        stored = await replica.get_notification(notification_id)
+        assert stored.notification_version == primary_token
+        return primary_token
+
+
+class AsyncIOReplicatedVersionTokenTestCase(_ReplicatedAsyncCase):
+    async def test_a_version_listed_from_the_replica_moves_the_primary(self):
+        service, replica = self.build_replicated()
+        created = await service.create_notification(**_create_kwargs())
+        await _amove_to(self.backend, created.id, FAILED)
+        await service.replicate_notification(created.id)
+        listed = (await self.listed(service, "backend-1"))[str(created.id)]
+
+        requeued = await service.requeue_notification(
+            created.id, template_version=4, expected_version=listed, send=False
+        )
+
+        assert (requeued.status, requeued.requested_template_version) == (PENDING, 4)
+        after_requeue = await self.assert_replica_on_primary_token(service, replica, created.id)
+        assert after_requeue != listed
+
+        repinned = await service.repin_notification(created.id, 5, expected_version=after_requeue)
+
+        assert repinned.requested_template_version == 5
+        after_repin = await self.assert_replica_on_primary_token(service, replica, created.id)
+        assert after_repin != after_requeue
+        assert (await replica.get_notification(created.id)).requested_template_version == 5
+
+    async def test_each_replicated_write_leaves_the_replica_on_the_primary_token(self):
+        service, replica = self.build_replicated(
+            renderer=VERSIONED_RENDERER, git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider()
+        )
+        adapter = next(iter(service.notification_adapters))
+
+        async def update(notification_id: Any) -> None:
+            await service.update_notification(notification_id, title="Changed")
+
+        async def send(notification_id: Any) -> None:
+            # Marks sent, stores the context, the git commit SHA and the template version used.
+            await service.send(await self.backend.get_notification(notification_id))
+
+        async def failed_send(notification_id: Any) -> None:
+            with patch.object(adapter, "send", side_effect=RuntimeError("smtp down")):
+                await service.send(await self.backend.get_notification(notification_id))
+
+        async def cancel(notification_id: Any) -> None:
+            await service.cancel_notification(notification_id)
+
+        async def cancel_then_requeue(notification_id: Any) -> None:
+            await service.cancel_notification(notification_id)
+            await service.requeue_notification(notification_id, send=False)
+
+        async def repin(notification_id: Any) -> None:
+            await service.repin_notification(notification_id, 4)
+
+        writes = {
+            "update": update,
+            "send": send,
+            "failed send": failed_send,
+            "cancel": cancel,
+            "requeue": cancel_then_requeue,
+            "repin": repin,
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                created = await service.create_notification(**_create_kwargs())
+                after_create = await self.assert_replica_on_primary_token(
+                    service, replica, created.id
+                )
+
+                await write(created.id)
+
+                after_write = await self.assert_replica_on_primary_token(
+                    service, replica, created.id
+                )
+                assert after_write != after_create
+
+        sent = await replica.get_notification(
+            next(n.id for n in self.backend.notifications if n.status == SENT)
+        )
+        assert sent.used_template_version == 7
+        assert sent.git_commit_sha is not None
+
+    async def test_creates_and_read_marking_leave_the_replica_on_the_primary_token(self):
+        service, replica = self.build_replicated()
+        one_off = await service.create_one_off_notification(**_one_off_kwargs())
+        sent = [
+            await service.create_notification(**_create_kwargs(send_after=None)) for _ in range(3)
+        ]
+        for notification in (one_off, *sent):
+            await self.assert_replica_on_primary_token(service, replica, notification.id)
+
+        await service.mark_read(sent[0].id)
+        read = await service.mark_read_bulk([sent[1].id, sent[2].id], user_id=1)
+
+        assert {str(n.id) for n in read} == {str(sent[1].id), str(sent[2].id)}
+        for notification in sent:
+            await self.assert_replica_on_primary_token(service, replica, notification.id)
+            assert (await replica.get_notification(notification.id)).status == READ
+
+    async def test_bulk_read_marking_falls_back_for_a_declined_snapshot(self):
+        service, replica = self.build_replicated()
+        first = await service.create_notification(**_create_kwargs(send_after=None))
+        second = await service.create_notification(**_create_kwargs(send_after=None))
+        declined_id = str(second.id)
+        apply = replica.apply_replication_snapshot_if_newer
+
+        async def decline_second(snapshot: Any) -> ApplyResult:
+            if str(snapshot.id) == declined_id:
+                return ApplyResult(applied=False, reason="declined for test")
+            return await apply(snapshot)
+
+        with (
+            patch.object(replica, "apply_replication_snapshot_if_newer", decline_second),
+            patch.object(
+                replica, "mark_sent_as_read_bulk", wraps=replica.mark_sent_as_read_bulk
+            ) as bulk,
+        ):
+            await service.mark_read_bulk([first.id, second.id], user_id=1)
+
+        assert [str(i) for i in bulk.call_args.args[0]] == [declined_id]
+        await self.assert_replica_on_primary_token(service, replica, first.id)
+        assert (await replica.get_notification(second.id)).status == READ
+
+    async def test_bulk_read_marking_is_replayed_on_a_replica_without_snapshot_apply(self):
+        service, replica = self.build_replicated(_AsyncIOReplayingReplica)
+        sent = [
+            await service.create_notification(**_create_kwargs(send_after=None)) for _ in range(2)
+        ]
+        for notification in sent:
+            await FakeAsyncIOFileBackend.apply_replication_snapshot_if_newer(
+                replica, await self.backend.get_notification(notification.id)
+            )
+        ids = [n.id for n in sent]
+
+        with patch.object(
+            replica, "mark_sent_as_read_bulk", wraps=replica.mark_sent_as_read_bulk
+        ) as bulk:
+            await service.mark_read_bulk(ids, user_id=1)
+
+        bulk.assert_called_once_with(ids, user_id=1)
+        assert {(await replica.get_notification(i)).status for i in ids} == {READ}
+
+    async def test_a_lagging_replica_gives_a_version_the_primary_refuses(self):
+        service, replica = self.build_replicated(
+            replication_mode="queued",
+            replication_queue_service=FakeAsyncIOReplicationQueueService(),
+        )
+        created = await service.create_notification(**_create_kwargs())
+        await _amove_to(self.backend, created.id, FAILED)
+        await service.replicate_notification(created.id)
+        await self.assert_replica_on_primary_token(service, replica, created.id)
+
+        # Enqueued, not yet applied: the replica still holds the previous version.
+        await service.repin_notification(created.id, 3)
+        stale = (await self.listed(service, "backend-1"))[str(created.id)]
+        assert stale != (await self.listed(service))[str(created.id)]
+        before = await _astored(self.backend, created.id)
+
+        with self.assertRaises(NotificationActionError) as raised:
+            await service.requeue_notification(created.id, expected_version=stale, send=False)
+
+        assert raised.exception.reason == "CHANGED"
+        assert await _astored(self.backend, created.id) == before
+
+        # Once the worker drains the queue, a fresh listing from the replica moves it.
+        await service.replicate_notification(created.id)
+        fresh = await self.assert_replica_on_primary_token(service, replica, created.id)
+        requeued = await service.requeue_notification(
+            created.id, expected_version=fresh, send=False
+        )
+        assert requeued.status == PENDING
+
+    async def test_a_replica_that_declines_a_snapshot_holds_a_token_of_its_own(self):
+        service, replica = self.build_replicated(_AsyncIOSnapshotOnlyReplica)
+        created = await service.create_notification(**_create_kwargs())
+        await _amove_to(self.backend, created.id, FAILED)
+        await service.replicate_notification(created.id)
+
+        with patch.object(
+            replica,
+            "apply_replication_snapshot_if_newer",
+            return_value=ApplyResult(applied=False, reason="declined for test"),
+        ):
+            await service.repin_notification(created.id, 3)
+
+        replayed = (await self.listed(service, "backend-1"))[str(created.id)]
+        assert (await replica.get_notification(created.id)).requested_template_version == 3
+        assert replayed != (await self.listed(service))[str(created.id)]
+        before = await _astored(self.backend, created.id)
+
+        with self.assertRaises(NotificationActionError) as raised:
+            await service.repin_notification(created.id, 4, expected_version=replayed)
+
+        assert raised.exception.reason == "CHANGED"
+        assert await _astored(self.backend, created.id) == before
+
+
+class AsyncIONamedBackendCapabilitiesTestCase(_ReplicatedAsyncCase):
+    async def test_a_replica_without_snapshot_apply_cannot_list_versions(self):
+        service, _ = self.build_replicated(_AsyncIOReplayingReplica)
+
+        assert await service.get_backend_supported_action_capabilities("backend-1") == {
+            key: True for key in _MOVE_OPTION_KEYS
+        } | {"versions.filter": False, "writes.notificationVersion": False}
+        with self.assertRaises(UnsupportedNotificationActionError) as raised:
+            await service.filter_notification_versions({}, 1, 10, "backend-1")
+        assert str(raised.exception) == (
+            "Backend backend-1 cannot list version tokens the primary backend accepts"
+        )
+
+    async def test_move_options_for_a_named_replica_mirror_the_primary(self):
+        self.use_backend(_AsyncIONoActionsBackend)
+        service, _ = self.build_replicated()
+
+        assert await service.get_backend_supported_action_capabilities("backend-1") == {
+            key: False for key in _MOVE_OPTION_KEYS
+        } | {"versions.filter": True, "writes.notificationVersion": True}
+        assert await service.filter_notification_versions({}, 1, 10, "backend-1") == []
+
+    async def test_the_primary_named_explicitly_reads_as_omitted(self):
+        self.use_backend(_AsyncIOOverclaimingBackend)
+        service, _ = self.build_replicated()
+        primary = service.get_primary_backend_identifier()
+
+        assert (
+            await service.get_backend_supported_action_capabilities(primary)
+            == await service.get_backend_supported_action_capabilities()
+        )
+        with self.assertRaises(UnsupportedNotificationActionError) as raised:
+            await service.filter_notification_versions({}, 1, 10, primary)
+        assert "cannot list version tokens" not in str(raised.exception)
+
+
+class AsyncIONotificationVersionFieldTestCase(_ReplicatedAsyncCase):
+    async def test_notifications_carry_their_current_token(self):
+        service = self.build_service()
+        created = await service.create_notification(**_create_kwargs())
+        first = await self.token(created.id)
+        assert created.notification_version == first
+
+        updated = await service.update_notification(created.id, title="Changed")
+
+        current = await self.token(created.id)
+        assert updated.notification_version == current != first
+        listed = await self.backend.filter_notifications({}, 1, 10)
+        assert [n.notification_version for n in listed] == [current]
+
+    async def test_it_can_be_passed_as_the_expected_version(self):
+        service = self.build_service()
+        notification = await self.make(service, FAILED)
+
+        repinned = await service.repin_notification(
+            notification.id,
+            4,
+            expected_version=(await service.get_notification(notification.id)).notification_version,
+        )
+
+        assert repinned.requested_template_version == 4
+
+    async def test_a_snapshot_without_a_token_gets_one_minted(self):
+        service = self.build_service()
+        created = await service.create_notification(**_create_kwargs())
+        replica = _new_backend(FakeAsyncIOFileBackend)
+        self._backends.append(replica)
+
+        await replica.apply_replication_snapshot_if_newer(
+            dataclasses.replace(created, notification_version=None)
+        )
+
+        minted = (await replica.get_notification(created.id)).notification_version
+        assert minted is not None and minted != created.notification_version
+        assert replica._version_token(created.id) == minted
+
+    async def test_the_sync_check_ignores_the_token_of_a_replaying_replica(self):
+        service, replica = self.build_replicated(_AsyncIOReplayingReplica)
+        created = await service.create_notification(**_create_kwargs())
+        await FakeAsyncIOFileBackend.apply_replication_snapshot_if_newer(replica, created)
+
+        await service.update_notification(created.id, title="Changed")
+
+        assert (await replica.get_notification(created.id)).notification_version != (
+            await self.backend.get_notification(created.id)
+        ).notification_version
+        report = await service.verify_notification_sync(created.id)
+        assert report["in_sync"] is True
+        assert "notification_version" not in {entry["field"] for entry in report["fields"]}
+
+
+class AsyncIOTokenTakingReplicaTestCase(_ReplicatedAsyncCase):
+    """The AsyncIO twin of ``TokenTakingReplicaTestCase``."""
+
+    async def seed(self, replica: Any, notification_id: Any) -> None:
+        await FakeAsyncIOFileBackend.apply_replication_snapshot_if_newer(
+            replica,
+            dataclasses.replace(
+                await self.backend.get_notification(notification_id), notification_version=None
+            ),
+        )
+
+    async def test_a_created_row_it_holds_is_converged_to_the_primary_token(self):
+        service, replica = self.build_replicated(_AsyncIOTokenTakingReplica)
+        created = await service.create_notification(**_create_kwargs())
+        await self.seed(replica, created.id)
+        seeded = (await replica.get_notification(created.id)).notification_version
+        assert seeded != await self.token(created.id)
+
+        await service.replicate_notification(created.id)
+
+        await self.assert_replica_on_primary_token(service, replica, created.id)
+
+    async def test_each_replicated_write_leaves_it_on_the_primary_token(self):
+        await self.check_each_replicated_write(_AsyncIOTokenTakingReplica)
+
+    async def test_a_replica_refusing_updates_on_delivered_rows_still_converges(self):
+        await self.check_each_replicated_write(_AsyncIODeliveryStrictReplica)
+
+    async def check_each_replicated_write(self, replica_cls: Any) -> None:
+        service, replica = self.build_replicated(
+            replica_cls,
+            renderer=VERSIONED_RENDERER,
+            git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider(),
+        )
+        adapter = next(iter(service.notification_adapters))
+
+        async def update(notification_id: Any) -> None:
+            await service.update_notification(notification_id, title="Changed")
+
+        async def send(notification_id: Any) -> None:
+            await service.send(await self.backend.get_notification(notification_id))
+
+        async def failed_send(notification_id: Any) -> None:
+            with patch.object(adapter, "send", side_effect=RuntimeError("smtp down")):
+                await service.send(await self.backend.get_notification(notification_id))
+
+        async def cancel(notification_id: Any) -> None:
+            await service.cancel_notification(notification_id)
+
+        async def cancel_then_requeue(notification_id: Any) -> None:
+            await service.cancel_notification(notification_id)
+            await service.requeue_notification(notification_id, template_version=4, send=False)
+
+        async def repin(notification_id: Any) -> None:
+            await service.repin_notification(notification_id, 4)
+
+        async def send_then_read(notification_id: Any) -> None:
+            await send(notification_id)
+            await service.mark_read(notification_id)
+
+        async def send_then_bulk_read(notification_id: Any) -> None:
+            await send(notification_id)
+            await service.mark_read_bulk([notification_id], user_id=1)
+
+        writes = {
+            "update": update,
+            "send": send,
+            "failed send": failed_send,
+            "cancel": cancel,
+            "requeue": cancel_then_requeue,
+            "repin": repin,
+            "read": send_then_read,
+            "bulk read": send_then_bulk_read,
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                created = await service.create_notification(**_create_kwargs())
+                await self.seed(replica, created.id)
+
+                await write(created.id)
+
+                await self.assert_replica_on_primary_token(service, replica, created.id)
+                primary_row = await self.backend.get_notification(created.id)
+                replica_row = await replica.get_notification(created.id)
+                for field in ("status", "title", "requested_template_version"):
+                    assert getattr(replica_row, field) == getattr(primary_row, field)
+                assert replica_row.used_template_version == primary_row.used_template_version
+                assert replica_row.git_commit_sha == primary_row.git_commit_sha
+
+    async def test_a_version_listed_from_it_moves_the_primary(self):
+        service, replica = self.build_replicated(_AsyncIOTokenTakingReplica)
+        created = await service.create_notification(**_create_kwargs())
+        await self.seed(replica, created.id)
+        await service.cancel_notification(created.id)
+        listed = (await self.listed(service, "backend-1"))[str(created.id)]
+
+        requeued = await service.requeue_notification(
+            created.id, template_version=4, expected_version=listed, send=False
+        )
+
+        assert requeued.status == PENDING
+        await self.assert_replica_on_primary_token(service, replica, created.id)
+
+    async def test_a_replica_reporting_neither_gets_tokens_of_its_own(self):
+        service, replica = self.build_replicated(_AsyncIOReplayingReplica)
+        created = await service.create_notification(**_create_kwargs())
+        await self.seed(replica, created.id)
+
+        await service.update_notification(created.id, title="Changed")
+
+        assert (await replica.get_notification(created.id)).title == "Changed"
+        assert replica._version_token(created.id) != await self.token(created.id)
+        capabilities = await service.get_backend_supported_action_capabilities("backend-1")
+        assert capabilities["versions.filter"] is False
+
+    async def test_a_replica_not_reporting_it_is_never_passed_the_keyword(self):
+        service, replica = self.build_replicated(
+            _AsyncIOStrictReplica, git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider()
+        )
+        adapter = next(iter(service.notification_adapters))
+        created = [await service.create_notification(**_create_kwargs()) for _ in range(5)]
+        for notification in created:
+            await FakeAsyncIOFileBackend.apply_replication_snapshot_if_newer(
+                replica, await self.backend.get_notification(notification.id)
+            )
+        first, second, third, fourth, fifth = (n.id for n in created)
+
+        # See the sync twin: the failed send is the only ERROR line expected.
+        with self.assertLogs(SERVICE_LOGGER, level="ERROR") as logs:
+            await service.update_notification(first, title="Changed")
+            await service.repin_notification(first, 4)
+            await service.send(await self.backend.get_notification(first))
+            await service.mark_read(first)
+            await service.send(await self.backend.get_notification(second))
+            await service.mark_read_bulk([second], user_id=1)
+            await service.cancel_notification(third)
+            await service.requeue_notification(third, template_version=5, send=False)
+            with patch.object(adapter, "send", side_effect=RuntimeError("smtp down")):
+                await service.send(await self.backend.get_notification(fourth))
+            await service.replicate_notification(fifth)
+
+        assert [record.getMessage() for record in logs.records] == [
+            f"Failed to send notification {fourth}"
+        ]
+        statuses = {
+            str(id_): (await replica.get_notification(id_)).status
+            for id_ in (first, second, third, fourth)
+        }
+        assert statuses == {
+            str(first): READ,
+            str(second): READ,
+            str(third): PENDING,
+            str(fourth): FAILED,
+        }
+        assert (await replica.get_notification(first)).title == "Changed"
+        assert (await replica.get_notification(third)).requested_template_version == 5
+
+
+class AsyncIOReplicaTokenStampTestCase(_ReplicatedAsyncCase):
+    """The AsyncIO twin of ``ReplicaTokenStampTestCase``."""
+
+    async def seed(self, replica: Any, notification_id: Any) -> None:
+        await FakeAsyncIOFileBackend.apply_replication_snapshot_if_newer(
+            replica,
+            dataclasses.replace(
+                await self.backend.get_notification(notification_id), notification_version=None
+            ),
+        )
+
+    def build_queued(
+        self, replica_cls: type = _AsyncIOTokenTakingReplica, **kwargs: Any
+    ) -> tuple[AsyncIONotificationService, Any]:
+        return self.build_replicated(
+            replica_cls,
+            replication_mode="queued",
+            replication_queue_service=FakeAsyncIOReplicationQueueService(),
+            **kwargs,
+        )
+
+    async def assert_replica_version_refused(
+        self, service: AsyncIONotificationService, notification_id: Any
+    ) -> None:
+        listed = (await self.listed(service, "backend-1"))[str(notification_id)]
+        assert listed != (await self.listed(service))[str(notification_id)]
+        before = await _astored(self.backend, notification_id)
+
+        with self.assertRaises(NotificationActionError) as raised:
+            await service.requeue_notification(notification_id, expected_version=listed, send=False)
+
+        assert raised.exception.reason == "CHANGED"
+        assert await _astored(self.backend, notification_id) == before
+
+    async def test_a_queued_cancel_takes_the_replica_to_cancelled_before_stamping(self):
+        service, replica = self.build_queued()
+        created = await service.create_notification(**_create_kwargs())
+        await self.seed(replica, created.id)
+        await service.cancel_notification(created.id)
+        assert (await replica.get_notification(created.id)).status == PENDING
+
+        result = await service.process_replication(created.id)
+
+        assert result == {"successes": ["backend-1"], "failures": []}
+        assert (await replica.get_notification(created.id)).status == CANCELLED
+        listed = await self.assert_replica_on_primary_token(service, replica, created.id)
+        requeued = await service.requeue_notification(
+            created.id, expected_version=listed, send=False
+        )
+        assert requeued.status == PENDING
+
+    async def test_a_queued_requeue_takes_the_replica_back_to_pending_before_stamping(self):
+        service, replica = self.build_queued()
+        for status in (FAILED, CANCELLED):
+            with self.subTest(status=status):
+                created = await service.create_notification(**_create_kwargs())
+                await _amove_to(self.backend, created.id, status)
+                await self.seed(replica, created.id)
+                await service.requeue_notification(created.id, template_version=4, send=False)
+
+                await service.process_replication(created.id)
+
+                stored = await replica.get_notification(created.id)
+                assert (stored.status, stored.requested_template_version) == (PENDING, 4)
+                await self.assert_replica_on_primary_token(service, replica, created.id)
+
+    async def test_a_replay_that_fails_part_way_leaves_the_replica_a_token_of_its_own(self):
+        service, replica = self.build_queued()
+        created = await service.create_notification(**_create_kwargs())
+        await self.seed(replica, created.id)
+        await service.process_replication(created.id)
+        await self.assert_replica_on_primary_token(service, replica, created.id)
+        await service.update_notification(created.id, title="Changed")
+        await service.cancel_notification(created.id)
+
+        with (
+            patch.object(replica, "cancel_notification", side_effect=RuntimeError("down")),
+            self.assertLogs(SERVICE_LOGGER, level="ERROR"),
+        ):
+            result = await service.process_replication(created.id)
+
+        assert [failure["backend_identifier"] for failure in result["failures"]] == ["backend-1"]
+        stored = await replica.get_notification(created.id)
+        assert (stored.status, stored.title) == (PENDING, "Changed")
+        await self.assert_replica_version_refused(service, created.id)
+
+    async def test_a_replica_whose_update_did_not_land_is_not_stamped_on_a_cancel(self):
+        service, replica = self.build_replicated(_AsyncIOTokenTakingReplica)
+        created = await service.create_notification(**_create_kwargs())
+        original_title = created.title
+        await self.seed(replica, created.id)
+        await service.replicate_notification(created.id)
+        await self.assert_replica_on_primary_token(service, replica, created.id)
+        with (
+            patch.object(
+                replica,
+                "persist_notification_update",
+                side_effect=NotificationUpdateError("refused"),
+            ),
+            self.assertLogs(SERVICE_LOGGER, level="ERROR"),
+        ):
+            await service.update_notification(created.id, title="Changed")
+        update = replica.persist_notification_update
+
+        async def drop_content(notification_id: Any, update_data: Any, **kwargs: Any) -> Any:
+            return await update(notification_id, {}, **kwargs)
+
+        with (
+            patch.object(replica, "persist_notification_update", drop_content),
+            self.assertLogs(SERVICE_LOGGER, level="WARNING") as logs,
+        ):
+            await service.cancel_notification(created.id)
+
+        stored = await replica.get_notification(created.id)
+        assert (stored.status, stored.title) == (CANCELLED, original_title)
+        messages = [record.getMessage() for record in logs.records]
+        assert len(messages) == 1
+        assert str(created.id) in messages[0]
+        assert "Changed" not in messages[0] and original_title not in messages[0]
+        await self.assert_replica_version_refused(service, created.id)
+
+    async def test_a_replica_inheriting_store_template_version_is_converged_and_stamped(self):
+        service, replica = self.build_replicated(
+            _AsyncIOVersionlessTokenTakingReplica,
+            renderer=VERSIONED_RENDERER,
+            git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider(),
+        )
+        created = await service.create_notification(**_create_kwargs())
+        await self.seed(replica, created.id)
+
+        with self.assertNoLogs(SERVICE_LOGGER, level="WARNING"):
+            await service.send(await self.backend.get_notification(created.id))
+
+        await self.assert_replica_on_primary_token(service, replica, created.id)
+        stored = await replica.get_notification(created.id)
+        assert stored.status == SENT
+        assert stored.used_template_version is None
+        assert (await self.backend.get_notification(created.id)).used_template_version == 7
+
+    async def test_migrating_onto_the_primary_passes_it_no_token(self):
+        self.use_backend(_AsyncIOTokenClaimingStrictBackend)
+        service, replica = self.build_replicated()
+        created = [await service.create_notification(**_create_kwargs()) for _ in range(3)]
+        for notification in created:
+            await replica.get_notification(notification.id)
+
+        result = await service.migrate_to_backend(
+            service.get_primary_backend_identifier(), 2, source_backend_identifier="backend-1"
+        )
+
+        assert result == {"migrated": 3, "failures": []}
+
+    async def test_an_older_snapshot_arriving_late_leaves_the_newer_row(self):
+        with freeze_time(FROZEN_AT) as frozen:
+            service, replica = self.build_replicated(
+                git_commit_sha_provider=FakeAsyncIOGitCommitShaProvider()
+            )
+            created = await service.create_notification(**_create_kwargs())
+            replicate = service._replicate_inline_one
+            late: list[tuple[Any, ...]] = []
+
+            async def hold_back(identifier: Any, snapshot: Any, write: Any) -> None:
+                late.append((identifier, dataclasses.replace(snapshot), write))
+
+            frozen.tick(1)
+            with patch.object(service, "_replicate_inline_one", hold_back):
+                await service.send(await self.backend.get_notification(created.id))
+            frozen.tick(1)
+            await service.mark_read(created.id)
+            newer = await self.assert_replica_on_primary_token(service, replica, created.id)
+
+            assert await replica.apply_replication_snapshot_if_newer(late[0][1]) == ApplyResult(
+                applied=False, reason="local row is newer than the snapshot", superseded=True
+            )
+            with patch.object(
+                replica, "store_context_used", wraps=replica.store_context_used
+            ) as stores:
+                for identifier, snapshot, write in late:
+                    await replicate(identifier, snapshot, write)
+
+        stores.assert_not_called()
+        assert (await replica.get_notification(created.id)).status == READ
+        assert await self.assert_replica_on_primary_token(service, replica, created.id) == newer
+
+
+class AsyncIOFakeBackendTokenKeywordTestCase(_AsyncCase):
+    """The AsyncIO twin of ``FakeBackendTokenKeywordTestCase``."""
+
+    async def test_each_write_holds_the_given_token(self):
+        backend = self.backend
+        assert (await backend.get_action_capabilities())["writes.notificationVersion"] is True
+        created = await backend.persist_notification(**_create_kwargs(), notification_version="t-0")
+        one_off = await backend.persist_one_off_notification(
+            **_one_off_kwargs(), notification_version="t-1"
+        )
+        assert (backend._version_token(created.id), backend._version_token(one_off.id)) == (
+            "t-0",
+            "t-1",
+        )
+        id_ = created.id
+        attached = await backend.persist_notification(
+            **_create_kwargs(),
+            attachments=[NotificationAttachment(file=b"x", filename="a.txt")],
+        )
+        writes = {
+            "update": lambda v: backend.persist_notification_update(
+                id_, {"title": "Changed"}, notification_version=v
+            ),
+            "store context": lambda v: backend.store_context_used(
+                id_, {}, "adapter", notification_version=v
+            ),
+            "store sha": lambda v: backend.store_git_commit_sha(
+                id_, "a" * 40, notification_version=v
+            ),
+            "store template version": lambda v: backend.store_template_version(
+                id_, 3, notification_version=v
+            ),
+            "repin": lambda v: backend.repin_notification(id_, 4, notification_version=v),
+            "repin to the same version": lambda v: backend.repin_notification(
+                id_, 4, notification_version=v
+            ),
+            "fail": lambda v: backend.mark_pending_as_failed(id_, notification_version=v),
+            "requeue": lambda v: backend.requeue_notification(id_, notification_version=v),
+            "cancel": lambda v: backend.cancel_notification(id_, notification_version=v),
+            "requeue again": lambda v: backend.requeue_notification(id_, notification_version=v),
+            "send": lambda v: backend.mark_pending_as_sent(id_, notification_version=v),
+            "read": lambda v: backend.mark_sent_as_read(id_, notification_version=v),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                await write(f"t-{name}")
+                assert backend._version_token(id_) == f"t-{name}"
+                assert (await backend.get_notification(id_)).notification_version == f"t-{name}"
+
+        attachment_id = (await backend.get_attachments(attached.id))[0].id
+        await backend.delete_notification_attachment(attachment_id, notification_version="t-detach")
+        assert backend._version_token(attached.id) == "t-detach"
+
+    async def test_bulk_read_holds_each_given_token(self):
+        backend = self.backend
+        rows = [await backend.persist_notification(**_create_kwargs()) for _ in range(3)]
+        for row in rows:
+            await backend.mark_pending_as_sent(row.id)
+        held, minted, untouched = rows
+
+        await backend.mark_sent_as_read_bulk(
+            [held.id, minted.id],
+            user_id=1,
+            notification_versions={held.id: "t-held", untouched.id: "t-ignored"},
+        )
+
+        assert backend._version_token(held.id) == "t-held"
+        assert backend._version_token(minted.id) not in ("t-held", "t-ignored")
+        assert backend._version_token(untouched.id) != "t-ignored"

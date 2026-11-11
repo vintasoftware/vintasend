@@ -171,6 +171,32 @@ Backends may implement the optional `applyReplicationSnapshotIfNewer(snapshot)` 
 
 **A broken queue never drops a replication.** If queued mode is configured but no replication queue service is set, or the record's id cannot be resolved, the service logs a warning and replicates inline to every backend. If enqueueing for a single backend fails, only that backend is replicated inline; the ones already enqueued are left to the worker. Nothing on the replication path can fail the primary write, which has already committed.
 
+## Version tokens on replicas
+
+The [conditional moves](/vintasend/docs/lifecycle/#moving-notifications-safely) check an opaque version token against the primary, but you may want to list the tokens from a replica, to keep a bulk selection off the primary.
+
+<Py>
+
+The primary issues the token on every write, and replication carries it to the replicas, so a version listed from a replica is one the primary accepts:
+
+```python
+versions = service.filter_notification_versions(stranded, 1, 100, backend_identifier="replica")
+for entry in versions:
+    service.requeue_notification(entry.id, expected_version=entry.version)  # runs on the primary
+```
+
+A replica holds the primary's tokens in one of two ways. A backend that implements `apply_replication_snapshot_if_newer` stores the token the primary's snapshot carries (`Notification.notification_version`). A backend that replays writes instead can report `writes.notificationVersion`: the service then replays each write there without a token, converges the row to the primary's snapshot (status, content, template pin, context used, git commit SHA), re-reads it, and only when it matches makes one token-only write, `persist_notification_update(id, {}, notification_version=<primary token>)`. A row that does not match, or a replay that fails part-way, leaves the replica a token of its own, so a move listed from it is refused rather than accepted against a row that differs from the primary's. Bulk read-marking applies each read row's snapshot to a replica that takes snapshots, rather than replaying the bulk write, and stamps a token-taking replica row by row. A replica whose row is already newer than an arriving snapshot declines it as `superseded`, and nothing older is replayed onto it.
+
+A replica that has not caught up yet, typically in queued mode before the worker drains the task, hands out a stale token. The move is refused, usually with `CHANGED` (a requeue checks the status first, so a notification that has moved on can be refused with `INVALID_STATUS`), and nothing is written; list again. A replica that does neither holds tokens of its own, which the primary would refuse every time, so <Sw py="get_backend_supported_action_capabilities" ts="getBackendSupportedActionCapabilities" /> reports `versions.filter` as `False` for it and listing from it raises `UnsupportedNotificationActionError`. Named for a replica, the three move-option keys (`requeue.templateVersion`, `requeue.expectedVersion`, `repin.expectedVersion`) are the primary's, because moves always run there. `verify_notification_sync` never compares `notification_version`.
+
+</Py>
+
+<Ts>
+
+`vintasend-ts` does not carry version tokens across replicas yet: list the versions you move from the primary backend.
+
+</Ts>
+
 ## Monitoring and repair
 
 Three operations give a dashboard what it needs to watch replication and fix drift, plus one for bulk migration.

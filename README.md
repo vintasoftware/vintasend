@@ -701,6 +701,33 @@ changes what matches, so list again from page 1 rather than moving on to page 2.
 `expected_version` makes the move conditional: if the notification was written since it was
 listed, the call raises `NotificationActionError` with reason `CHANGED` and writes nothing.
 
+Every `Notification` and `OneOffNotification` also carries its token in
+`notification_version` (`None` from a backend that keeps no token), so a caller already holding
+a notification can skip the listing:
+
+```python
+notification = notification_service.get_notification(notification_id)
+notification_service.repin_notification(
+    notification.id, 4, expected_version=notification.notification_version
+)
+```
+
+**Listing from a replica.** Moves always run on the primary backend, but you can list from an
+additional backend, such as a read replica, with
+`filter_notification_versions(filter, page, page_size, backend_identifier="replica")`. The
+primary issues the tokens and replication carries them to the replica, so a listed version is
+one the primary accepts. A replica that has not caught up with the latest write yet hands out a
+stale token: the move is refused, usually with `CHANGED` (a requeue checks the status first, so
+a notification that has moved on can be refused with `INVALID_STATUS`), and you list again. A
+replica holds the primary's tokens when it applies the primary's snapshots
+(`apply_replication_snapshot_if_newer`) or reports `writes.notificationVersion`. For the latter,
+the service replays each write there without a token, converges the row to the primary's, and
+stamps the primary's token on it only once the row verifiably matches; a row that does not match
+keeps a token of its own, so a move listed from it is refused. Listing from a replica that does
+neither raises
+`UnsupportedNotificationActionError`, because its tokens are its own and the primary would
+refuse every one.
+
 These options are optional backend features. `get_backend_supported_action_capabilities()`
 reports which ones the primary backend supports, all `False` by default:
 
@@ -710,12 +737,18 @@ reports which ones the primary backend supports, all `False` by default:
 | `requeue.expectedVersion` | the backend's `requeue_notification` checks `expected_version` |
 | `requeue.templateVersion` | the backend's `requeue_notification` pins in the same write |
 | `versions.filter` | the backend implements `filter_notification_versions` |
+| `writes.notificationVersion` | the backend's writes take the primary's token as a replica |
+
+Passed an additional backend's identifier, it answers each key where the action runs: the
+three move options come from the primary, `versions.filter` is the named backend's own and is
+`True` only when that backend can hold the primary's tokens, as above, and
+`writes.notificationVersion` is the named backend's own.
 
 An option the primary backend does not report is refused with reason `UNSUPPORTED` before
 anything is read or written, never passed to a backend that would ignore it.
 `filter_notification_versions` on a backend without it raises
 `UnsupportedNotificationActionError`. The fakes, `vintasend-django` and `vintasend-sqlalchemy`
-support all four.
+support all five.
 
 Requeueing a cancelled notification needs a backend that keeps cancelled rows. The Django and
 SQLAlchemy backends and the in-repo fake keep them with status `CANCELLED`, and `get_notification`

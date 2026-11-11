@@ -63,6 +63,7 @@ from vintasend.services.dataclasses import (
     NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     ONE_OFF_NOTIFICATION_SYNC_COMPARABLE_FIELDS,
     AnyNotificationAttachment,
+    ApplyResult,
     BackendMigrationFailure,
     BackendMigrationResult,
     BackendSyncStats,
@@ -469,11 +470,23 @@ def _validate_expected_version(
         )
 
 
+def _send_time_has_come(send_after: datetime.datetime | None) -> bool:
+    """Whether a notification with this send time should be sent now rather than left for later.
+
+    A naive ``send_after`` is read as UTC: SQLite, and PostgreSQL ``timestamp`` columns, hand
+    datetimes back without a time zone, and comparing one with an aware "now" raises
+    ``TypeError``.
+    """
+    if send_after is None:
+        return True
+    if send_after.tzinfo is None:
+        send_after = send_after.replace(tzinfo=datetime.timezone.utc)
+    return send_after <= datetime.datetime.now(tz=datetime.timezone.utc)
+
+
 def _is_due(notification: "Notification | OneOffNotification") -> bool:
     """Whether a pending notification should be sent now rather than left for later."""
-    return notification.send_after is None or notification.send_after <= datetime.datetime.now(
-        tz=datetime.timezone.utc
-    )
+    return _send_time_has_come(notification.send_after)
 
 
 def _notification_type_value(notification_type: "NotificationTypes | str") -> str:
@@ -536,6 +549,149 @@ def _merge_action_capabilities(backend: object, reported: dict[str, bool]) -> di
     if not _overrides(backend, "filter_notification_versions"):
         capabilities["versions.filter"] = False
     return capabilities
+
+
+# Keys describing an option of a move. Moves always run on the primary backend, so for a named
+# additional backend these are read from the primary rather than from the backend named.
+_PRIMARY_ROUTED_ACTION_CAPABILITIES: tuple[str, ...] = (
+    "requeue.templateVersion",
+    "requeue.expectedVersion",
+    "repin.expectedVersion",
+)
+
+
+def _route_named_backend_capabilities(
+    named_backend: object,
+    named_capabilities: dict[str, bool],
+    primary_capabilities: dict[str, bool],
+) -> dict[str, bool]:
+    """A named additional backend's capabilities, with each key read where its action runs.
+
+    Both reports are already merged by ``_merge_action_capabilities``. The move options come
+    from the primary, since that is where requeue and repin write. ``versions.filter`` stays
+    the named backend's own, and additionally needs it to apply replication snapshots or to
+    report ``writes.notificationVersion``: only then does it hold the primary's version tokens.
+    A replica that replays writes through its own primitives without taking the primary's token
+    issues tokens of its own, which the primary always refuses (usually as ``CHANGED``).
+    ``writes.notificationVersion`` is the named backend's own: it is about writes to it.
+    """
+    capabilities = dict(named_capabilities)
+    for key in _PRIMARY_ROUTED_ACTION_CAPABILITIES:
+        capabilities[key] = primary_capabilities[key]
+    capabilities["versions.filter"] = capabilities["versions.filter"] and (
+        _overrides(named_backend, "apply_replication_snapshot_if_newer")
+        or capabilities["writes.notificationVersion"]
+    )
+    return capabilities
+
+
+def _versions_unsupported_on_backend_error(
+    backend_identifier: str,
+) -> UnsupportedNotificationActionError:
+    return UnsupportedNotificationActionError(
+        f"Backend {backend_identifier} cannot list version tokens the primary backend accepts"
+    )
+
+
+def _log_bulk_snapshot_failure(notification_id: int | str | uuid.UUID) -> None:
+    logger.warning(
+        "Failed to apply the snapshot of notification %s to a replica while marking "
+        "notifications read; marking it read there instead",
+        notification_id,
+        exc_info=True,
+    )
+
+
+def _snapshot_settled(outcome: ApplyResult) -> bool:
+    """Whether a replica needs no fallback after ``apply_replication_snapshot_if_newer``.
+
+    True when it applied the snapshot, and when it declined it as ``superseded``: its row is
+    newer than the snapshot and already reflects a later write, which replaying the older
+    snapshot through the fallback would overwrite.
+    """
+    return outcome.applied or outcome.superseded
+
+
+def _unapplied_bulk_ids(
+    read_on_primary: "Iterable[Notification]",
+    rows: "Iterable[Notification | OneOffNotification]",
+    apply: "Callable[[Notification | OneOffNotification], bool]",
+) -> list[int | str | uuid.UUID]:
+    """Apply each primary row to a replica; return the ids it still has to mark read itself.
+
+    That is every id the primary marked read whose row the replica declined (other than as
+    superseded, which ``apply`` reports as settled), failed to apply (logged by id only), or
+    that could not be re-read from the primary.
+    """
+    applied: set[str] = set()
+    for row in rows:
+        try:
+            if apply(row):
+                applied.add(str(row.id))
+        except Exception:  # noqa: BLE001
+            _log_bulk_snapshot_failure(row.id)
+    return [record.id for record in read_on_primary if str(record.id) not in applied]
+
+
+# The fields ``_converge_replica_to_snapshot`` brings into line, which a replica row must match
+# before it is stamped with the primary's version token. ``used_template_version`` is added when
+# the replica overrides ``store_template_version``; the base default has nowhere to keep it.
+_CONVERGED_FIELDS: tuple[str, ...] = (
+    "status",
+    "title",
+    "body_template",
+    "context_name",
+    "context_kwargs",
+    "send_after",
+    "subject_template",
+    "preheader_template",
+    "adapter_extra_parameters",
+    "requested_template_version",
+    "context_used",
+    "adapter_used",
+    "git_commit_sha",
+)
+
+
+def _comparable_value(value: object) -> object:
+    """``value``, with a naive datetime read as UTC so it compares with an aware one."""
+    if isinstance(value, datetime.datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value
+
+
+def _replica_row_matches_snapshot(
+    row: "Notification | OneOffNotification",
+    snapshot: "Notification | OneOffNotification",
+    *,
+    with_used_template_version: bool,
+) -> bool:
+    """Whether a converged replica row holds what the primary's snapshot holds."""
+    fields = _CONVERGED_FIELDS
+    if with_used_template_version:
+        fields = (*fields, "used_template_version")
+    return all(
+        _comparable_value(getattr(row, name, None))
+        == _comparable_value(getattr(snapshot, name, None))
+        for name in fields
+    )
+
+
+def _log_unstamped_replica(notification_id: int | str | uuid.UUID) -> None:
+    logger.warning(
+        "A replica's copy of notification %s does not match the primary's after converging "
+        "it, so it keeps a version token of its own and moves listed from it are refused",
+        notification_id,
+    )
+
+
+def _log_bulk_converge_failure(notification_id: int | str | uuid.UUID) -> None:
+    logger.warning(
+        "Failed to converge notification %s on a replica after marking it read; it keeps a "
+        "version token of its own",
+        notification_id,
+        exc_info=True,
+    )
 
 
 class Contexts(metaclass=SingletonMeta):
@@ -1080,14 +1236,16 @@ class NotificationService(Generic[A, B]):
         tried first: a backend that implements it upserts the whole record -- creating the row
         with the primary's id or refreshing it newer-wins -- in one call. When it declines
         (``applied=False``, the concrete default) the ``additional_write`` fallback mirrors the
-        mutation with the backend's own primitives. A duplicate/conflict failure -- the replica
+        mutation with the backend's own primitives -- unless it declined as ``superseded``: its
+        row is newer than the snapshot and already reflects a later write, which the fallback
+        would overwrite with older state, so nothing is replayed. A duplicate/conflict failure --
+        the replica
         already holds a created row, or lacks a row being updated -- flips once to converging the
         replica to the snapshot before the error propagates to the caller's logging.
         """
         try:
-            if (
-                snapshot is not None
-                and replica.apply_replication_snapshot_if_newer(snapshot).applied
+            if snapshot is not None and _snapshot_settled(
+                replica.apply_replication_snapshot_if_newer(snapshot)
             ):
                 return
             additional_write(replica, snapshot)
@@ -1125,6 +1283,14 @@ class NotificationService(Generic[A, B]):
         audit fields (e.g. ``sent_at``) -- ``update_data`` only carries the plain content fields.
         A backend that needs full-fidelity replication, including attachments, should implement
         ``apply_replication_snapshot_if_newer`` instead of relying on this fallback.
+
+        No write here carries the primary's token. A replica reporting
+        ``writes.notificationVersion`` is then re-read and, only if its row matches the snapshot
+        on every converged field, stamped with the snapshot's token in one token-only write (see
+        ``_stamp_if_converged``). If anything raises first, nothing is stamped and the replica
+        keeps a token of its own, which the primary refuses. That does not lift the limits
+        above: it still cannot get a row it lacks, since no primitive creates one with the
+        primary's id, and attachments are still not converged.
         """
         try:
             replica_row = replica.get_notification(snapshot.id)
@@ -1146,30 +1312,142 @@ class NotificationService(Generic[A, B]):
             "preheader_template": snapshot.preheader_template,
             "adapter_extra_parameters": snapshot.adapter_extra_parameters,
         }
-        replica.persist_notification_update(snapshot.id, update_data)
+        # No write here carries a token: each one issues the replica's own. A replica that takes
+        # the primary's token is stamped with it at the end, once its row is checked against the
+        # snapshot. Such a replica predates nothing, so the template pin and the version used
+        # are converged too: a row holding the primary's token must hold the primary's content.
+        stamps = self._stamps_primary_token(replica)
+        if stamps:
+            update_data["requested_template_version"] = snapshot.requested_template_version
+        current_status = replica_row.status
+        # A row that did not go out (FAILED or CANCELLED) and differs from the snapshot's status
+        # goes back to PENDING_SEND first, as it did on the primary, so every forward transition
+        # below starts from there and the content update after it lands.
+        if (
+            current_status in REQUEUEABLE_NOTIFICATION_STATUSES
+            and snapshot.status != current_status
+        ):
+            replica.requeue_notification(snapshot.id, send_after=snapshot.send_after)
+            current_status = NotificationStatus.PENDING_SEND.value
+        # Backends refuse a content update once a notification is delivered (SENT or READ), and
+        # a delivered row's content no longer changes on the primary either, so the update is
+        # replayed only while the replica's row can still take it.
+        if current_status in REPINNABLE_NOTIFICATION_STATUSES:
+            replica.persist_notification_update(snapshot.id, update_data)
         if snapshot.context_used is not None:
             replica.store_context_used(
                 snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
             )
         if snapshot.git_commit_sha is not None:
             replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        # Only on a replica that overrides it: the base default is a no-op with nowhere to keep
+        # the value, and predates the token keyword.
+        if (
+            stamps
+            and _overrides(replica, "store_template_version")
+            and snapshot.used_template_version is not None
+        ):
+            replica.store_template_version(snapshot.id, snapshot.used_template_version)
         # Reach the snapshot's status through the same intermediate transitions a real backend
         # requires, rather than forcing a single terminal `mark_*` call: a row still PENDING_SEND
         # must pass through SENT on its way to READ, matching the state machine every backend
         # (including strict ones) enforces.
-        current_status = replica_row.status
-        if snapshot.status == NotificationStatus.SENT.value:
-            if current_status == NotificationStatus.PENDING_SEND.value:
+        if current_status == NotificationStatus.PENDING_SEND.value:
+            if snapshot.status == NotificationStatus.SENT.value:
                 replica.mark_pending_as_sent(snapshot.id)
-        elif snapshot.status == NotificationStatus.FAILED.value:
-            if current_status == NotificationStatus.PENDING_SEND.value:
+            elif snapshot.status == NotificationStatus.FAILED.value:
                 replica.mark_pending_as_failed(snapshot.id)
-        elif snapshot.status == NotificationStatus.READ.value:
-            if current_status == NotificationStatus.PENDING_SEND.value:
+            elif snapshot.status == NotificationStatus.CANCELLED.value:
+                replica.cancel_notification(snapshot.id)
+            elif snapshot.status == NotificationStatus.READ.value:
                 replica.mark_pending_as_sent(snapshot.id)
                 replica.mark_sent_as_read(snapshot.id)
-            elif current_status == NotificationStatus.SENT.value:
-                replica.mark_sent_as_read(snapshot.id)
+        elif (
+            current_status == NotificationStatus.SENT.value
+            and snapshot.status == NotificationStatus.READ.value
+        ):
+            replica.mark_sent_as_read(snapshot.id)
+        if stamps:
+            self._stamp_if_converged(replica, snapshot)
+
+    def _reread_from_primary(
+        self, records: Iterable["Notification | OneOffNotification"]
+    ) -> list["Notification | OneOffNotification"]:
+        """Each record as the primary holds it now, skipping (and logging by id) any that fail.
+
+        Bulk writes use it for the per-row tokens their replicas need. A failure never fails
+        the caller: the primary write has already committed.
+        """
+        rows: list[Notification | OneOffNotification] = []
+        for record in records:
+            try:
+                rows.append(self.notification_backend.get_notification(record.id))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to re-read notification %s to replicate its version token",
+                    record.id,
+                    exc_info=True,
+                )
+        return rows
+
+    def _accepts_notification_version(self, backend: B) -> bool:
+        """Whether ``backend`` reports ``writes.notificationVersion``, read fresh every time."""
+        return _merge_action_capabilities(backend, backend.get_action_capabilities())[
+            "writes.notificationVersion"
+        ]
+
+    def _stamps_primary_token(self, replica: B) -> bool:
+        """Whether ``replica`` is stamped with the primary's token once its row matches.
+
+        Only a backend reporting ``writes.notificationVersion``, so one whose write methods do
+        not accept the keyword is never handed it, and never the primary itself, which issues
+        tokens rather than taking them -- that covers ``migrate_to_backend`` with the primary
+        as the destination.
+        """
+        if replica is self.notification_backend:
+            return False
+        return self._accepts_notification_version(replica)
+
+    def _stamp_if_converged(
+        self, replica: B, snapshot: "Notification | OneOffNotification"
+    ) -> None:
+        """Give a converged replica row the primary's token, if it verifiably matches.
+
+        Re-reads the row and compares it with the snapshot on every field
+        ``_converge_replica_to_snapshot`` brings into line (``used_template_version`` only when
+        the replica overrides ``store_template_version``). Only when they match is the token
+        written, in one token-only write a backend reporting ``writes.notificationVersion`` must
+        accept in any status. A mismatch is logged by id and leaves the replica's own token, so
+        a move with a version listed from it is refused rather than accepted against a row that
+        differs from the primary's. A snapshot without a token has nothing to stamp.
+        """
+        if snapshot.notification_version is None:
+            return
+        row = replica.get_notification(snapshot.id)
+        if not _replica_row_matches_snapshot(
+            row,
+            snapshot,
+            with_used_template_version=_overrides(replica, "store_template_version"),
+        ):
+            _log_unstamped_replica(snapshot.id)
+            return
+        # Through ``**``: the abstract signature keeps its 3.7.0 form, and only a backend
+        # reporting ``writes.notificationVersion`` accepts the keyword.
+        stamp: dict[str, Any] = {"notification_version": snapshot.notification_version}
+        replica.persist_notification_update(snapshot.id, {}, **stamp)
+
+    def _converge_and_stamp(
+        self, replica: B, snapshot: "Notification | OneOffNotification | None"
+    ) -> None:
+        """After a replica path replays its one change, converge and stamp a token-taking replica.
+
+        The requeue, repin and cancel replica paths replay only their own change, with no token.
+        On a replica that takes the primary's token that is not enough to stamp it, so the rest
+        of the row is brought into line and checked first. Other replicas keep what they had.
+        """
+        if snapshot is None or not self._stamps_primary_token(replica):
+            return
+        self._converge_replica_to_snapshot(replica, snapshot)
 
     def _replicate_store_context_used(
         self,
@@ -1824,9 +2102,7 @@ class NotificationService(Generic[A, B]):
             lambda backend: backend.persist_notification(**persist_kwargs),
             self._replicate_snapshot_fallback,
         )
-        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if _send_time_has_come(notification.send_after):
             self.send(notification)
         return notification
 
@@ -1914,9 +2190,7 @@ class NotificationService(Generic[A, B]):
             lambda backend: backend.persist_one_off_notification(**persist_kwargs),
             self._replicate_snapshot_fallback,
         )
-        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if _send_time_has_come(notification.send_after):
             self.send(notification)
         return notification
 
@@ -2203,9 +2477,63 @@ class NotificationService(Generic[A, B]):
         # Materialize once: the id iterable may be a single-use generator, and both the primary
         # write and every replica mirror need to consume it.
         ids = list(notification_ids)
+        read_on_primary: list[Notification] = []
+
+        def _mark_read_bulk_on_primary(backend: B) -> Iterable[Notification]:
+            # Materialized too, so the records can serve as replication snapshots below and
+            # still be returned to the caller.
+            read_on_primary.extend(backend.mark_sent_as_read_bulk(ids, user_id=user_id))
+            return read_on_primary
+
+        # The primary's post-write rows, re-read at most once and only when some replica needs
+        # them: one that applies snapshots, or one stamped with the primary's tokens.
+        primary_rows: list[Notification | OneOffNotification] = []
+        primary_rows_read = False
+
+        def _primary_rows() -> list[Notification | OneOffNotification]:
+            nonlocal primary_rows_read
+            if not primary_rows_read:
+                primary_rows.extend(self._reread_from_primary(read_on_primary))
+                primary_rows_read = True
+            return primary_rows
+
+        def _mark_read_bulk_on_replica(backend: B, _snapshot: Any) -> None:
+            # A bulk write has no single record for the generic path to snapshot. A replica that
+            # applies snapshots takes each primary row instead, version token included, and only
+            # the ones it declines (other than as superseded, whose rows are already newer) are
+            # marked read through its own bulk write. That bulk write carries no tokens: a
+            # replica stamped with the primary's tokens then has each of those rows converged,
+            # checked and stamped one by one. One that does neither mirrors the bulk write
+            # exactly as before.
+            applies_snapshots = _overrides(backend, "apply_replication_snapshot_if_newer")
+            stamps = self._stamps_primary_token(backend)
+            if not applies_snapshots and not stamps:
+                backend.mark_sent_as_read_bulk(ids, user_id=user_id)
+                return
+            rows = _primary_rows()
+            targets: list[int | str | uuid.UUID] = ids
+            if applies_snapshots:
+                targets = _unapplied_bulk_ids(
+                    read_on_primary,
+                    rows,
+                    lambda row: _snapshot_settled(backend.apply_replication_snapshot_if_newer(row)),
+                )
+            if not targets:
+                return
+            backend.mark_sent_as_read_bulk(targets, user_id=user_id)
+            if not stamps:
+                return
+            wanted = {str(target) for target in targets}
+            for row in rows:
+                if str(row.id) not in wanted:
+                    continue
+                try:
+                    self._converge_replica_to_snapshot(backend, row)
+                except Exception:  # noqa: BLE001
+                    _log_bulk_converge_failure(row.id)
+
         return self._execute_multi_backend_write(
-            lambda backend: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
-            lambda backend, snapshot: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+            _mark_read_bulk_on_primary, _mark_read_bulk_on_replica
         )
 
     def get_in_app_unread(
@@ -2408,9 +2736,7 @@ class NotificationService(Generic[A, B]):
         source = self.notification_backend.get_notification(notification_id)
         if isinstance(source, OneOffNotification):
             raise NotificationResendError("One-off notifications cannot be resent")
-        if source.send_after is not None and source.send_after > datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if not _send_time_has_come(source.send_after):
             raise NotificationResendError(
                 "Cannot resend a notification that is still scheduled in the future"
             )
@@ -2452,9 +2778,7 @@ class NotificationService(Generic[A, B]):
         if use_stored_context_if_available and source.context_used is not None:
             reused_context = cast(NotificationContextDict, source.context_used)
 
-        if clone.send_after is None or clone.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if _send_time_has_come(clone.send_after):
             self.send(clone, context=reused_context)
         return clone
 
@@ -2521,11 +2845,13 @@ class NotificationService(Generic[A, B]):
             # Reached when the replica declines the snapshot, or when there is none because the
             # primary deletes cancelled rows rather than keeping them as CANCELLED. Mirror the
             # cancel on the replica. A replica that never held the row is already in the desired
-            # (absent) state, so a not-found is success, not a failure.
+            # (absent) state, so a not-found is success, not a failure. The cancel carries no
+            # token; a replica that takes the primary's is converged and stamped after it.
             try:
                 backend.cancel_notification(notification_id)
             except NotificationNotFoundError:
                 return
+            self._converge_and_stamp(backend, snapshot)
 
         return self._execute_multi_backend_write(
             lambda backend: backend.cancel_notification(notification_id),
@@ -2543,12 +2869,32 @@ class NotificationService(Generic[A, B]):
         ``False`` unless the backend reports it. A key whose method the backend does not
         implement reads ``False`` whatever the backend reports.
 
+        Each key is answered by the backend where its action runs. With ``backend_identifier``
+        omitted or naming the primary, every key is the primary's. Naming an additional
+        backend, ``requeue.templateVersion``, ``requeue.expectedVersion`` and
+        ``repin.expectedVersion`` are still the primary's, because moves always write there,
+        while ``versions.filter`` is the named backend's and is ``True`` only when it reports
+        it and also either implements ``apply_replication_snapshot_if_newer`` or reports
+        ``writes.notificationVersion``. A replica that applies the primary's snapshots, or one
+        stamped with the primary's token once the writes it replays leave its row matching
+        the primary's, holds the primary's version tokens; one that does neither holds tokens
+        of its own, which the primary would always refuse. ``writes.notificationVersion`` is
+        the named backend's own report.
+
         ``requeue_notification`` and ``repin_notification`` read this to decide whether to pass
         ``expected_version`` and ``template_version`` on, and refuse an option the primary
         backend does not report with ``NotificationActionError`` reason ``UNSUPPORTED``.
         """
         backend = self._get_backend(backend_identifier)
-        return _merge_action_capabilities(backend, backend.get_action_capabilities())
+        capabilities = _merge_action_capabilities(backend, backend.get_action_capabilities())
+        if backend_identifier is None or backend_identifier == self._primary_backend_identifier:
+            return capabilities
+        primary = self.notification_backend
+        return _route_named_backend_capabilities(
+            backend,
+            capabilities,
+            _merge_action_capabilities(primary, primary.get_action_capabilities()),
+        )
 
     def _assert_action_supported(
         self,
@@ -2585,12 +2931,30 @@ class NotificationService(Generic[A, B]):
         notifications match, so it should list again from the first page instead of moving on
         to the next one.
 
+        Tokens come from the primary backend, which issues one on every write; replication
+        carries them to additional backends that apply snapshots, and stamps them on a replica
+        reporting ``writes.notificationVersion`` once its row matches the primary's. So a
+        version listed from a named replica is one the primary accepts, unless the replica has
+        not caught up with the latest write yet: the move is then refused, usually as
+        ``CHANGED`` (a requeue checks the status first, so a notification that has moved on
+        can be refused as ``INVALID_STATUS``), and the caller lists again.
+
         Raises UnsupportedNotificationActionError when the backend does not implement it
         (``versions.filter`` is ``False`` in ``get_backend_supported_action_capabilities``).
+        For a named additional backend that includes one that neither implements
+        ``apply_replication_snapshot_if_newer`` nor reports ``writes.notificationVersion``: its
+        tokens are its own, and the primary would refuse every one of them.
         """
-        return self._get_backend(backend_identifier).filter_notification_versions(
-            filter, page, page_size
-        )
+        backend = self._get_backend(backend_identifier)
+        if (
+            backend_identifier is not None
+            and backend_identifier != self._primary_backend_identifier
+            and not self.get_backend_supported_action_capabilities(backend_identifier)[
+                "versions.filter"
+            ]
+        ):
+            raise _versions_unsupported_on_backend_error(backend_identifier)
+        return backend.filter_notification_versions(filter, page, page_size)
 
     def get_current_template_version(
         self, notification_type: NotificationTypes | str, template_key: str
@@ -2659,8 +3023,11 @@ class NotificationService(Generic[A, B]):
 
         The write goes to the primary backend first, then to every additional backend, the
         same way other writes are replicated. Replicas take it unconditionally: a version token
-        belongs to the primary backend. A replica that cannot pin in the same write is repinned
-        and then requeued. A replica that fails is logged and does not change the result.
+        belongs to the primary backend. A replica that applies snapshots receives the primary's
+        record as it stands after the write, version token included, so versions listed from
+        it keep matching the primary's. One that declines is requeued through its own
+        ``requeue_notification``, and one that cannot pin in the same write is repinned and
+        then requeued. A replica that fails is logged and does not change the result.
 
         This method may raise the following exceptions:
             * InvalidTemplateVersionError if ``template_version`` is not a non-negative ``int``,
@@ -2722,9 +3089,18 @@ class NotificationService(Generic[A, B]):
                 notification_id, send_after=send_after, **primary_options
             )
 
-        def _requeue_replica(backend: B, *_: Any) -> Notification | OneOffNotification:
+        def _requeue_replica(
+            backend: B, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # Reached only when the replica declines the primary's snapshot. The writes carry no
+            # token; a replica that takes the primary's is converged and stamped after them.
+            _requeue_replica_row(backend)
+            self._converge_and_stamp(backend, snapshot)
+
+        def _requeue_replica_row(backend: B) -> None:
             if template_version is None:
-                return backend.requeue_notification(notification_id, send_after=send_after)
+                backend.requeue_notification(notification_id, send_after=send_after)
+                return
             replica_capabilities = _merge_action_capabilities(
                 backend, backend.get_action_capabilities()
             )
@@ -2732,13 +3108,14 @@ class NotificationService(Generic[A, B]):
                 # Through ``**``: the abstract signature keeps its 3.7.0 form, and only a
                 # backend reporting the capability accepts the keyword.
                 replica_options: dict[str, Any] = {"template_version": template_version}
-                return backend.requeue_notification(
+                backend.requeue_notification(
                     notification_id, send_after=send_after, **replica_options
                 )
+                return
             backend.persist_notification_update(
                 notification_id, {"requested_template_version": template_version}
             )
-            return backend.requeue_notification(notification_id, send_after=send_after)
+            backend.requeue_notification(notification_id, send_after=send_after)
 
         try:
             requeued = self._execute_multi_backend_write(
@@ -2807,7 +3184,9 @@ class NotificationService(Generic[A, B]):
         checks the status, and ``expected_version`` when given, in the same write, so a worker
         sending the notification in between is never overwritten. The base class's default
         writes through ``persist_notification_update``. Every additional backend then takes the
-        pin unconditionally.
+        pin unconditionally: one that applies snapshots receives the primary's record as it
+        stands after the write, version token included, and one that declines is pinned through
+        its own ``persist_notification_update``.
 
         Repinning to the version already pinned writes nothing and returns the notification as
         it is, unless ``expected_version`` is given: the backend then checks it all the same.
@@ -2873,10 +3252,15 @@ class NotificationService(Generic[A, B]):
                 notification_id, version, expected_version=expected_version
             )
 
-        def _repin_replica(backend: B, *_: Any) -> Notification | OneOffNotification:
-            return backend.persist_notification_update(
+        def _repin_replica(
+            backend: B, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # Reached only when the replica declines the primary's snapshot. The update carries
+            # no token; a replica that takes the primary's is converged and stamped after it.
+            backend.persist_notification_update(
                 notification_id, {"requested_template_version": version}
             )
+            self._converge_and_stamp(backend, snapshot)
 
         try:
             repinned = self._execute_multi_backend_write(
@@ -3578,14 +3962,16 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         tried first: a backend that implements it upserts the whole record -- creating the row
         with the primary's id or refreshing it newer-wins -- in one call. When it declines
         (``applied=False``, the concrete default) the ``additional_write`` fallback mirrors the
-        mutation with the backend's own primitives. A duplicate/conflict failure -- the replica
+        mutation with the backend's own primitives -- unless it declined as ``superseded``: its
+        row is newer than the snapshot and already reflects a later write, which the fallback
+        would overwrite with older state, so nothing is replayed. A duplicate/conflict failure --
+        the replica
         already holds a created row, or lacks a row being updated -- flips once to converging the
         replica to the snapshot before the error propagates to the caller's logging.
         """
         try:
-            if (
-                snapshot is not None
-                and (await replica.apply_replication_snapshot_if_newer(snapshot)).applied
+            if snapshot is not None and _snapshot_settled(
+                await replica.apply_replication_snapshot_if_newer(snapshot)
             ):
                 return
             await additional_write(replica, snapshot)
@@ -3623,6 +4009,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         audit fields (e.g. ``sent_at``) -- ``update_data`` only carries the plain content fields.
         A backend that needs full-fidelity replication, including attachments, should implement
         ``apply_replication_snapshot_if_newer`` instead of relying on this fallback.
+
+        No write here carries the primary's token. A replica reporting
+        ``writes.notificationVersion`` is then re-read and, only if its row matches the snapshot
+        on every converged field, stamped with the snapshot's token in one token-only write (see
+        ``_stamp_if_converged``). If anything raises first, nothing is stamped and the replica
+        keeps a token of its own, which the primary refuses. That does not lift the limits
+        above: it still cannot get a row it lacks, since no primitive creates one with the
+        primary's id, and attachments are still not converged.
         """
         try:
             replica_row = await replica.get_notification(snapshot.id)
@@ -3644,30 +4038,120 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             "preheader_template": snapshot.preheader_template,
             "adapter_extra_parameters": snapshot.adapter_extra_parameters,
         }
-        await replica.persist_notification_update(snapshot.id, update_data)
+        # No write here carries a token: each one issues the replica's own. A replica that takes
+        # the primary's token is stamped with it at the end, once its row is checked against the
+        # snapshot. Such a replica predates nothing, so the template pin and the version used
+        # are converged too: a row holding the primary's token must hold the primary's content.
+        stamps = await self._stamps_primary_token(replica)
+        if stamps:
+            update_data["requested_template_version"] = snapshot.requested_template_version
+        current_status = replica_row.status
+        # A row that did not go out (FAILED or CANCELLED) and differs from the snapshot's status
+        # goes back to PENDING_SEND first, as it did on the primary, so every forward transition
+        # below starts from there and the content update after it lands.
+        if (
+            current_status in REQUEUEABLE_NOTIFICATION_STATUSES
+            and snapshot.status != current_status
+        ):
+            await replica.requeue_notification(snapshot.id, send_after=snapshot.send_after)
+            current_status = NotificationStatus.PENDING_SEND.value
+        # Backends refuse a content update once a notification is delivered (SENT or READ), and
+        # a delivered row's content no longer changes on the primary either, so the update is
+        # replayed only while the replica's row can still take it.
+        if current_status in REPINNABLE_NOTIFICATION_STATUSES:
+            await replica.persist_notification_update(snapshot.id, update_data)
         if snapshot.context_used is not None:
             await replica.store_context_used(
                 snapshot.id, snapshot.context_used, snapshot.adapter_used or ""
             )
         if snapshot.git_commit_sha is not None:
             await replica.store_git_commit_sha(snapshot.id, snapshot.git_commit_sha)
+        # Only on a replica that overrides it: the base default is a no-op with nowhere to keep
+        # the value, and predates the token keyword.
+        if (
+            stamps
+            and _overrides(replica, "store_template_version")
+            and snapshot.used_template_version is not None
+        ):
+            await replica.store_template_version(snapshot.id, snapshot.used_template_version)
         # Reach the snapshot's status through the same intermediate transitions a real backend
         # requires, rather than forcing a single terminal `mark_*` call: a row still PENDING_SEND
         # must pass through SENT on its way to READ, matching the state machine every backend
         # (including strict ones) enforces.
-        current_status = replica_row.status
-        if snapshot.status == NotificationStatus.SENT.value:
-            if current_status == NotificationStatus.PENDING_SEND.value:
+        if current_status == NotificationStatus.PENDING_SEND.value:
+            if snapshot.status == NotificationStatus.SENT.value:
                 await replica.mark_pending_as_sent(snapshot.id)
-        elif snapshot.status == NotificationStatus.FAILED.value:
-            if current_status == NotificationStatus.PENDING_SEND.value:
+            elif snapshot.status == NotificationStatus.FAILED.value:
                 await replica.mark_pending_as_failed(snapshot.id)
-        elif snapshot.status == NotificationStatus.READ.value:
-            if current_status == NotificationStatus.PENDING_SEND.value:
+            elif snapshot.status == NotificationStatus.CANCELLED.value:
+                await replica.cancel_notification(snapshot.id)
+            elif snapshot.status == NotificationStatus.READ.value:
                 await replica.mark_pending_as_sent(snapshot.id)
                 await replica.mark_sent_as_read(snapshot.id)
-            elif current_status == NotificationStatus.SENT.value:
-                await replica.mark_sent_as_read(snapshot.id)
+        elif (
+            current_status == NotificationStatus.SENT.value
+            and snapshot.status == NotificationStatus.READ.value
+        ):
+            await replica.mark_sent_as_read(snapshot.id)
+        if stamps:
+            await self._stamp_if_converged(replica, snapshot)
+
+    async def _reread_from_primary(
+        self, records: Iterable["Notification | OneOffNotification"]
+    ) -> list["Notification | OneOffNotification"]:
+        """See the sync twin: each record as the primary holds it now, failures skipped."""
+        rows: list[Notification | OneOffNotification] = []
+        for record in records:
+            try:
+                rows.append(await self.notification_backend.get_notification(record.id))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to re-read notification %s to replicate its version token",
+                    record.id,
+                    exc_info=True,
+                )
+        return rows
+
+    async def _accepts_notification_version(self, backend: BAIO) -> bool:
+        """Whether ``backend`` reports ``writes.notificationVersion``, read fresh every time."""
+        return _merge_action_capabilities(backend, await backend.get_action_capabilities())[
+            "writes.notificationVersion"
+        ]
+
+    async def _stamps_primary_token(self, replica: BAIO) -> bool:
+        """See the sync twin: a backend reporting ``writes.notificationVersion``, never the
+        primary."""
+        if replica is self.notification_backend:
+            return False
+        return await self._accepts_notification_version(replica)
+
+    async def _stamp_if_converged(
+        self, replica: BAIO, snapshot: "Notification | OneOffNotification"
+    ) -> None:
+        """See the sync twin: stamp the primary's token only on a row that matches the
+        snapshot."""
+        if snapshot.notification_version is None:
+            return
+        row = await replica.get_notification(snapshot.id)
+        if not _replica_row_matches_snapshot(
+            row,
+            snapshot,
+            with_used_template_version=_overrides(replica, "store_template_version"),
+        ):
+            _log_unstamped_replica(snapshot.id)
+            return
+        # Through ``**``: the abstract signature keeps its 3.7.0 form, and only a backend
+        # reporting ``writes.notificationVersion`` accepts the keyword.
+        stamp: dict[str, Any] = {"notification_version": snapshot.notification_version}
+        await replica.persist_notification_update(snapshot.id, {}, **stamp)
+
+    async def _converge_and_stamp(
+        self, replica: BAIO, snapshot: "Notification | OneOffNotification | None"
+    ) -> None:
+        """See the sync twin: converge and stamp a token-taking replica after its one change."""
+        if snapshot is None or not await self._stamps_primary_token(replica):
+            return
+        await self._converge_replica_to_snapshot(replica, snapshot)
 
     async def _replicate_store_context_used(
         self,
@@ -4332,9 +4816,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             lambda backend: backend.persist_notification(**persist_kwargs),
             self._replicate_snapshot_fallback,
         )
-        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if _send_time_has_come(notification.send_after):
             await self.send(notification)
         return notification
 
@@ -4422,9 +4904,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
             lambda backend: backend.persist_one_off_notification(**persist_kwargs),
             self._replicate_snapshot_fallback,
         )
-        if notification.send_after is None or notification.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if _send_time_has_come(notification.send_after):
             await self.send(notification)
         return notification
 
@@ -4731,9 +5211,64 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         # Materialize once: the id iterable may be a single-use generator, and both the primary
         # write and every replica mirror need to consume it.
         ids = list(notification_ids)
+        read_on_primary: list[Notification] = []
+
+        async def _mark_read_bulk_on_primary(backend: BAIO) -> Iterable[Notification]:
+            # Materialized too, so the records can serve as replication snapshots below and
+            # still be returned to the caller.
+            read_on_primary.extend(await backend.mark_sent_as_read_bulk(ids, user_id=user_id))
+            return read_on_primary
+
+        # See the sync twin: the primary's post-write rows, re-read at most once and only when
+        # some replica needs their tokens.
+        primary_rows: list[Notification | OneOffNotification] = []
+        primary_rows_read = False
+
+        async def _primary_rows() -> list[Notification | OneOffNotification]:
+            nonlocal primary_rows_read
+            if not primary_rows_read:
+                primary_rows.extend(await self._reread_from_primary(read_on_primary))
+                primary_rows_read = True
+            return primary_rows
+
+        async def _mark_read_bulk_on_replica(backend: BAIO, _snapshot: Any) -> None:
+            # See the sync twin: snapshots first for a replica that applies them (a superseded
+            # row is settled), then the replica's own bulk write for the rest, with no tokens,
+            # then per-row converge, check and stamp on a replica that takes the primary's.
+            applies_snapshots = _overrides(backend, "apply_replication_snapshot_if_newer")
+            stamps = await self._stamps_primary_token(backend)
+            if not applies_snapshots and not stamps:
+                await backend.mark_sent_as_read_bulk(ids, user_id=user_id)
+                return
+            rows = await _primary_rows()
+            targets: list[int | str | uuid.UUID] = ids
+            if applies_snapshots:
+                applied: set[str] = set()
+                for row in rows:
+                    try:
+                        if _snapshot_settled(
+                            await backend.apply_replication_snapshot_if_newer(row)
+                        ):
+                            applied.add(str(row.id))
+                    except Exception:  # noqa: BLE001
+                        _log_bulk_snapshot_failure(row.id)
+                targets = [record.id for record in read_on_primary if str(record.id) not in applied]
+            if not targets:
+                return
+            await backend.mark_sent_as_read_bulk(targets, user_id=user_id)
+            if not stamps:
+                return
+            wanted = {str(target) for target in targets}
+            for row in rows:
+                if str(row.id) not in wanted:
+                    continue
+                try:
+                    await self._converge_replica_to_snapshot(backend, row)
+                except Exception:  # noqa: BLE001
+                    _log_bulk_converge_failure(row.id)
+
         return await self._execute_multi_backend_write(
-            lambda backend: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
-            lambda backend, snapshot: backend.mark_sent_as_read_bulk(ids, user_id=user_id),
+            _mark_read_bulk_on_primary, _mark_read_bulk_on_replica
         )
 
     async def get_in_app_unread(
@@ -4938,9 +5473,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         source = await self.notification_backend.get_notification(notification_id)
         if isinstance(source, OneOffNotification):
             raise NotificationResendError("One-off notifications cannot be resent")
-        if source.send_after is not None and source.send_after > datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if not _send_time_has_come(source.send_after):
             raise NotificationResendError(
                 "Cannot resend a notification that is still scheduled in the future"
             )
@@ -4982,9 +5515,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         if use_stored_context_if_available and source.context_used is not None:
             reused_context = cast(NotificationContextDict, source.context_used)
 
-        if clone.send_after is None or clone.send_after <= datetime.datetime.now(
-            tz=datetime.timezone.utc
-        ):
+        if _send_time_has_come(clone.send_after):
             await self.send(clone, context=reused_context)
         return clone
 
@@ -5056,6 +5587,7 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 await backend.cancel_notification(notification_id)
             except NotificationNotFoundError:
                 return
+            await self._converge_and_stamp(backend, snapshot)
 
         return await self._execute_multi_backend_write(
             lambda backend: backend.cancel_notification(notification_id),
@@ -5073,12 +5605,32 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         ``False`` unless the backend reports it. A key whose method the backend does not
         implement reads ``False`` whatever the backend reports.
 
+        Each key is answered by the backend where its action runs. With ``backend_identifier``
+        omitted or naming the primary, every key is the primary's. Naming an additional
+        backend, ``requeue.templateVersion``, ``requeue.expectedVersion`` and
+        ``repin.expectedVersion`` are still the primary's, because moves always write there,
+        while ``versions.filter`` is the named backend's and is ``True`` only when it reports
+        it and also either implements ``apply_replication_snapshot_if_newer`` or reports
+        ``writes.notificationVersion``. A replica that applies the primary's snapshots, or one
+        stamped with the primary's token once the writes it replays leave its row matching
+        the primary's, holds the primary's version tokens; one that does neither holds tokens
+        of its own, which the primary would always refuse. ``writes.notificationVersion`` is
+        the named backend's own report.
+
         ``requeue_notification`` and ``repin_notification`` read this to decide whether to pass
         ``expected_version`` and ``template_version`` on, and refuse an option the primary
         backend does not report with ``NotificationActionError`` reason ``UNSUPPORTED``.
         """
         backend = self._get_backend(backend_identifier)
-        return _merge_action_capabilities(backend, await backend.get_action_capabilities())
+        capabilities = _merge_action_capabilities(backend, await backend.get_action_capabilities())
+        if backend_identifier is None or backend_identifier == self._primary_backend_identifier:
+            return capabilities
+        primary = self.notification_backend
+        return _route_named_backend_capabilities(
+            backend,
+            capabilities,
+            _merge_action_capabilities(primary, await primary.get_action_capabilities()),
+        )
 
     async def _assert_action_supported(
         self,
@@ -5116,12 +5668,30 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         notifications match, so it should list again from the first page instead of moving on
         to the next one.
 
+        Tokens come from the primary backend, which issues one on every write; replication
+        carries them to additional backends that apply snapshots, and stamps them on a replica
+        reporting ``writes.notificationVersion`` once its row matches the primary's. So a
+        version listed from a named replica is one the primary accepts, unless the replica has
+        not caught up with the latest write yet: the move is then refused, usually as
+        ``CHANGED`` (a requeue checks the status first, so a notification that has moved on
+        can be refused as ``INVALID_STATUS``), and the caller lists again.
+
         Raises UnsupportedNotificationActionError when the backend does not implement it
         (``versions.filter`` is ``False`` in ``get_backend_supported_action_capabilities``).
+        For a named additional backend that includes one that neither implements
+        ``apply_replication_snapshot_if_newer`` nor reports ``writes.notificationVersion``: its
+        tokens are its own, and the primary would refuse every one of them.
         """
-        return await self._get_backend(backend_identifier).filter_notification_versions(
-            filter, page, page_size
-        )
+        backend = self._get_backend(backend_identifier)
+        if (
+            backend_identifier is not None
+            and backend_identifier != self._primary_backend_identifier
+            and not (await self.get_backend_supported_action_capabilities(backend_identifier))[
+                "versions.filter"
+            ]
+        ):
+            raise _versions_unsupported_on_backend_error(backend_identifier)
+        return await backend.filter_notification_versions(filter, page, page_size)
 
     async def get_current_template_version(
         self, notification_type: NotificationTypes | str, template_key: str
@@ -5190,8 +5760,11 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
 
         The write goes to the primary backend first, then to every additional backend, the
         same way other writes are replicated. Replicas take it unconditionally: a version token
-        belongs to the primary backend. A replica that cannot pin in the same write is repinned
-        and then requeued. A replica that fails is logged and does not change the result.
+        belongs to the primary backend. A replica that applies snapshots receives the primary's
+        record as it stands after the write, version token included, so versions listed from
+        it keep matching the primary's. One that declines is requeued through its own
+        ``requeue_notification``, and one that cannot pin in the same write is repinned and
+        then requeued. A replica that fails is logged and does not change the result.
 
         This method may raise the following exceptions:
             * InvalidTemplateVersionError if ``template_version`` is not a non-negative ``int``,
@@ -5253,9 +5826,18 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 notification_id, send_after=send_after, **primary_options
             )
 
-        async def _requeue_replica(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
+        async def _requeue_replica(
+            backend: BAIO, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # Reached only when the replica declines the primary's snapshot. The writes carry no
+            # token; a replica that takes the primary's is converged and stamped after them.
+            await _requeue_replica_row(backend)
+            await self._converge_and_stamp(backend, snapshot)
+
+        async def _requeue_replica_row(backend: BAIO) -> None:
             if template_version is None:
-                return await backend.requeue_notification(notification_id, send_after=send_after)
+                await backend.requeue_notification(notification_id, send_after=send_after)
+                return
             replica_capabilities = _merge_action_capabilities(
                 backend, await backend.get_action_capabilities()
             )
@@ -5263,13 +5845,14 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 # Through ``**``: the abstract signature keeps its 3.7.0 form, and only a
                 # backend reporting the capability accepts the keyword.
                 replica_options: dict[str, Any] = {"template_version": template_version}
-                return await backend.requeue_notification(
+                await backend.requeue_notification(
                     notification_id, send_after=send_after, **replica_options
                 )
+                return
             await backend.persist_notification_update(
                 notification_id, {"requested_template_version": template_version}
             )
-            return await backend.requeue_notification(notification_id, send_after=send_after)
+            await backend.requeue_notification(notification_id, send_after=send_after)
 
         try:
             requeued = await self._execute_multi_backend_write(
@@ -5340,7 +5923,9 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
         checks the status, and ``expected_version`` when given, in the same write, so a worker
         sending the notification in between is never overwritten. The base class's default
         writes through ``persist_notification_update``. Every additional backend then takes the
-        pin unconditionally.
+        pin unconditionally: one that applies snapshots receives the primary's record as it
+        stands after the write, version token included, and one that declines is pinned through
+        its own ``persist_notification_update``.
 
         Repinning to the version already pinned writes nothing and returns the notification as
         it is, unless ``expected_version`` is given: the backend then checks it all the same.
@@ -5406,10 +5991,15 @@ class AsyncIONotificationService(Generic[AAIO, BAIO]):
                 notification_id, version, expected_version=expected_version
             )
 
-        async def _repin_replica(backend: BAIO, *_: Any) -> Notification | OneOffNotification:
-            return await backend.persist_notification_update(
+        async def _repin_replica(
+            backend: BAIO, snapshot: "Notification | OneOffNotification | None"
+        ) -> None:
+            # Reached only when the replica declines the primary's snapshot. The update carries
+            # no token; a replica that takes the primary's is converged and stamped after it.
+            await backend.persist_notification_update(
                 notification_id, {"requested_template_version": version}
             )
+            await self._converge_and_stamp(backend, snapshot)
 
         try:
             repinned = await self._execute_multi_backend_write(
