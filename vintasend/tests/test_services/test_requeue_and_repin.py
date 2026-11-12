@@ -291,7 +291,7 @@ class RequeueNotificationTestCase(TestCase):
                 requeued = service.requeue_notification(notification.id, send_after=None)
 
                 assert requeued.id == notification.id
-                assert requeued.status == PENDING
+                assert requeued.status == SENT
                 assert self.backend.get_notification(notification.id).status == SENT
                 assert [n.id for n, _, _ in _sent(service)] == [notification.id]
 
@@ -402,14 +402,14 @@ class RequeueNotificationTestCase(TestCase):
 
     # -- what it changes and keeps --------------------------------------------
 
-    def test_returns_the_notification_from_before_the_send(self):
+    def test_returns_the_notification_after_the_send(self):
         service = self.build_service()
         notification = self.make(service, FAILED)
 
         requeued = service.requeue_notification(notification.id, send_after=None)
 
-        assert requeued.status == PENDING
-        assert requeued.sent_at is None
+        assert requeued.status == SENT
+        assert requeued.sent_at is not None
         assert self.backend.get_notification(notification.id).status == SENT
 
     def test_clears_sent_at_and_keeps_everything_else(self):
@@ -469,7 +469,7 @@ class RequeueNotificationTestCase(TestCase):
         requeued = service.requeue_notification(created.id, send_after=None)
 
         assert isinstance(requeued, OneOffNotification)
-        assert requeued.status == PENDING
+        assert requeued.status == SENT
         assert self.backend.get_notification(created.id).status == SENT
 
     def test_a_cancelled_then_requeued_notification_can_be_sent(self):
@@ -512,7 +512,7 @@ class RequeueNotificationTestCase(TestCase):
         with self.assertLogs(SERVICE_LOGGER, level="ERROR"):
             requeued = service.requeue_notification(created.id, send_after=None)
 
-        assert requeued.status == PENDING
+        assert requeued.status == SENT
         assert self.backend.get_notification(created.id).status == SENT
 
     # -- privacy --------------------------------------------------------------
@@ -644,7 +644,7 @@ class RepinNotificationTestCase(TestCase):
                 service.repin_notification(notification.id)
 
         assert raised.exception.reason == "NO_TEMPLATE_VERSION"
-        assert str(notification.id) in logs.text()
+        assert str(notification.id) in str(raised.exception)
         assert "RuntimeError" in logs.text()
         # The renderer's own message stays out of the log: it can quote template content.
         assert "unreachable" not in logs.text()
@@ -753,7 +753,7 @@ class AsyncIORequeueNotificationTestCase(IsolatedAsyncioTestCase):
                 requeued = await service.requeue_notification(notification.id, send_after=None)
 
                 assert requeued.id == notification.id
-                assert requeued.status == PENDING
+                assert requeued.status == SENT
                 assert (await self.backend.get_notification(notification.id)).status == SENT
                 assert [n.id for n, _, _ in _sent(service)] == [notification.id]
 
@@ -870,8 +870,7 @@ class AsyncIORequeueNotificationTestCase(IsolatedAsyncioTestCase):
 
         requeued = await service.requeue_notification(notification.id, send_after=None)
 
-        assert requeued.status == PENDING
-        assert (await self.backend.get_notification(notification.id)).status == SENT
+        assert requeued.status == SENT
         assert [context for _, context, _ in _sent(service)] == [{"source": "stored"}]
 
     async def test_a_queue_adapter_puts_it_back_on_the_queue(self):
@@ -925,7 +924,7 @@ class AsyncIORequeueNotificationTestCase(IsolatedAsyncioTestCase):
         with self.assertLogs(SERVICE_LOGGER, level="ERROR"):
             requeued = await service.requeue_notification(created.id, send_after=None)
 
-        assert requeued.status == PENDING
+        assert requeued.status == SENT
         assert (await self.backend.get_notification(created.id)).status == SENT
 
     async def test_logs_and_errors_name_the_notification_by_id_only(self):
@@ -1038,7 +1037,8 @@ class AsyncIORepinNotificationTestCase(IsolatedAsyncioTestCase):
                 await service.repin_notification(notification.id)
 
         assert raised.exception.reason == "NO_TEMPLATE_VERSION"
-        assert str(notification.id) in logs.text()
+        assert str(notification.id) in str(raised.exception)
+        assert "RuntimeError" in logs.text()
         assert "unreachable" not in logs.text()
         _assert_no_field_values(logs.text())
 

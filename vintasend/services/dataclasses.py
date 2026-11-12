@@ -254,6 +254,12 @@ class Notification:
     # by the time anyone asks. update_notification rejects it in raw kwargs, the same as
     # git_commit_sha -- see UsedTemplateVersionReassignmentError.
     used_template_version: int | None = None
+    # System-managed: the backend's current version token for this notification, the same
+    # value ``filter_notification_versions`` returns for it, so a caller holding the
+    # notification can pass it as ``expected_version`` without listing. ``None`` from a backend
+    # that keeps no token. The primary backend issues it on every write and replication carries
+    # it to replicas that apply snapshots, so a replica hands out tokens the primary accepts.
+    notification_version: str | None = None
 
 
 @dataclass
@@ -298,6 +304,12 @@ class OneOffNotification:
     # by the time anyone asks. update_notification rejects it in raw kwargs, the same as
     # git_commit_sha -- see UsedTemplateVersionReassignmentError.
     used_template_version: int | None = None
+    # System-managed: the backend's current version token for this notification, the same
+    # value ``filter_notification_versions`` returns for it, so a caller holding the
+    # notification can pass it as ``expected_version`` without listing. ``None`` from a backend
+    # that keeps no token. The primary backend issues it on every write and replication carries
+    # it to replicas that apply snapshots, so a replica hands out tokens the primary accepts.
+    notification_version: str | None = None
 
 
 # Fields deliberately excluded from cross-backend sync comparison (see
@@ -309,7 +321,15 @@ class OneOffNotification:
 # - ``attachments``: a ``StoredAttachment``'s ``id`` and ``storage_identifiers`` are assigned by
 #   whichever storage backend wrote it, so the same logical file has different, backend-specific
 #   values on every backend -- not a single comparable value the way a scalar field is.
-_VOLATILE_NOTIFICATION_SYNC_FIELDS = frozenset({"created", "modified", "attachments"})
+# - ``notification_version``: a replica that applies the primary's snapshots carries the
+#   primary's token, but one that replays writes through its own primitives (because it does
+#   not implement ``apply_replication_snapshot_if_newer``, or declined a snapshot) issues tokens
+#   of its own on every write. Those never equal the primary's even when every content field
+#   agrees, so comparing them would report drift that is not there. A lagging snapshot-applying
+#   replica is caught by the content fields that changed along with the token.
+_VOLATILE_NOTIFICATION_SYNC_FIELDS = frozenset(
+    {"created", "modified", "attachments", "notification_version"}
+)
 
 # Every persisted, comparable field on ``Notification``, derived from the dataclass itself (minus
 # the volatile fields above) so a newly added dataclass field is automatically picked up by
@@ -400,6 +420,20 @@ class BackendMigrationResult(TypedDict):
 
 
 @dataclass(frozen=True)
+class NotificationVersion:
+    """A notification's ID and the opaque token for the version of it a backend holds.
+
+    The token changes whenever the notification is written, by anyone. Pass it back as
+    ``expected_version`` to ``requeue_notification`` or ``repin_notification`` to act on the
+    notification only if nothing has changed since it was listed. Compare tokens for equality
+    only: they are not ordered, and a backend may use any string.
+    """
+
+    id: int | str | uuid.UUID
+    version: str
+
+
+@dataclass(frozen=True)
 class ApplyResult:
     """Outcome of a backend's ``apply_replication_snapshot_if_newer`` call.
 
@@ -410,12 +444,19 @@ class ApplyResult:
     It is ``False`` when the backend declined: either because it does not implement snapshot
     application at all (the concrete ``BaseNotificationBackend`` default) or because the row it
     already holds is newer than the snapshot. On ``False`` the service falls back to a
-    read-then-write replica mutation. ``reason`` is an optional, human-readable note for logs;
-    it never drives control flow.
+    read-then-write replica mutation, unless ``superseded`` is ``True``. ``reason`` is an
+    optional, human-readable note for logs; it never drives control flow.
+
+    ``superseded`` is ``True`` when the backend declined because the row it holds is newer than
+    the snapshot (newer-wins). The row then already reflects a later write than the one being
+    replicated, so the service skips the fallback for it: replaying the older snapshot through
+    the backend's primitives would overwrite the newer row. Leave it ``False`` for any other
+    decline.
     """
 
     applied: bool
     reason: str | None = None
+    superseded: bool = False
 
 
 class UpdateNotificationKwargs(TypedDict, total=False):

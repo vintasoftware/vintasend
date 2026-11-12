@@ -178,7 +178,24 @@ NotificationAction = Literal["requeue", "repin"]
 #   ``status`` says which status it was, when the service knows it.
 # * ``NO_TEMPLATE_VERSION``: a repin to the current version found none. Either no renderer for
 #   the notification's type versions its templates, or the renderer failed to answer.
-NotificationActionErrorReason = Literal["NOT_FOUND", "INVALID_STATUS", "NO_TEMPLATE_VERSION"]
+# * ``CHANGED``: the notification is no longer at the version the caller expected
+#   (``expected_version``), or it changed between the backend's read and its write. Read it
+#   again and decide afresh.
+# * ``UNSUPPORTED``: the primary backend cannot do what was asked, such as checking
+#   ``expected_version`` or pinning and re-queuing in one write. It reports that in
+#   ``get_backend_supported_action_capabilities()``.
+NotificationActionErrorReason = Literal[
+    "NOT_FOUND", "INVALID_STATUS", "NO_TEMPLATE_VERSION", "CHANGED", "UNSUPPORTED"
+]
+
+# Every reason above, for code that validates or enumerates them, such as an HTTP API.
+NOTIFICATION_ACTION_ERROR_REASONS: tuple[NotificationActionErrorReason, ...] = (
+    "NOT_FOUND",
+    "INVALID_STATUS",
+    "NO_TEMPLATE_VERSION",
+    "CHANGED",
+    "UNSUPPORTED",
+)
 
 
 class NotificationActionError(NotificationError):
@@ -222,3 +239,33 @@ class NotificationRequeueError(NotificationUpdateError):
     The service checks the status first, so a backend raises this only when another caller
     changed the status in between. For example, a worker sent the notification, or a second
     caller requeued it first."""
+
+
+class NotificationRepinError(NotificationUpdateError):
+    """Raised by a backend's ``repin_notification`` when the notification exists but its status
+    is not one of ``REPINNABLE_NOTIFICATION_STATUSES``, so nothing was written.
+
+    The service maps it to ``NotificationActionError`` reason ``INVALID_STATUS``."""
+
+
+class NotificationVersionChangedError(NotificationUpdateError):
+    """Raised by a backend's ``requeue_notification`` or ``repin_notification`` when the
+    notification is no longer at the ``expected_version`` it was given, or changed between the
+    backend's read and its write. Nothing was written.
+
+    A token the backend could not have handed out matches no notification, so it is refused the
+    same way. The service maps it to ``NotificationActionError`` reason ``CHANGED``."""
+
+
+class UnsupportedNotificationActionError(NotificationError):
+    """Raised by a backend handed an option or asked for an operation it does not support,
+    instead of ignoring it.
+
+    The service never passes an option the primary backend does not report in
+    ``get_action_capabilities()``, so a backend raises this only when called directly.
+    ``filter_notification_versions`` on a backend without it raises this too."""
+
+
+class InvalidExpectedVersionError(NotificationError):
+    """Raised when an ``expected_version`` passed to ``requeue_notification`` or
+    ``repin_notification`` is not a non-empty ``str``. Raised before anything is read."""

@@ -5,11 +5,12 @@ import io
 import json
 import os
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from decimal import Decimal
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 from vintasend.constants import (
+    REPINNABLE_NOTIFICATION_STATUSES,
     REQUEUEABLE_NOTIFICATION_STATUSES,
     UNSET,
     NotificationStatus,
@@ -20,7 +21,9 @@ from vintasend.exceptions import (
     AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationNotFoundError,
+    NotificationRepinError,
     NotificationRequeueError,
+    NotificationVersionChangedError,
 )
 from vintasend.services.attachment_managers.stubs.fake_attachment_manager import (
     FakeAsyncIOAttachmentManager,
@@ -33,6 +36,7 @@ from vintasend.services.dataclasses import (
     AttachmentFileRecord,
     Notification,
     NotificationAttachment,
+    NotificationVersion,
     OneOffNotification,
     StoredAttachment,
     UpdateNotificationKwargs,
@@ -46,6 +50,7 @@ from vintasend.services.notification_backends.filters import (
     matches_filter,
     sort_notifications,
 )
+from vintasend.utils.uuid_utils import uuid7
 
 
 class FakeFileAttachmentFile(AttachmentFile):
@@ -76,13 +81,173 @@ class FakeFileAttachmentFile(AttachmentFile):
         self.file_data = b""
 
 
-class FakeFileBackend(BaseNotificationBackend):
+class _NotificationVersionTokens:
+    """Version tokens for the fakes: a fresh UUIDv7 whenever a notification's stored form changes.
+
+    A real backend keeps the token in a column that every write sets (``vintasend-django`` and
+    ``vintasend-sqlalchemy`` use a ``notification_version`` UUID). The fakes have no columns, so
+    they compare each notification's serialized form with the one they last stored, at every
+    store, and issue a new token for any that changed. That catches every write path, including
+    ones added later, without each method having to remember to bump the token.
+
+    The comparison reads whole records, but only here, at write time.
+    ``filter_notification_versions`` reads the ID and the token and nothing else.
+
+    Every stored notification carries its current token in ``notification_version``, set at
+    the same refresh, so whatever the fakes return holds the token a listing would give. The
+    field is left out of the stored form: stamping it must not count as a write.
+
+    A snapshot applied through ``apply_replication_snapshot_if_newer`` keeps the token it
+    carries, rather than getting one minted here, so a replica fed by the primary hands out the
+    primary's tokens -- which is what lets ``expected_version`` listed from a replica pass the
+    primary's check. A snapshot with no token is a write like any other and gets a new one.
+    """
+
+    notifications: list[Notification | OneOffNotification]
+    _version_tokens: dict[str, str]
+    _version_forms: dict[str, str]
+
+    def _reset_version_tokens(self) -> None:
+        self._version_tokens = {}
+        self._version_forms = {}
+
+    @staticmethod
+    def _version_form(notification: Notification | OneOffNotification) -> str:
+        # Built from the dataclass fields rather than the persisted JSON, so every field --
+        # including any added later -- is covered. An attachment's ``file`` is a handle to the
+        # bytes, not part of the record, so it is left out; the rest of each attachment is kept.
+        form: dict[str, object] = {
+            field.name: getattr(notification, field.name)
+            for field in dataclasses.fields(notification)
+            if field.name not in ("attachments", "notification_version")
+        }
+        form["is_one_off"] = isinstance(notification, OneOffNotification)
+        form["attachments"] = [
+            {
+                field.name: getattr(attachment, field.name)
+                for field in dataclasses.fields(attachment)
+                if field.name != "file"
+            }
+            for attachment in notification.attachments
+        ]
+        return json.dumps(form, sort_keys=True, default=str)
+
+    def _refresh_version_tokens(self) -> None:
+        forms: dict[str, str] = {}
+        for notification in self.notifications:
+            key = str(notification.id)
+            form = self._version_form(notification)
+            forms[key] = form
+            if self._version_forms.get(key) != form:
+                self._version_tokens[key] = str(uuid7())
+        self._version_forms = forms
+        self._version_tokens = {
+            key: token for key, token in self._version_tokens.items() if key in forms
+        }
+        for notification in self.notifications:
+            notification.notification_version = self._version_tokens[str(notification.id)]
+
+    def _hold_version(
+        self, notification_id: int | str | uuid.UUID, notification_version: str | None
+    ) -> None:
+        """Make a just-written row hold ``notification_version`` instead of a minted token.
+
+        The ``notification_version`` keyword every fake write accepts (the fakes report
+        ``writes.notificationVersion``) lands here. Recording the row's form alongside the
+        token makes the refresh that follows see an unchanged row and leave the token alone.
+        ``None`` changes nothing: the refresh mints a token if the write changed the row.
+        """
+        if notification_version is None:
+            return
+        key = str(notification_id)
+        notification = next((n for n in self.notifications if str(n.id) == key), None)
+        if notification is None:
+            return
+        self._version_tokens[key] = notification_version
+        self._version_forms[key] = self._version_form(notification)
+        notification.notification_version = notification_version
+
+    def _hold_versions(self, notification_versions: "Mapping[Any, str] | None") -> None:
+        """``_hold_version`` per row, for the bulk writes' ``notification_versions`` mapping."""
+        for notification_id, notification_version in (notification_versions or {}).items():
+            self._hold_version(notification_id, notification_version)
+
+    def _adopt_snapshot_version(self, stored: Notification | OneOffNotification) -> None:
+        """Keep the token a just-stored replication snapshot carries, before the next refresh.
+
+        A snapshot without a token drops the recorded form instead, so the refresh mints one,
+        as it does for any other write.
+        """
+        if stored.notification_version is None:
+            self._version_forms.pop(str(stored.id), None)
+            return
+        self._hold_version(stored.id, stored.notification_version)
+
+    def _version_token(self, notification_id: int | str | uuid.UUID) -> str:
+        self._refresh_version_tokens()
+        return self._version_tokens[str(notification_id)]
+
+    def _check_expected_version(
+        self,
+        action: str,
+        notification_id: int | str | uuid.UUID,
+        expected_version: str | None,
+    ) -> None:
+        if expected_version is not None and expected_version != self._version_token(
+            notification_id
+        ):
+            raise NotificationVersionChangedError(
+                f"Cannot {action} notification {notification_id}: it changed since that "
+                "version was read"
+            )
+
+    def _versions_page(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        self._refresh_version_tokens()
+        matched = [n for n in self.notifications if matches_filter(n, filter)]
+        if len({type(n.id) for n in matched}) <= 1:
+            # Native order: ints numerically (2 before 10), UUIDs by value.
+            matched.sort(key=lambda n: cast(Any, n.id))
+        else:
+            # Mixed id types (str ids from create, UUID ids from one-offs) do not compare with
+            # each other, so group by type and order by text within each group.
+            matched.sort(key=lambda n: (type(n.id).__name__, str(n.id)))
+        start = (page - 1) * page_size
+        return [
+            NotificationVersion(id=n.id, version=self._version_tokens[str(n.id)])
+            for n in matched[start : start + page_size]
+        ]
+
+
+# Every action and presence filter the fakes implement, reported so the service passes the
+# options through.
+_FAKE_ACTION_CAPABILITIES: dict[str, bool] = {
+    "repin.expectedVersion": True,
+    "requeue.expectedVersion": True,
+    "requeue.templateVersion": True,
+    "versions.filter": True,
+    "writes.notificationVersion": True,
+}
+_FAKE_FILTER_CAPABILITIES: dict[str, bool] = {
+    "fields.hasSendAfter": True,
+    "negation.hasSendAfter": True,
+    "fields.hasRequestedTemplateVersion": True,
+    "negation.hasRequestedTemplateVersion": True,
+}
+
+
+class FakeFileBackend(_NotificationVersionTokens, BaseNotificationBackend):
     notifications: list[Notification | OneOffNotification]
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
         super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
+        self._reset_version_tokens()
         # In-memory file records (keyed by id) and notification->file join rows. The bytes
         # they describe live in the attachment manager, not here.
         self._attachment_file_records: dict[str, AttachmentFileRecord] = {}
@@ -103,11 +268,14 @@ class FakeFileBackend(BaseNotificationBackend):
         except json.JSONDecodeError:
             self.notifications = []
             return
+        # Tokens are not persisted: rows read back from the file get fresh ones.
+        self._refresh_version_tokens()
 
     def clear(self):
         self.notifications = []
         self._attachment_file_records = {}
         self._attachment_join_rows = []
+        self._reset_version_tokens()
         try:
             os.remove(self.database_file_name)
         except FileNotFoundError:
@@ -318,6 +486,7 @@ class FakeFileBackend(BaseNotificationBackend):
             )
 
     def _store_notifications(self):
+        self._refresh_version_tokens()
         json_output_file = open(self.database_file_name, "w", encoding="utf-8")
         json.dump(
             [self._convert_notification_to_json(n) for n in self.notifications],
@@ -348,6 +517,8 @@ class FakeFileBackend(BaseNotificationBackend):
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
         requested_template_version: int | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification:
         notification_id = str(uuid.uuid4())
         stored_attachments = self._store_attachments(attachments or [], notification_id)
@@ -373,6 +544,7 @@ class FakeFileBackend(BaseNotificationBackend):
             requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
+        self._hold_version(notification.id, notification_version)
         self._store_notifications()
         return notification
 
@@ -537,13 +709,18 @@ class FakeFileBackend(BaseNotificationBackend):
             )
         return stored_attachments
 
-    def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
+    def delete_notification_attachment(
+        self, attachment_id: int | str | uuid.UUID, *, notification_version: str | None = None
+    ) -> None:
         """Delete a single notification attachment join row by its own id.
 
         This drops only the join row, never the underlying `AttachmentFileRecord` or its
         bytes -- a file may still back other notifications. Reclaiming an orphaned file is
         a separate, caller-driven step via `get_orphaned_attachment_files`.
         """
+        for row in self._attachment_join_rows:
+            if str(row["id"]) == str(attachment_id):
+                self._hold_version(row["notification_id"], notification_version)
         self._attachment_join_rows = [
             row for row in self._attachment_join_rows if str(row["id"]) != str(attachment_id)
         ]
@@ -565,6 +742,8 @@ class FakeFileBackend(BaseNotificationBackend):
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
         requested_template_version: int | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> OneOffNotification:
         notification_id = uuid.uuid4()
         stored_attachments = self._store_attachments(attachments or [], notification_id)
@@ -592,51 +771,66 @@ class FakeFileBackend(BaseNotificationBackend):
             requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
+        self._hold_version(notification.id, notification_version)
         self._store_notifications()
         return notification
 
     def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs
+        self,
+        notification_id: int | str | uuid.UUID,
+        update_data: UpdateNotificationKwargs,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
 
         for key, value in update_data.items():
             setattr(notification, key, value)
 
-        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        # An empty ``update_data`` with a ``notification_version`` is the token-only write the
+        # service uses to stamp a converged replica row with the primary's token. It is accepted
+        # in any status, delivered included, and changes nothing but the token.
+        if update_data:
+            notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
         return notification
 
     def mark_pending_as_sent(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         notification.sent_at = datetime.datetime.now(tz=datetime.timezone.utc)
         notification.modified = notification.sent_at
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
         return notification
 
     def mark_pending_as_failed(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
         return notification
 
     def mark_sent_as_read(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
     ) -> Notification | OneOffNotification:
         notification = self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         notification.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
         notification.modified = notification.read_at
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
         return notification
 
-    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
+    def cancel_notification(
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
+    ) -> None:
         """Cancel a pending notification by setting its status to ``CANCELLED``.
 
         The row is kept, as the Django and SQLAlchemy backends keep it, so a cancelled
@@ -656,16 +850,24 @@ class FakeFileBackend(BaseNotificationBackend):
             )
         notification.status = NotificationStatus.CANCELLED.value
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
 
     def requeue_notification(
         self,
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        # The status check and the write have nothing in between, and this backend lives in
-        # one process, so no other caller can change the status while this runs.
+        # The checks and the write have nothing in between, and this backend lives in one
+        # process, so no other caller can change the notification while this runs. The order
+        # of the checks is what a SQL backend reports after its conditional UPDATE matched
+        # nothing: not found, then changed, then the wrong status.
         notification = self.get_notification(notification_id)
+        self._check_expected_version("requeue", notification_id, expected_version)
         if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
             raise NotificationRequeueError(
                 f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
@@ -674,9 +876,46 @@ class FakeFileBackend(BaseNotificationBackend):
         notification.sent_at = None
         if send_after is not UNSET:
             notification.send_after = send_after
+        if template_version is not None:
+            notification.requested_template_version = template_version
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
         return notification
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+        notification_version: str | None = None,
+    ) -> Notification | OneOffNotification:
+        notification = self.get_notification(notification_id)
+        self._check_expected_version("repin", notification_id, expected_version)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            self._hold_version(notification_id, notification_version)
+            return notification
+        notification.requested_template_version = template_version
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
+        self._store_notifications()
+        return notification
+
+    def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        return self._versions_page(filter, page, page_size)
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        return dict(_FAKE_ACTION_CAPABILITIES)
 
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
@@ -760,14 +999,16 @@ class FakeFileBackend(BaseNotificationBackend):
         return sum(1 for n in self.notifications if matches_filter(n, filter))
 
     def get_filter_capabilities(self) -> dict[str, bool]:
-        # This fake supports the full vocabulary, so it declines nothing: an empty report means
-        # every capability is supported once merged over the all-``True`` default.
-        return {}
+        # This fake supports the full vocabulary, so it declines nothing, and it reports the
+        # presence filters, the only keys that default to ``False``.
+        return dict(_FAKE_FILTER_CAPABILITIES)
 
     def mark_sent_as_read_bulk(
         self,
         notification_ids: Iterable[int | str | uuid.UUID],
         user_id: int | str | uuid.UUID | None = None,
+        *,
+        notification_versions: Mapping[int | str | uuid.UUID, str] | None = None,
     ) -> list[Notification]:
         ids = {str(i) for i in notification_ids}
         result: list[Notification] = []
@@ -785,6 +1026,9 @@ class FakeFileBackend(BaseNotificationBackend):
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
+        # Only the rows this call returns, keyed by id in any of its forms.
+        held = {str(key): token for key, token in (notification_versions or {}).items()}
+        self._hold_versions({n.id: held[str(n.id)] for n in result if str(n.id) in held})
         if changed:
             self._store_notifications()
         return result
@@ -807,31 +1051,40 @@ class FakeFileBackend(BaseNotificationBackend):
         notification_id: int | str | uuid.UUID,
         context: dict,
         adapter_import_str: str,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         notification = self.get_notification(notification_id)
         notification.context_used = context
         notification.adapter_used = adapter_import_str
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
 
     def store_git_commit_sha(
         self,
         notification_id: int | str | uuid.UUID,
         git_commit_sha: str,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         notification = self.get_notification(notification_id)
         notification.git_commit_sha = git_commit_sha
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
 
     def store_template_version(
         self,
         notification_id: int | str | uuid.UUID,
         template_version: int,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         # Overridden rather than inherited: the base's default is a no-op so that a backend
         # with nowhere to put this keeps working, and a reference implementation that took
         # that default would quietly prove nothing.
         notification = self.get_notification(notification_id)
         notification.used_template_version = template_version
+        self._hold_version(notification_id, notification_version)
         self._store_notifications()
 
     def apply_replication_snapshot_if_newer(
@@ -841,10 +1094,13 @@ class FakeFileBackend(BaseNotificationBackend):
 
         Inserts the snapshot when this backend lacks the row (preserving the primary's id),
         replaces it when the snapshot's ``modified`` is at least as new as the stored row's,
-        and declines when the stored row is strictly newer. A defensive copy is stored so the
-        primary and this replica never share a mutable record. Downstream backends (e.g.
-        ``vintasend-django``) mirror this as an ``update_or_create`` that only overwrites when
-        ``modified`` is newer.
+        and declines when the stored row is strictly newer, reporting ``superseded=True`` so the
+        service skips its fallback for that row. A defensive copy is stored so the
+        primary and this replica never share a mutable record. The snapshot's
+        ``notification_version`` becomes this backend's token for the row, so versions listed
+        here are ones the primary accepts; a token is minted only when the snapshot has none.
+        Downstream backends (e.g. ``vintasend-django``) mirror this as an ``update_or_create``
+        that only overwrites when ``modified`` is newer and copies the token column across.
         """
         incoming = dataclasses.replace(snapshot)
         for index, existing in enumerate(self.notifications):
@@ -855,11 +1111,15 @@ class FakeFileBackend(BaseNotificationBackend):
                 and snapshot.modified is not None
                 and snapshot.modified < existing.modified
             ):
-                return ApplyResult(applied=False, reason="local row is newer than the snapshot")
+                return ApplyResult(
+                    applied=False, reason="local row is newer than the snapshot", superseded=True
+                )
             self.notifications[index] = incoming
+            self._adopt_snapshot_version(incoming)
             self._store_notifications()
             return ApplyResult(applied=True)
         self.notifications.append(incoming)
+        self._adopt_snapshot_version(incoming)
         self._store_notifications()
         return ApplyResult(applied=True)
 
@@ -890,13 +1150,14 @@ class InvalidBackend:
         pass
 
 
-class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
+class FakeAsyncIOFileBackend(_NotificationVersionTokens, AsyncIOBaseNotificationBackend):
     notifications: list[Notification | OneOffNotification]
     database_file_name: str
 
     def __init__(self, database_file_name: str = "notifications.json", **kwargs):
         super().__init__(database_file_name=database_file_name, **kwargs)
         self.database_file_name = database_file_name
+        self._reset_version_tokens()
         # In-memory file records (keyed by id) and notification->file join rows. The bytes
         # they describe live in the attachment manager, not here.
         self._attachment_file_records: dict[str, AttachmentFileRecord] = {}
@@ -917,11 +1178,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         except json.JSONDecodeError:
             self.notifications = []
             return
+        # Tokens are not persisted: rows read back from the file get fresh ones.
+        self._refresh_version_tokens()
 
     async def clear(self):
         self.notifications = []
         self._attachment_file_records = {}
         self._attachment_join_rows = []
+        self._reset_version_tokens()
         try:
             os.remove(self.database_file_name)
         except FileNotFoundError:
@@ -1097,7 +1361,11 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         return stored_attachments
 
     async def delete_notification_attachment(
-        self, attachment_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        attachment_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         """Delete a single notification attachment join row by its own id.
 
@@ -1105,6 +1373,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         bytes -- a file may still back other notifications. Reclaiming an orphaned file is
         a separate, caller-driven step via `get_orphaned_attachment_files`.
         """
+        for row in self._attachment_join_rows:
+            if str(row["id"]) == str(attachment_id):
+                self._hold_version(row["notification_id"], notification_version)
         self._attachment_join_rows = [
             row for row in self._attachment_join_rows if str(row["id"]) != str(attachment_id)
         ]
@@ -1294,6 +1565,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
     async def _store_notifications(self, lock: asyncio.Lock | None = None):
         if lock is not None:
             await lock.acquire()
+        self._refresh_version_tokens()
         json_output_file = open(self.database_file_name, "w", encoding="utf-8")
         json.dump(
             [self._convert_notification_to_json(n) for n in self.notifications],
@@ -1327,6 +1599,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         tenant: str | None = None,
         requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification:
         notification_id = str(uuid.uuid4())
         stored_attachments = await self._store_attachments(attachments or [], notification_id, lock)
@@ -1352,6 +1626,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
+        self._hold_version(notification.id, notification_version)
         await self._store_notifications(lock)
         return notification
 
@@ -1373,6 +1648,8 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         tenant: str | None = None,
         requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> OneOffNotification:
         notification_id = uuid.uuid4()
         stored_attachments = await self._store_attachments(attachments or [], notification_id, lock)
@@ -1400,6 +1677,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             requested_template_version=requested_template_version,
         )
         self.notifications.append(notification)
+        self._hold_version(notification.id, notification_version)
         await self._store_notifications(lock)
         return notification
 
@@ -1408,47 +1686,71 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id: int | str | uuid.UUID,
         update_data: UpdateNotificationKwargs,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
 
         for key, value in update_data.items():
             setattr(notification, key, value)
 
-        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        # The token-only write: see the sync twin.
+        if update_data:
+            notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
         return notification
 
     async def mark_pending_as_sent(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.SENT.value
         notification.sent_at = datetime.datetime.now(tz=datetime.timezone.utc)
         notification.modified = notification.sent_at
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
         return notification
 
     async def mark_pending_as_failed(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.FAILED.value
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
         return notification
 
     async def mark_sent_as_read(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         notification = await self.get_notification(notification_id)
         notification.status = NotificationStatus.READ.value
         notification.read_at = datetime.datetime.now(tz=datetime.timezone.utc)
         notification.modified = notification.read_at
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
         return notification
 
     async def cancel_notification(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         """Cancel a pending notification by setting its status to ``CANCELLED``.
 
@@ -1469,6 +1771,7 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
             )
         notification.status = NotificationStatus.CANCELLED.value
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
 
     async def requeue_notification(
@@ -1476,10 +1779,16 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
         lock: asyncio.Lock | None = None,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        # Nothing is awaited between the status check and the write, so no other coroutine
-        # can change the status while this runs.
+        # Nothing is awaited between the checks and the write, so no other coroutine can
+        # change the notification while this runs. The checks run in the order a SQL backend
+        # reports after its conditional UPDATE matched nothing: not found, changed, status.
         notification = await self.get_notification(notification_id)
+        self._check_expected_version("requeue", notification_id, expected_version)
         if notification.status not in REQUEUEABLE_NOTIFICATION_STATUSES:
             raise NotificationRequeueError(
                 f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
@@ -1488,9 +1797,47 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification.sent_at = None
         if send_after is not UNSET:
             notification.send_after = send_after
+        if template_version is not None:
+            notification.requested_template_version = template_version
         notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
         return notification
+
+    async def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+        lock: asyncio.Lock | None = None,
+        notification_version: str | None = None,
+    ) -> Notification | OneOffNotification:
+        notification = await self.get_notification(notification_id)
+        self._check_expected_version("repin", notification_id, expected_version)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            self._hold_version(notification_id, notification_version)
+            return notification
+        notification.requested_template_version = template_version
+        notification.modified = datetime.datetime.now(tz=datetime.timezone.utc)
+        self._hold_version(notification_id, notification_version)
+        await self._store_notifications(lock)
+        return notification
+
+    async def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        return self._versions_page(filter, page, page_size)
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        return dict(_FAKE_ACTION_CAPABILITIES)
 
     async def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
@@ -1571,15 +1918,17 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         return sum(1 for n in self.notifications if matches_filter(n, filter))
 
     async def get_filter_capabilities(self) -> dict[str, bool]:
-        # This fake supports the full vocabulary, so it declines nothing: an empty report means
-        # every capability is supported once merged over the all-``True`` default.
-        return {}
+        # This fake supports the full vocabulary, so it declines nothing, and it reports the
+        # presence filters, the only keys that default to ``False``.
+        return dict(_FAKE_FILTER_CAPABILITIES)
 
     async def mark_sent_as_read_bulk(
         self,
         notification_ids: Iterable[int | str | uuid.UUID],
         user_id: int | str | uuid.UUID | None = None,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_versions: Mapping[int | str | uuid.UUID, str] | None = None,
     ) -> list[Notification]:
         ids = {str(i) for i in notification_ids}
         result: list[Notification] = []
@@ -1597,6 +1946,9 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 changed = True
             if n.status == NotificationStatus.READ.value:
                 result.append(n)
+        # Only the rows this call returns, keyed by id in any of its forms.
+        held = {str(key): token for key, token in (notification_versions or {}).items()}
+        self._hold_versions({n.id: held[str(n.id)] for n in result if str(n.id) in held})
         if changed:
             await self._store_notifications(lock)
         return result
@@ -1619,10 +1971,13 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         context: dict,
         adapter_import_str: str,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         notification = await self.get_notification(notification_id)
         notification.context_used = context
         notification.adapter_used = adapter_import_str
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
 
     async def store_git_commit_sha(
@@ -1630,9 +1985,12 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id: int | str | uuid.UUID,
         git_commit_sha: str,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         notification = await self.get_notification(notification_id)
         notification.git_commit_sha = git_commit_sha
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
 
     async def store_template_version(
@@ -1640,10 +1998,13 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
         notification_id: int | str | uuid.UUID,
         template_version: int,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         # See the sync twin: overridden on purpose, so the send path is exercised end to end.
         notification = await self.get_notification(notification_id)
         notification.used_template_version = template_version
+        self._hold_version(notification_id, notification_version)
         await self._store_notifications(lock)
 
     async def apply_replication_snapshot_if_newer(
@@ -1653,10 +2014,13 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
 
         Inserts the snapshot when this backend lacks the row (preserving the primary's id),
         replaces it when the snapshot's ``modified`` is at least as new as the stored row's,
-        and declines when the stored row is strictly newer. A defensive copy is stored so the
-        primary and this replica never share a mutable record. Downstream backends (e.g.
-        ``vintasend-django``) mirror this as an ``update_or_create`` that only overwrites when
-        ``modified`` is newer.
+        and declines when the stored row is strictly newer, reporting ``superseded=True`` so the
+        service skips its fallback for that row. A defensive copy is stored so the
+        primary and this replica never share a mutable record. The snapshot's
+        ``notification_version`` becomes this backend's token for the row, so versions listed
+        here are ones the primary accepts; a token is minted only when the snapshot has none.
+        Downstream backends (e.g. ``vintasend-django``) mirror this as an ``update_or_create``
+        that only overwrites when ``modified`` is newer and copies the token column across.
         """
         incoming = dataclasses.replace(snapshot)
         for index, existing in enumerate(self.notifications):
@@ -1667,10 +2031,14 @@ class FakeAsyncIOFileBackend(AsyncIOBaseNotificationBackend):
                 and snapshot.modified is not None
                 and snapshot.modified < existing.modified
             ):
-                return ApplyResult(applied=False, reason="local row is newer than the snapshot")
+                return ApplyResult(
+                    applied=False, reason="local row is newer than the snapshot", superseded=True
+                )
             self.notifications[index] = incoming
+            self._adopt_snapshot_version(incoming)
             await self._store_notifications()
             return ApplyResult(applied=True)
         self.notifications.append(incoming)
+        self._adopt_snapshot_version(incoming)
         await self._store_notifications()
         return ApplyResult(applied=True)

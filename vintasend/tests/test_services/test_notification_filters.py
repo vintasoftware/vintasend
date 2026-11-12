@@ -93,6 +93,15 @@ def _build_notification(
     )
 
 
+# The fakes evaluate the presence filters, the only keys that default to ``False``.
+PRESENCE_FILTER_CAPABILITIES = {
+    "fields.hasSendAfter": True,
+    "negation.hasSendAfter": True,
+    "fields.hasRequestedTemplateVersion": True,
+    "negation.hasRequestedTemplateVersion": True,
+}
+
+
 class MatchesFilterUnitTestCase(TestCase):
     """Direct tests of the pure evaluator, independent of any backend or pagination."""
 
@@ -570,8 +579,9 @@ class FilterNotificationsBackendTestCase(TestCase):
         assert self.backend.count_notifications({}) == 3
         assert self.backend.count_notifications({"tenant": "acme"}) == 2
 
-    def test_get_filter_capabilities_is_empty(self):
-        assert self.backend.get_filter_capabilities() == {}
+    def test_get_filter_capabilities_reports_only_the_presence_filters(self):
+        # Everything else defaults to supported; the presence filters default to unsupported.
+        assert self.backend.get_filter_capabilities() == PRESENCE_FILTER_CAPABILITIES
 
     def test_pagination_sweep_with_shared_created_returns_every_row_once_descending(self):
         # Same setup as the ascending sweep above, but pinning that the ``id`` tiebreaker is
@@ -698,8 +708,8 @@ class FilterNotificationsAsyncBackendTestCase(IsolatedAsyncioTestCase):
         self._seed([_build_notification("a"), _build_notification("b")])
         assert await self.backend.count_notifications({}) == 2
 
-    async def test_get_filter_capabilities_is_empty(self):
-        assert await self.backend.get_filter_capabilities() == {}
+    async def test_get_filter_capabilities_reports_only_the_presence_filters(self):
+        assert await self.backend.get_filter_capabilities() == PRESENCE_FILTER_CAPABILITIES
 
     async def test_pagination_sweep_with_shared_created_returns_every_row_once_ascending(self):
         # AsyncIO mirror of the sync fake's exhaustive sweep -- no full multi-page sweep exists
@@ -855,7 +865,7 @@ class FilterNotificationsServiceTestCase(TestCase):
 
     def test_capabilities_all_true_for_full_backend(self):
         caps = self.service.get_backend_supported_filter_capabilities()
-        assert caps == DEFAULT_BACKEND_FILTER_CAPABILITIES
+        assert caps == {**DEFAULT_BACKEND_FILTER_CAPABILITIES, **PRESENCE_FILTER_CAPABILITIES}
         assert all(caps.values())
 
     def test_capabilities_merge_over_default(self):
@@ -867,11 +877,11 @@ class FilterNotificationsServiceTestCase(TestCase):
         )
         caps = service.get_backend_supported_filter_capabilities()
         assert caps["fields.tenant"] is False
-        # Every other key stays True after the merge.
+        # Every other key keeps its default after the merge.
         for key, value in caps.items():
             if key == "fields.tenant":
                 continue
-            assert value is True, key
+            assert value is DEFAULT_BACKEND_FILTER_CAPABILITIES[key], key
         assert set(caps) == set(DEFAULT_BACKEND_FILTER_CAPABILITIES)
 
     def test_logical_and_negation_capabilities_default_to_supported(self):
@@ -1038,7 +1048,7 @@ class FilterNotificationsAsyncServiceTestCase(IsolatedAsyncioTestCase):
 
     async def test_capabilities_all_true_for_full_backend(self):
         caps = await self.service.get_backend_supported_filter_capabilities()
-        assert caps == DEFAULT_BACKEND_FILTER_CAPABILITIES
+        assert caps == {**DEFAULT_BACKEND_FILTER_CAPABILITIES, **PRESENCE_FILTER_CAPABILITIES}
 
     async def test_capabilities_merge_over_default(self):
         service: AsyncIONotificationService = AsyncIONotificationService(
@@ -1052,7 +1062,7 @@ class FilterNotificationsAsyncServiceTestCase(IsolatedAsyncioTestCase):
         for key, value in caps.items():
             if key == "fields.tenant":
                 continue
-            assert value is True, key
+            assert value is DEFAULT_BACKEND_FILTER_CAPABILITIES[key], key
 
     async def test_logical_and_negation_capabilities_default_to_supported(self):
         caps = await self.service.get_backend_supported_filter_capabilities()

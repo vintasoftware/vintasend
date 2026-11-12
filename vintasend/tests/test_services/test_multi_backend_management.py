@@ -565,8 +565,10 @@ class SyncComparableFieldsPinTestCase(TestCase):
     """
 
     def test_volatile_fields_are_pinned(self):
+        # notification_version is volatile on purpose: a replica that replays writes, rather
+        # than applying the primary's snapshots, issues tokens of its own on every write.
         assert _VOLATILE_NOTIFICATION_SYNC_FIELDS == frozenset(
-            {"created", "modified", "attachments"}
+            {"created", "modified", "attachments", "notification_version"}
         )
 
     def test_notification_comparable_fields_are_pinned(self):

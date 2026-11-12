@@ -52,6 +52,10 @@ class _UpdatedDataBackend(FakeFileBackend):
     def persist_notification_update(self, notification_id, updated_data):  # type: ignore[override]
         return super().persist_notification_update(notification_id, updated_data)
 
+    def get_action_capabilities(self) -> dict[str, bool]:
+        # Like those released backends, its writes take no ``notification_version``.
+        return {**super().get_action_capabilities(), "writes.notificationVersion": False}
+
 
 class _UpdatedDataNoSnapshotReplica(_UpdatedDataBackend):
     """Declines snapshots, so the service converges it through ``persist_notification_update``."""
@@ -65,6 +69,10 @@ class _AsyncIOUpdatedDataBackend(FakeAsyncIOFileBackend):
         self, notification_id, updated_data, lock=None
     ):
         return await super().persist_notification_update(notification_id, updated_data, lock)
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        # Like those released backends, its writes take no ``notification_version``.
+        return {**await super().get_action_capabilities(), "writes.notificationVersion": False}
 
 
 class _AsyncIOUpdatedDataNoSnapshotReplica(_AsyncIOUpdatedDataBackend):

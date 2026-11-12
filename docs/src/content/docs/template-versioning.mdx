@@ -111,7 +111,7 @@ The default is **off**, because turning it on changes what an existing deploymen
 
 - **The call wins over the service.** A per-call value overrides the service default in both directions; leave it out to defer to the service.
 - **An explicit version wins over both.** The flag only decides what happens when the caller does not name a version, on create and on update alike.
-- **Resolved through the renderer.** The service asks the renderer configured for that notification type, via <Sw py="get_latest_template_version(template_key)" ts="getLatestTemplateVersion(templateKey)" />. The base implementation returns <Sw py="None" ts="null" />, so with a file-based renderer the flag has nothing to pin and quietly does nothing.
+- **Resolved through the renderer.** The service asks the renderer configured for that notification type, via <Sw py="get_latest_template_version(template_key)" ts="getLatestTemplateVersion(templateKey)" />. The base implementation returns <Sw py="None" ts="null" />, so with a file-based renderer the flag has nothing to pin and quietly does nothing. The service exposes the same lookup as <Sw py="get_current_template_version(notification_type, template_key)" ts="getCurrentTemplateVersion(notificationType, templateKey)" />, and a repin without a version uses it too.
 - **Best-effort.** A renderer that fails while resolving is logged and the notification is created unpinned rather than failing the write. An unpinned notification still sends.
 - **Updates re-pin only when the template changes.** An update carrying a new <Sw py="body_template" ts="bodyTemplate" /> is re-pinned to that template's current version; an update to the title leaves an existing pin exactly as it was. Silently moving a pin forward is the one thing pinning exists to prevent.
 
@@ -224,6 +224,55 @@ A managed template is source that anyone who can edit templates hands straight t
 </Callout>
 
 </Ts>
+
+### Previews, sends and publishing
+
+A base or fragment named without `version=` resolves one of two ways, chosen by the composer:
+
+| Parts | An unpinned base or fragment resolves to | Used by |
+|---|---|---|
+| `latest` | its newest version, drafts included | the template service's own composer, for editing and validation |
+| `published` | its newest **active** version | the renderer's composer, so every send |
+
+A send applies the same rule to the parts it composes that it applies to the notification's own key, so an editor sees the draft base someone is working on and a recipient never does. A part with nothing published fails the send, so activate bases and fragments, not only the templates that extend them. To compose sends against the newest parts whatever their status, as releases before this one did, build the renderer with <Sw py='composer_parts="latest"' ts="composerOptions: { parts: 'latest' }" />.
+
+<Sw py="render_standalone" ts="renderStandalone" /> renders a template with no notification, and takes the rule per call, so a preview and "what a send would produce" need no second composer. To refuse to publish a version that a send could not render, let `activate` render it first: if that fails, nothing is written and `ManagedTemplateRenderCheckError` carries the failure, naming the key and version but never the context.
+
+<Py>
+
+```python
+from vintasend_managed_templates.managed_template_service import RenderCheck
+
+template = templates.get_template("welcome")
+preview = templates.render_standalone(template, sample_context, parts="latest")
+as_sent = templates.render_standalone(template, sample_context, parts="published")
+
+templates.activate("welcome", 3, "ana", check_render=RenderCheck(context=sample_context))
+
+templates.get_current_template_version("welcome")  # the version new notifications get
+```
+
+`set_status(key, ManagedTemplateStatus.ACTIVE, version, changed_by, check_render=...)` checks the same way; `check_render` with any other status raises `ValueError`.
+
+</Py>
+
+<Ts>
+
+```typescript
+const template = await templates.getTemplate('welcome');
+const preview = await templates.renderStandalone(template, sampleContext, { parts: 'latest' });
+const asSent = await templates.renderStandalone(template, sampleContext, { parts: 'published' });
+
+await templates.activate('welcome', 3, 'ana', { checkRender: { context: sampleContext } });
+
+await templates.getCurrentTemplateVersion('welcome'); // the version new notifications get
+```
+
+`setStatus(key, 'active', version, changedBy, { checkRender })` checks the same way; `checkRender` with any other status is a `TypeError`.
+
+</Ts>
+
+<Sw py="get_current_template_version" ts="getCurrentTemplateVersion" /> answers the key's newest active version, or nothing when no version is published or that version is an abstract base. The renderer's <Sw py="get_latest_template_version" ts="getLatestTemplateVersion" /> returns the same, and the library calls it for <Sw py="pin_template_versions" ts="pinTemplateVersions" />, for a repin without a version and for the service's own <Sw py="get_current_template_version(notification_type, template_key)" ts="getCurrentTemplateVersion(notificationType, templateKey)" />, so a dashboard showing "the version new notifications get" and the library re-pinning to it cannot disagree.
 
 ## Rendering historical template content
 

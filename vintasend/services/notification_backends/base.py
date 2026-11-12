@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from vintasend.constants import UNSET, UnsetType
+from vintasend.constants import REPINNABLE_NOTIFICATION_STATUSES, UNSET, UnsetType
+from vintasend.exceptions import NotificationRepinError, UnsupportedNotificationActionError
 from vintasend.services.dataclasses import ApplyResult
 from vintasend.services.notification_backends.filters import (
     DEFAULT_BACKEND_FILTER_CAPABILITIES,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
         AnyNotificationAttachment,
         AttachmentFileRecord,
         Notification,
+        NotificationVersion,
         OneOffNotification,
         StoredAttachment,
         UpdateNotificationKwargs,
@@ -74,6 +76,50 @@ __all__ = [
 
 
 class BaseNotificationBackend(ABC):
+    """The storage seam: where notifications are persisted, queried and updated.
+
+    **Writing the primary's version token (``writes.notificationVersion``).** A backend that
+    reports ``writes.notificationVersion`` in ``get_action_capabilities()`` must accept a
+    keyword-only ``notification_version: str | None = None`` on every write method that changes
+    a single notification -- ``persist_notification``, ``persist_one_off_notification``,
+    ``persist_notification_update``, ``mark_pending_as_sent``, ``mark_pending_as_failed``,
+    ``mark_sent_as_read``, ``cancel_notification``, ``requeue_notification``,
+    ``repin_notification``, ``store_context_used``, ``store_git_commit_sha``,
+    ``store_template_version`` and ``delete_notification_attachment`` -- and a keyword-only
+    ``notification_versions: Mapping[id, str] | None = None`` on ``mark_sent_as_read_bulk``,
+    one token per row. A given token is the one the row must hold after the write, instead of
+    one the backend issues; ``None`` (or a row missing from the mapping) means issue one as
+    usual. Bulk keys are the ids as the primary returned them, so compare them as strings when
+    id types may differ.
+
+    The keyword is not in the abstract signatures, so an override written before 3.8.0 still
+    type-checks; widening a signature with it is a valid override. It stays part of the contract
+    on every write method listed above, and the bulk ``notification_versions`` mapping is
+    accepted by it too, but the service itself uses the keyword for one thing only: stamping.
+
+    **The stamp.** A replica holds the primary's token only once its row verifiably matches the
+    primary's snapshot. When an additional backend reporting the capability does not apply the
+    primary's snapshot (it declines it, or does not implement
+    ``apply_replication_snapshot_if_newer``), the service replays the write there with no
+    token, so every replayed write issues the replica's own; converges the row to the snapshot
+    (status, content, template pin, context used, git commit SHA and, when the backend overrides
+    ``store_template_version``, the template version used); re-reads the row and compares it
+    with the snapshot; and only when they match makes one token-only write::
+
+        persist_notification_update(notification_id, {}, notification_version=<primary token>)
+
+    So a backend reporting ``writes.notificationVersion`` MUST accept an empty ``update_data``
+    with a ``notification_version`` in ANY status, ``SENT`` and ``READ`` included, as a
+    token-only write that changes nothing else -- not the content, not ``modified``. If the row
+    does not match, the snapshot has no token, or any write raised, there is no stamp: the
+    replica keeps a token of its own, and a move with a version listed from it is refused,
+    which is the safe outcome. Bulk read-marking stamps row by row the same way.
+
+    The primary never receives the keyword: the primary issues tokens. Nor can it get a replica
+    a row it lacks: no write creates a row with the primary's id, which is what
+    ``apply_replication_snapshot_if_newer`` is for.
+    """
+
     backend_import_str: str
     backend_kwargs: dict
     config: Any
@@ -136,7 +182,11 @@ class BaseNotificationBackend(ABC):
         # A backend that stores it can answer "which version was this notification recorded
         # against" without re-deriving it from a template store that has moved on since.
         requested_template_version: int | None = None,
-    ) -> "Notification": ...
+    ) -> "Notification":
+        """Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
+        ...
 
     @abstractmethod
     def persist_one_off_notification(
@@ -160,7 +210,11 @@ class BaseNotificationBackend(ABC):
         # A backend that stores it can answer "which version was this notification recorded
         # against" without re-deriving it from a template store that has moved on since.
         requested_template_version: int | None = None,
-    ) -> "OneOffNotification": ...
+    ) -> "OneOffNotification":
+        """Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
+        ...
 
     @abstractmethod
     def persist_notification_update(
@@ -180,6 +234,12 @@ class BaseNotificationBackend(ABC):
         The service passes ``notification_id`` and ``update_data`` positionally, because
         released implementations name the second parameter ``updated_data``. Keep the
         seam's names in a new implementation all the same.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring. Such a backend must
+        then accept an empty ``update_data`` with a ``notification_version`` in any status,
+        ``SENT`` and ``READ`` included, as a token-only write that changes nothing else: it is
+        how the service stamps a converged replica row with the primary's token.
         """
 
     @abstractmethod
@@ -189,13 +249,20 @@ class BaseNotificationBackend(ABC):
         """
         Mark a pending notification as sent. Implementations must set ``sent_at`` to
         the current time on the affected row.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
         """
         ...
 
     @abstractmethod
     def mark_pending_as_failed(
         self, notification_id: int | str | uuid.UUID
-    ) -> "Notification | OneOffNotification": ...
+    ) -> "Notification | OneOffNotification":
+        """Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
+        ...
 
     @abstractmethod
     def mark_sent_as_read(
@@ -204,6 +271,9 @@ class BaseNotificationBackend(ABC):
         """
         Mark a sent notification as read. Implementations must set ``read_at`` to
         the current time on the affected row.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
         """
         ...
 
@@ -232,10 +302,18 @@ class BaseNotificationBackend(ABC):
 
         Unlike ``mark_sent_as_read``, this method NEVER raises when zero rows are
         updated -- it is idempotent by construction.
+
+        Takes a keyword-only ``notification_versions: Mapping[id, str] | None = None`` when the
+        backend reports ``writes.notificationVersion``; see the class docstring. The contract
+        accepts the mapping, but the service does not pass it: it stamps row by row.
         """
 
     @abstractmethod
-    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None: ...
+    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
+        """Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
+        ...
 
     @abstractmethod
     def requeue_notification(
@@ -267,7 +345,29 @@ class BaseNotificationBackend(ABC):
         Return the full notification, attachments included, the same way ``get_notification``
         does. The service sends whatever this returns.
 
+        Two optional keyword-only arguments, added in 3.8.0, are deliberately not part of the
+        abstract signature above, so an override written for 3.7 still type-checks. A backend
+        that reports ``requeue.templateVersion`` or ``requeue.expectedVersion`` in
+        ``get_action_capabilities()`` must accept the matching argument as keyword-only
+        (widening the signature is a valid override). The service passes each one only to a
+        backend that reports it, so a backend that does not support them leaves them out of
+        its signature:
+
+        * ``template_version`` (``requeue.templateVersion``): set ``requested_template_version``
+          in the same write, so the notification is never left pinned but not pending, or
+          pending on the old pin.
+        * ``expected_version`` (``requeue.expectedVersion``): write only if the notification is
+          still at this version, the token ``filter_notification_versions`` returned for it, and
+          raise ``NotificationVersionChangedError`` otherwise, writing nothing. A SQL backend
+          adds the version column to the ``WHERE``; when nothing matched, it reads the row once
+          to say why.
+
+        A backend that reports neither must raise if it is handed one anyway, never ignore it.
+
         Required since 3.7.0. A backend written against an earlier version must add it.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
         """
         ...
 
@@ -398,10 +498,24 @@ class BaseNotificationBackend(ABC):
         once applied so the service skips the fallback, and ``applied=False`` (optionally with a
         ``reason``) to defer to it.
 
+        Return ``ApplyResult(applied=False, superseded=True)`` when this backend's row is newer
+        than the snapshot: the service then skips the fallback, since the row already reflects
+        a later write, and replaying the older snapshot would overwrite it.
+
         ``snapshot`` is the primary backend's authoritative record for a notification; it must
         be written with its existing id, never a freshly assigned one. Concrete rather than
         abstract on purpose: multi-backend replication is opt-in, so forcing every backend to
         implement it would break single-backend deployments that never use it.
+
+        A backend that keeps version tokens (see ``filter_notification_versions``) must store
+        ``snapshot.notification_version`` as the row's token when it applies the snapshot,
+        instead of issuing one of its own, and issue a new one only when the snapshot carries
+        none. That is how a replica comes to hand out tokens the primary accepts as
+        ``expected_version``. So a backend that reports ``versions.filter`` and is used as a
+        replica must implement this or report ``writes.notificationVersion`` (see the class
+        docstring): one that replays writes without taking the primary's token holds tokens of
+        its own, which the primary always refuses, and the service reports ``versions.filter``
+        as ``False`` for it when it is named.
         """
         return ApplyResult(
             applied=False,
@@ -444,6 +558,116 @@ class BaseNotificationBackend(ABC):
         MUST report ``{'pagination.oneIndexed': False}``, because a caller that assumes the
         wrong base gets no error -- just the wrong rows. See
         ``DEFAULT_BACKEND_FILTER_CAPABILITIES``.
+
+        The presence filters (``fields.hasSendAfter``, ``negation.hasSendAfter``,
+        ``fields.hasRequestedTemplateVersion``, ``negation.hasRequestedTemplateVersion``) are
+        the exception: they default to ``False``, so a backend that evaluates them reports
+        ``True``.
+        """
+        return {}
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+    ) -> "Notification | OneOffNotification":
+        """Pin a notification to a template version, in one conditional write where it can.
+
+        An implementation must:
+
+        * only move a notification whose status is one of
+          ``vintasend.constants.REPINNABLE_NOTIFICATION_STATUSES``, and raise
+          ``NotificationRepinError`` for any other. A SQL backend puts the statuses in the
+          ``UPDATE``'s ``WHERE``, so a worker sending the notification in between is never
+          overwritten;
+        * raise ``NotificationVersionChangedError`` when ``expected_version`` is given and the
+          notification is at another version, or when it changes between the read and the
+          write;
+        * raise ``NotificationNotFoundError`` when no notification has that ID;
+        * write nothing in any of those cases, nor when the notification is already pinned to
+          ``template_version``, which it then returns as it is;
+        * change ``requested_template_version`` only.
+
+        Report ``repin.expectedVersion`` in ``get_action_capabilities()`` once it does all of
+        that.
+
+        Optional, added in 3.8.0. This default reads the notification, checks its status and
+        writes through ``persist_notification_update``. It cannot check ``expected_version``,
+        so it raises ``UnsupportedNotificationActionError`` when given one.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
+        if expected_version is not None:
+            raise UnsupportedNotificationActionError(
+                f"Cannot repin notification {notification_id}: this backend does not check "
+                "expected_version"
+            )
+        notification = self.get_notification(notification_id)
+        if notification.status not in REPINNABLE_NOTIFICATION_STATUSES:
+            raise NotificationRepinError(
+                f"Cannot repin notification {notification_id}: it has already been delivered"
+            )
+        if notification.requested_template_version == template_version:
+            return notification
+        return self.persist_notification_update(
+            notification_id, {"requested_template_version": template_version}
+        )
+
+    def filter_notification_versions(
+        self,
+        filter: "NotificationFilter",  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> "list[NotificationVersion]":
+        """The ID and version token of every notification matching ``filter``, a page at a time.
+
+        For counting and selecting notifications without reading them. An implementation must
+        not read recipients, contexts, context parameters, rendered content or attachments to
+        answer it, and must return nothing but ``NotificationVersion(id, version)``. A SQL
+        backend selects the ID and version columns only.
+
+        The version is an opaque string that changes on every write to the notification, by
+        anyone. ``requeue_notification`` and ``repin_notification`` take it back as
+        ``expected_version``. Serializers should also fill it in ``notification_version`` on
+        every ``Notification`` / ``OneOffNotification`` the backend returns, so a caller holding
+        one can pass it without listing. On a replica the token is the primary's, carried over
+        by ``apply_replication_snapshot_if_newer``.
+
+        Results are ordered by ID, so pages are stable while nothing is written. A caller that
+        changes what it lists as it goes should list again from page 1 rather than move on to
+        the next page. Pages follow the backend's ``pagination.oneIndexed`` convention.
+
+        Optional, added in 3.8.0. Report ``versions.filter`` in ``get_action_capabilities()``
+        when it is implemented. This default raises ``UnsupportedNotificationActionError``.
+        """
+        raise UnsupportedNotificationActionError(
+            f"Backend {self.get_backend_identifier() or type(self).__name__} does not support "
+            "filter_notification_versions"
+        )
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        """Which optional notification actions this backend supports.
+
+        Keys are those of ``vintasend.constants.DEFAULT_BACKEND_ACTION_CAPABILITIES``, all
+        ``False`` by default, and a missing key reads as ``False``. A backend reports ``True``
+        for what it implements:
+
+        * ``repin.expectedVersion``: ``repin_notification`` is overridden and checks
+          ``expected_version``;
+        * ``requeue.expectedVersion``: ``requeue_notification`` checks ``expected_version``;
+        * ``requeue.templateVersion``: ``requeue_notification`` pins ``template_version`` in the
+          same write;
+        * ``versions.filter``: ``filter_notification_versions`` is implemented;
+        * ``writes.notificationVersion``: every single-notification write takes a keyword-only
+          ``notification_version`` and ``mark_sent_as_read_bulk`` a ``notification_versions``
+          mapping (see the class docstring).
+
+        More keys may be added later, so read the ones you need by name.
+
+        Optional, added in 3.8.0. This default reports nothing.
         """
         return {}
 
@@ -474,7 +698,11 @@ class BaseNotificationBackend(ABC):
         notification_id: int | str | uuid.UUID,
         context: dict,
         adapter_import_str: str,
-    ) -> None: ...
+    ) -> None:
+        """Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
+        ...
 
     @abstractmethod
     def store_git_commit_sha(
@@ -487,6 +715,9 @@ class BaseNotificationBackend(ABC):
         Called by NotificationService at send time, only when the resolved SHA differs from
         what is already stored -- so an implementation need not deduplicate writes itself.
         ``git_commit_sha`` always arrives already normalized (40 lowercase hex characters).
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
         """
         ...
 
@@ -505,6 +736,9 @@ class BaseNotificationBackend(ABC):
         backend with no column for it inherits this and keeps working, which is what lets the
         field be added without a major version. The cost of not overriding it is only that
         ``used_template_version`` stays None on the records that backend holds.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
         """
         return None
 
@@ -573,7 +807,11 @@ class BaseNotificationBackend(ABC):
 
     @abstractmethod
     def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
-        """Delete a single notification attachment join row by its own id."""
+        """Delete a single notification attachment join row by its own id.
+
+        Takes a keyword-only ``notification_version: str | None = None`` when the backend
+        reports ``writes.notificationVersion``; see the class docstring.
+        """
         ...
 
 
