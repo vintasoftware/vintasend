@@ -1,5 +1,21 @@
 # Release Notes
 
+## `vintasend-django` 3.8.1 (2026-11-12)
+
+`vintasend-django` 3.8.0 was tagged but never published: its test matrix failed on Django 4.2
+and 6.1. 3.8.1 is the first `vintasend-django` release in the 3.8 family and contains
+everything listed for it under 3.8.0, plus:
+
+### Bug Fixes
+
+* On SQLite with Django before 5.0, `apply_replication_snapshot_if_newer` raised
+  `OverflowError` for a snapshot id too large for the id column, instead of declining it with
+  nothing written. An unreported integer range now falls back to the 64-bit one.
+
+### Backwards compatibility
+
+* No API change. It requires `vintasend` 3.8.0, like the rest of the family.
+
 ## Version 3.8.0 (2026-11-11)
 
 Moving notifications onto a new template version safely, and previewing and publishing managed
