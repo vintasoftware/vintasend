@@ -1,6 +1,6 @@
 # Release Notes
 
-## Version 3.8.0 (unreleased)
+## Version 3.8.0 (2026-11-11)
 
 Moving notifications onto a new template version safely, and previewing and publishing managed
 templates without building a fake notification. It matches the TypeScript VintaSend
